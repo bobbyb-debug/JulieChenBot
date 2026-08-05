@@ -2,12 +2,17 @@
 Julie ChenBot Discord Service
 =============================
 
-Responsible for connecting Julie ChenBot to Discord,
-loading slash commands, and managing presence.
+Responsible for:
+
+• Connecting to Discord
+• Loading slash commands
+• Starting Julie's Production Scheduler
+• Managing Presence
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import pkgutil
 
@@ -16,19 +21,18 @@ from discord.ext import commands
 
 from config import BOT_NAME, DISCORD_TOKEN
 from services.logger import ProductionLogger
+from services.scheduler import Scheduler
 
 
 class DiscordService:
-    """
-    Main Discord service.
-    """
 
     def __init__(self) -> None:
 
         self.logger = ProductionLogger.get("Discord")
 
-        intents = discord.Intents.default()
+        self.scheduler = Scheduler()
 
+        intents = discord.Intents.default()
         intents.guilds = True
         intents.guild_messages = True
         intents.message_content = True
@@ -60,9 +64,11 @@ class DiscordService:
             print("=" * 60)
 
             if not self.bot.guilds:
+
                 print("Julie is not connected to any servers.")
 
             for guild in self.bot.guilds:
+
                 print(f"• {guild.name}")
                 print(f"  ID: {guild.id}")
                 print(f"  Members: {guild.member_count}")
@@ -91,9 +97,22 @@ class DiscordService:
                 )
 
             except Exception:
+
                 self.logger.exception(
-                    "Failed to sync slash commands."
+                    "Failed syncing slash commands."
                 )
+
+            #
+            # Start Production Scheduler
+            #
+
+            asyncio.create_task(
+                self.scheduler.start()
+            )
+
+            self.logger.info(
+                "Production Scheduler started."
+            )
 
             print()
             print("=" * 60)
@@ -101,8 +120,22 @@ class DiscordService:
             print("=" * 60)
             print()
 
+        @self.bot.event
+        async def on_disconnect():
+
+            self.logger.warning(
+                "Julie disconnected from Discord."
+            )
+
+        @self.bot.event
+        async def on_resumed():
+
+            self.logger.info(
+                "Discord connection resumed."
+            )
+
     # ==========================================================
-    # Slash Command Helper
+    # Slash Commands
     # ==========================================================
 
     def command(self, *args, **kwargs):
@@ -159,8 +192,9 @@ class DiscordService:
     def run(self) -> None:
 
         if not DISCORD_TOKEN:
+
             raise RuntimeError(
-                "DISCORD_TOKEN is missing from .env"
+                "DISCORD_TOKEN missing from .env"
             )
 
         self.logger.info(
