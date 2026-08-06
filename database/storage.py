@@ -1,151 +1,333 @@
 """
-Julie ChenBot - Jokers RSS Engine
-=================================
+Julie ChenBot Storage
+=====================
 
-Downloads the JokersUpdates RSS feed and returns only
-updates Julie has never announced before.
+Persistent JSON storage for Julie ChenBot.
 
-Julie remembers the last RSS item even after restarting.
+Stores production state between restarts.
+
+Examples
+--------
+storage = Storage()
+
+storage.set("last_guid", guid)
+
+guid = storage.get("last_guid")
+
+storage.last_guid = guid
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
-
-import feedparser
-
-from config import RSS_FEED
-from database.storage import Storage
-from services.logger import ProductionLogger
-
-logger = ProductionLogger.get("Jokers")
+import json
+import threading
+from pathlib import Path
+from typing import Any
 
 
-@dataclass(slots=True)
-class FeedUpdate:
-    """
-    Represents one Jokers RSS update.
-    """
+class Storage:
 
-    guid: str
-    title: str
-    description: str
-    link: str
-    published: str
+    FILE = Path("data/storage.json")
 
+    DEFAULT_DATA = {
 
-class JokersRSS:
-    """
-    Jokers RSS Engine
-    """
+        # RSS
+        "last_guid": "",
+        "last_title": "",
+        "last_published": "",
+
+        # Feed status
+        "feed_state": "UNKNOWN",
+
+        # Image watcher
+        "last_image_hash": "",
+
+        # Last production event
+        "last_event": {},
+
+        # Statistics
+        "statistics": {
+
+            "rss_updates": 0,
+
+            "announcements": 0,
+
+            "feed_interruptions": 0,
+
+            "bot_starts": 0,
+
+        },
+    }
 
     def __init__(self) -> None:
 
-        self.feed_url = RSS_FEED
+        self._lock = threading.Lock()
 
-        self.db = Storage()
-
-        logger.info("Jokers RSS engine initialized.")
-
-    # ==========================================================
-    # Download Feed
-    # ==========================================================
-
-    def download(self):
-
-        logger.info("Checking Jokers RSS...")
-
-        feed = feedparser.parse(self.feed_url)
-
-        if feed.bozo:
-            logger.warning(
-                "RSS parser reported warnings."
-            )
-
-        return feed
-
-    # ==========================================================
-    # Current Feed Entry
-    # ==========================================================
-
-    def latest(self) -> Optional[FeedUpdate]:
-
-        feed = self.download()
-
-        if not feed.entries:
-
-            logger.warning(
-                "RSS returned zero entries."
-            )
-
-            return None
-
-        entry = feed.entries[0]
-
-        return FeedUpdate(
-            guid=getattr(entry, "id", ""),
-            title=getattr(entry, "title", ""),
-            description=getattr(entry, "description", ""),
-            link=getattr(entry, "link", ""),
-            published=getattr(entry, "published", ""),
+        self.FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-    # ==========================================================
-    # Has Anything Changed?
-    # ==========================================================
+        self._data: dict[str, Any] = {}
 
-    def check(self) -> Optional[FeedUpdate]:
+        self.load()
 
-        latest = self.latest()
+    # ======================================================
+    # Load
+    # ======================================================
 
-        if latest is None:
-            return None
+    def load(self) -> None:
 
-        # First launch
+        if not self.FILE.exists():
 
-        if not self.db.last_guid:
-
-            logger.info(
-                "Creating first RSS snapshot."
+            self._data = dict(
+                self.DEFAULT_DATA
             )
 
-            self.db.last_guid = latest.guid
-            self.db.last_title = latest.title
-            self.db.last_published = latest.published
+            self.save()
 
-            return None
+            return
 
-        # No change
+        try:
 
-        if latest.guid == self.db.last_guid:
+            with self.FILE.open(
+                "r",
+                encoding="utf-8",
+            ) as f:
 
-            logger.info(
-                "No new Jokers updates."
+                self._data = json.load(
+                    f
+                )
+
+        except Exception:
+
+            self._data = dict(
+                self.DEFAULT_DATA
             )
 
-            return None
+            self.save()
 
-        # New update
+        # Ensure any new keys exist
+        self._merge_defaults()
 
-        logger.info(
-            "New Jokers update detected."
+    # ======================================================
+    # Save
+    # ======================================================
+
+    def save(self) -> None:
+
+        with self._lock:
+
+            with self.FILE.open(
+                "w",
+                encoding="utf-8",
+            ) as f:
+
+                json.dump(
+
+                    self._data,
+
+                    f,
+
+                    indent=4,
+
+                    ensure_ascii=False,
+
+                    sort_keys=True,
+
+                )
+
+    # ======================================================
+    # Defaults
+    # ======================================================
+
+    def _merge_defaults(self) -> None:
+
+        changed = False
+
+        for key, value in self.DEFAULT_DATA.items():
+
+            if key not in self._data:
+
+                self._data[key] = value
+
+                changed = True
+
+        if changed:
+
+            self.save()
+
+    # ======================================================
+    # Generic
+    # ======================================================
+
+    def get(
+        self,
+        key: str,
+        default=None,
+    ):
+
+        return self._data.get(
+            key,
+            default,
         )
 
-        self.db.last_guid = latest.guid
-        self.db.last_title = latest.title
-        self.db.last_published = latest.published
+    def set(
+        self,
+        key: str,
+        value,
+    ) -> None:
 
-        return latest
+        self._data[key] = value
 
-    # ==========================================================
-    # Force Latest
-    # ==========================================================
+        self.save()
 
-    def current(self) -> Optional[FeedUpdate]:
-        """
-        Always return the newest RSS item,
-        regardless of whether Julie has seen it.
-        """
+    # ======================================================
+    # Convenience Properties
+    # ======================================================
 
-        return self.latest()
+    @property
+    def last_guid(self) -> str:
+
+        return self.get(
+            "last_guid",
+            "",
+        )
+
+    @last_guid.setter
+    def last_guid(
+        self,
+        value: str,
+    ) -> None:
+
+        self.set(
+            "last_guid",
+            value,
+        )
+
+    @property
+    def last_title(self) -> str:
+
+        return self.get(
+            "last_title",
+            "",
+        )
+
+    @last_title.setter
+    def last_title(
+        self,
+        value: str,
+    ) -> None:
+
+        self.set(
+            "last_title",
+            value,
+        )
+
+    @property
+    def last_published(self) -> str:
+
+        return self.get(
+            "last_published",
+            "",
+        )
+
+    @last_published.setter
+    def last_published(
+        self,
+        value: str,
+    ) -> None:
+
+        self.set(
+            "last_published",
+            value,
+        )
+
+    @property
+    def last_image_hash(self) -> str:
+
+        return self.get(
+            "last_image_hash",
+            "",
+        )
+
+    @last_image_hash.setter
+    def last_image_hash(
+        self,
+        value: str,
+    ) -> None:
+
+        self.set(
+            "last_image_hash",
+            value,
+        )
+
+    @property
+    def feed_state(self) -> str:
+
+        return self.get(
+            "feed_state",
+            "UNKNOWN",
+        )
+
+    @feed_state.setter
+    def feed_state(
+        self,
+        value: str,
+    ) -> None:
+
+        self.set(
+            "feed_state",
+            value,
+        )
+
+    # ======================================================
+    # Statistics
+    # ======================================================
+
+    def increment(
+        self,
+        key: str,
+    ) -> int:
+
+        stats = self.get(
+            "statistics",
+            {},
+        )
+
+        stats[key] = stats.get(
+            key,
+            0,
+        ) + 1
+
+        self.set(
+            "statistics",
+            stats,
+        )
+
+        return stats[key]
+
+    def statistic(
+        self,
+        key: str,
+    ) -> int:
+
+        return self.get(
+            "statistics",
+            {},
+        ).get(
+            key,
+            0,
+        )
+
+    # ======================================================
+    # Reset
+    # ======================================================
+
+    def reset(self) -> None:
+
+        self._data = dict(
+            self.DEFAULT_DATA
+        )
+
+        self.save()
