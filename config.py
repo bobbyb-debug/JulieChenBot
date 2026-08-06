@@ -35,7 +35,6 @@ ASSETS = ROOT / "assets"
 DATABASE = ROOT / "database"
 LOGS = ROOT / "logs"
 
-# Ensure required folders exist
 for directory in (ASSETS, DATABASE, LOGS):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -46,9 +45,13 @@ for directory in (ASSETS, DATABASE, LOGS):
 BOT_NAME = "Julie ChenBot"
 VERSION = "1.0.0"
 
-CHECK_INTERVAL = 60  # Seconds between update checks
-
 DEBUG = False
+
+PHASE = "Development" if DEBUG else "Production"
+
+BUILD = os.getenv("BUILD", VERSION)
+
+CHECK_INTERVAL = 60
 
 # ==========================================================
 # Discord
@@ -59,10 +62,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 
 def env_int(name: str, default: int = 0) -> int:
     """
-    Safely read an integer from the environment.
-
-    Returns the default value if the variable is
-    missing, empty, or not a valid integer.
+    Safely read an integer from an environment variable.
     """
 
     value = os.getenv(name)
@@ -87,9 +87,12 @@ PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 # JokersUpdates
 # ==========================================================
 
-RSS_FEED = (
+JOKERS_RSS_FEED = (
     "http://rss.jokersupdates.com/ubbthreads/rss/bbusaupdates/rss.php"
 )
+
+# Backwards compatibility
+RSS_FEED = JOKERS_RSS_FEED
 
 JOKERS_HOME = (
     "https://www.jokersupdates.com/"
@@ -97,6 +100,16 @@ JOKERS_HOME = (
 
 HOUSE_STATUS_IMAGE = (
     "https://www.jokersupdates.com/ubbthreads/images/headers/bigbrother/hg/"
+)
+
+# ==========================================================
+# HTTP
+# ==========================================================
+
+REQUEST_TIMEOUT = 15
+
+USER_AGENT = (
+    f"{BOT_NAME}/{VERSION} ({PHASE})"
 )
 
 # ==========================================================

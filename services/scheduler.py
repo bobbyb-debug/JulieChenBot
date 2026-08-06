@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 
 from config import CHECK_INTERVAL
-from production.jokers import JokersRSS
+from production.engine import JokersRSS
 from services.logger import ProductionLogger
 
 
