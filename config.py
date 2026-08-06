@@ -48,7 +48,13 @@ VERSION = "1.0.0"
 
 CHECK_INTERVAL = 60  # Seconds between update checks
 
-DEBUG = False
+DEBUG = False # ==========================================================
+# Build Information
+# ==========================================================
+
+PHASE = "Development" if DEBUG else "Production"
+
+BUILD = os.getenv("BUILD", VERSION)
 
 # ==========================================================
 # Discord

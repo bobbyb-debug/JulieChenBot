@@ -2,11 +2,7 @@
 Julie ChenBot Scheduler
 =======================
 
-Runs background tasks for Julie ChenBot.
-
-Current Tasks
--------------
-• Checks JokersUpdates RSS every 60 seconds.
+Runs Julie's Production Engine on a fixed interval.
 """
 
 from __future__ import annotations
@@ -14,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from config import CHECK_INTERVAL
-from production.jokers import JokersRSS
+from production.engine import ProductionEngine
 from services.logger import ProductionLogger
 
 
@@ -27,7 +23,7 @@ class Scheduler:
 
         self.logger = ProductionLogger.get("Scheduler")
 
-        self.jokers = JokersRSS()
+        self.engine = ProductionEngine()
 
         self.running = False
 
@@ -50,27 +46,7 @@ class Scheduler:
 
             try:
 
-                update = self.jokers.check()
-
-                if update:
-
-                    self.logger.info(
-                        "NEW LIVE FEED UPDATE"
-                    )
-
-                    self.logger.info(
-                        update.title
-                    )
-
-                    self.logger.info(
-                        update.link
-                    )
-
-                else:
-
-                    self.logger.info(
-                        "No new live feed updates."
-                    )
+                await self.engine.tick()
 
             except Exception:
 
