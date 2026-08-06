@@ -32,6 +32,12 @@ class Scheduler:
     # ==========================================================
 
     async def start(self) -> None:
+        """
+        Starts Julie's production scheduler.
+
+        Executes one Production Engine cycle every
+        CHECK_INTERVAL seconds until stopped.
+        """
 
         if self.running:
             return
@@ -46,12 +52,20 @@ class Scheduler:
 
             try:
 
+                self.logger.info(
+                    "Scheduler invoking engine.tick()."
+                )
+
                 await self.engine.tick()
+
+                self.logger.info(
+                    "Engine tick completed."
+                )
 
             except Exception:
 
                 self.logger.exception(
-                    "Scheduler encountered an error."
+                    "Scheduler encountered an unexpected error."
                 )
 
             await asyncio.sleep(
@@ -63,6 +77,9 @@ class Scheduler:
     # ==========================================================
 
     def stop(self) -> None:
+        """
+        Stops the scheduler.
+        """
 
         self.running = False
 

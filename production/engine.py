@@ -2,27 +2,25 @@
 Julie ChenBot Production Engine
 ===============================
 
-The Production Engine is Julie ChenBot's central orchestrator.
+The Production Engine is the heart of Julie ChenBot.
 
-It does not perform production monitoring itself.
+It coordinates every production monitoring system and serves as the
+single orchestrator for Julie's autonomous workflow.
 
-Instead, it coordinates every monitoring subsystem,
-collects ProductionEvents, and forwards meaningful
-events to the announcement pipeline.
+The Engine itself performs no monitoring. Instead, it delegates all
+monitoring to the ProductionWatcher, receives ProductionEvents, and
+coordinates Julie's production pipeline.
 
-The Engine intentionally knows nothing about RSS,
-images, competitions, or house state. Those concerns
-belong to registered monitors executed by the
-ProductionWatcher.
+Pipeline
+--------
 
-ProductionEngine Responsibilities
----------------------------------
-• Run one production cycle
-• Collect monitor results
-• Queue production events
-• Coordinate announcements
-• Persist runtime state
-• Report health information
+ProductionWatcher
+        ↓
+MonitorResult(s)
+        ↓
+ProductionEvent(s)
+        ↓
+ProductionAnnouncer
 """
 
 from __future__ import annotations
@@ -42,7 +40,10 @@ from database.storage import Storage
 
 from production.announcer import ProductionAnnouncer
 from production.events import ProductionEvent
-from production.monitors import MonitorResult
+from production.monitors import (
+    MonitorResult,
+    MonitorStatus,
+)
 from production.watcher import ProductionWatcher
 
 from services.logger import ProductionLogger
@@ -50,13 +51,13 @@ from services.logger import ProductionLogger
 
 class ProductionEngine:
     """
-    Julie ChenBot's production orchestrator.
+    Coordinates Julie ChenBot's production systems.
 
-    The engine owns runtime state while delegating
-    all production monitoring to ProductionWatcher.
+    The Engine owns runtime state, delegates monitoring,
+    queues ProductionEvents, and publishes announcements.
 
-    Monitors report ProductionEvents which are queued,
-    processed, announced, and eventually persisted.
+    Monitor-specific logic belongs inside individual
+    monitors, never inside the Engine.
     """
 
     def __init__(
@@ -67,13 +68,13 @@ class ProductionEngine:
         self.logger = ProductionLogger.get("Engine")
 
         #
-        # Persistence
+        # Persistent storage
         #
 
         self.storage = storage or Storage()
 
         #
-        # Core services
+        # Core production systems
         #
 
         self.watcher = ProductionWatcher(
@@ -83,7 +84,7 @@ class ProductionEngine:
         self.announcer = ProductionAnnouncer()
 
         #
-        # Runtime
+        # Runtime state
         #
 
         self.started_at = datetime.utcnow()
@@ -99,13 +100,15 @@ class ProductionEngine:
         self.last_tick_at: Optional[datetime] = None
 
         #
-        # Monitor results
+        # Latest monitor results
         #
 
-        self.last_results: list[MonitorResult] = []
+        self.last_results: list[
+            MonitorResult
+        ] = []
 
         #
-        # Production event queue
+        # Pending production events
         #
 
         self.pending_events: deque[
@@ -117,19 +120,39 @@ class ProductionEngine:
         )
 
     # =====================================================
-    # Runtime Properties
+    # Runtime
     # =====================================================
 
     @property
     def uptime(self) -> timedelta:
         """
-        Returns the amount of time the engine
-        has been running.
+        Returns how long Julie has been running.
         """
 
         return (
             datetime.utcnow()
             - self.started_at
+        )
+
+    @property
+    def monitor_count(self) -> int:
+        """
+        Number of registered monitors.
+        """
+
+        return self.watcher.total_monitors
+
+    @property
+    def healthy_monitor_count(self) -> int:
+        """
+        Number of healthy monitors from the
+        previous production cycle.
+        """
+
+        return sum(
+            1
+            for result in self.last_results
+            if result.status == MonitorStatus.HEALTHY
         )
 
     @property
@@ -142,33 +165,6 @@ class ProductionEngine:
             self.pending_events
         )
 
-    @property
-    def monitor_count(self) -> int:
-        """
-        Number of registered monitors.
-        """
-
-        return len(
-            self.watcher.monitors
-        )
-
-    @property
-    def healthy_monitor_count(self) -> int:
-        """
-        Number of healthy monitors from the
-        previous production cycle.
-        """
-
-        return sum(
-
-            1
-
-            for result in self.last_results
-
-            if result.status.value == "healthy"
-
-        )
-
     # =====================================================
     # Helpers
     # =====================================================
@@ -178,11 +174,10 @@ class ProductionEngine:
         value: Optional[datetime],
     ) -> Optional[str]:
 
-        return (
-            value.isoformat()
-            if value
-            else None
-        )
+        if value is None:
+            return None
+
+        return value.isoformat()
 
     @staticmethod
     def _format_uptime(
@@ -196,56 +191,247 @@ class ProductionEngine:
                 )
             )
         )
-        # =====================================================
+    
+    def _format_uptime(
+        uptime: timedelta,
+    ) 
+"""
+Julie ChenBot Production Engine
+===============================
+
+The Production Engine is the heart of Julie ChenBot.
+
+It coordinates every production monitoring system and serves as the
+single orchestrator for Julie's autonomous workflow.
+
+The Engine itself performs no monitoring. Instead, it delegates all
+monitoring to the ProductionWatcher, receives ProductionEvents, and
+coordinates Julie's production pipeline.
+
+Pipeline
+--------
+
+ProductionWatcher
+        ↓
+MonitorResult(s)
+        ↓
+ProductionEvent(s)
+        ↓
+ProductionAnnouncer
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Optional
+
+from config import (
+    BOT_NAME,
+    BUILD,
+    PHASE,
+    VERSION,
+)
+
+from database.storage import Storage
+
+from production.announcer import ProductionAnnouncer
+from production.events import ProductionEvent
+from production.monitors import (
+    MonitorResult,
+    MonitorStatus,
+)
+from production.watcher import ProductionWatcher
+
+from services.logger import ProductionLogger
+
+
+class ProductionEngine:
+    """
+    Coordinates Julie ChenBot's production systems.
+
+    The Engine owns runtime state, delegates monitoring,
+    queues ProductionEvents, and publishes announcements.
+
+    Monitor-specific logic belongs inside individual
+    monitors, never inside the Engine.
+    """
+
+    def __init__(
+        self,
+        storage: Optional[Storage] = None,
+    ) -> None:
+
+        self.logger = ProductionLogger.get("Engine")
+
+        #
+        # Persistent storage
+        #
+
+        self.storage = storage or Storage()
+
+        #
+        # Core production systems
+        #
+
+        self.watcher = ProductionWatcher(
+            storage=self.storage,
+        )
+
+        self.announcer = ProductionAnnouncer()
+
+        #
+        # Runtime state
+        #
+
+        self.started_at = datetime.utcnow()
+
+        self.running = False
+
+        self.tick_count = 0
+
+        self.error_count = 0
+
+        self.last_error: Optional[str] = None
+
+        self.last_tick_at: Optional[datetime] = None
+
+        #
+        # Latest monitor results
+        #
+
+        self.last_results: list[
+            MonitorResult
+        ] = []
+
+        #
+        # Pending production events
+        #
+
+        self.pending_events: deque[
+            ProductionEvent
+        ] = deque()
+
+        self.logger.info(
+            "Production Engine initialized."
+        )
+
+    # =====================================================
+    # Runtime
+    # =====================================================
+
+    @property
+    def uptime(self) -> timedelta:
+        """
+        Returns how long Julie has been running.
+        """
+
+        return (
+            datetime.utcnow()
+            - self.started_at
+        )
+
+    @property
+    def monitor_count(self) -> int:
+        """
+        Number of registered monitors.
+        """
+
+        return self.watcher.total_monitors
+
+    @property
+    def healthy_monitor_count(self) -> int:
+        """
+        Number of healthy monitors from the
+        previous production cycle.
+        """
+
+        return sum(
+            1
+            for result in self.last_results
+            if result.status == MonitorStatus.HEALTHY
+        )
+
+    @property
+    def pending_event_count(self) -> int:
+        """
+        Number of queued production events.
+        """
+
+        return len(
+            self.pending_events
+        )
+
+    # =====================================================
+    # Helpers
+    # =====================================================
+
+    @staticmethod
+    def _iso(
+        value: Optional[datetime],
+    ) -> Optional[str]:
+
+        if value is None:
+            return None
+
+        return value.isoformat()
+
+    @staticmethod
+    def _format_uptime(
+        uptime: timedelta,
+    ) -> str:
+
+        return str(
+            timedelta(
+                seconds=int(
+                    uptime.total_seconds()
+                )
+            )
+        )
+    ...
+    @staticmethod
+    def _format_uptime(...):
+        ...
+
+    # =====================================================
     # Production Cycle
     # =====================================================
 
     async def tick(self) -> None:
+        ...
+    # =====================================================
+    # Event Processing
+    # =====================================================
+
+    async def process_events(self) -> None:
         """
-        Executes one complete production cycle.
+        Processes queued ProductionEvents.
 
-        The Engine delegates monitoring to the
-        ProductionWatcher, queues any resulting
-        ProductionEvents, processes them,
-        announces them, and persists runtime state.
+        Future phases will enrich events with AI,
+        timelines, statistics, and persistence.
         """
 
-        self.tick_count += 1
-        self.last_tick_at = datetime.utcnow()
+        if not self.pending_events:
+            return
 
-        try:
+        self.logger.info(
+            "Processing %d production event(s).",
+            self.pending_event_count,
+        )
 
-            #
-            # Execute every registered monitor
-            #
+        #
+        # Currently events are simply logged.
+        # Future phases will enrich each event
+        # before announcement.
+        #
 
-            results = await self.watcher.run()
+        for event in self.pending_events:
 
-            self.last_results = results
-
-            #
-            # Collect newly generated events
-            #
-
-            for result in results:
-
-                if result.events:
-
-                    self.pending_events.extend(
-                        result.events
-                    )
-
-            #
-            # Pipeline
-            #
-
-            await self.process_events()
-
-            await self.announce()
-
-            await self.save_state()
-
-            self.last_error = None
+            self.logger.info(
+                "[%s] %s",
+                event.source,
+                event.title,
+            )
 
         except Exception as exc:
 
@@ -263,37 +449,30 @@ class ProductionEngine:
 
     async def process_events(self) -> None:
         """
-        Processes queued production events.
+        Processes queued ProductionEvents.
 
-        At present this stage performs logging only.
-
-        Future phases will enrich events with
-        timeline information, AI summaries,
-        statistics, and persistence.
+        Future phases will enrich events with AI,
+        timelines, statistics, and persistence.
         """
 
         if not self.pending_events:
-
             return
 
         self.logger.info(
-
             "Processing %d production event(s).",
-
             self.pending_event_count,
-
         )
+
+        #
+        # Currently events are simply logged.
+        #
 
         for event in self.pending_events:
 
             self.logger.info(
-
                 "[%s] %s",
-
                 event.source,
-
                 event.title,
-
             )
 
     # =====================================================
@@ -301,8 +480,9 @@ class ProductionEngine:
     # =====================================================
 
     async def announce(self) -> None:
+
         """
-        Announces every queued production event.
+        Announces queued ProductionEvents.
 
         Events remain queued until successfully
         announced.
@@ -323,7 +503,8 @@ class ProductionEngine:
             except Exception:
 
                 #
-                # Put the event back.
+                # Put the event back into the queue
+                # so it can be retried later.
                 #
 
                 self.pending_events.appendleft(
@@ -331,9 +512,7 @@ class ProductionEngine:
                 )
 
                 self.logger.exception(
-
                     "Announcement failed."
-
                 )
 
                 break
@@ -346,15 +525,11 @@ class ProductionEngine:
         """
         Persists runtime state.
 
-        Storage already owns persistence.
-        Future phases may extend this to save
-        timelines, monitor history, AI summaries,
-        and queued events.
+        Storage currently persists values as they
+        change. This hook exists so future phases
+        can save monitor history, timelines,
+        analytics, and queued events.
         """
-
-        #
-        # Storage setters automatically persist.
-        #
 
         return
         # =====================================================
@@ -396,34 +571,39 @@ class ProductionEngine:
 
             "monitor_count": self.monitor_count,
 
-            "healthy_monitors": (
-                self.healthy_monitor_count
-            ),
+            "healthy_monitors":
+                self.healthy_monitor_count,
 
-            "pending_events": (
-                self.pending_event_count
-            ),
+            "pending_events":
+                self.pending_event_count,
 
-            "error_count": self.error_count,
+            "error_count":
+                self.error_count,
 
-            "last_error": self.last_error,
+            "last_error":
+                self.last_error,
 
             "monitors": [
 
                 {
 
-                    "name": result.monitor,
+                    "name":
+                        result.monitor,
 
-                    "status": result.status.value,
+                    "status":
+                        result.status.value,
 
-                    "changed": result.changed,
+                    "changed":
+                        result.changed,
 
-                    "detail": result.detail,
+                    "detail":
+                        result.detail,
 
-                    "duration_ms": round(
+                    "duration_ms":
                         result.duration_ms,
-                        2,
-                    ),
+
+                    "events":
+                        len(result.events),
 
                 }
 
@@ -434,7 +614,7 @@ class ProductionEngine:
         }
 
     # =====================================================
-    # About Julie
+    # Information
     # =====================================================
 
     def info(self) -> dict:
@@ -453,17 +633,26 @@ class ProductionEngine:
 
             "build": BUILD,
 
-            "uptime": self._format_uptime(
-                self.uptime
-            ),
-
             "started_at": self._iso(
                 self.started_at
             ),
 
-        }
+            "uptime": self._format_uptime(
+                self.uptime
+            ),
 
-    # =====================================================
+            "watcher": {
+
+                "registered_monitors":
+                    self.monitor_count,
+
+                "healthy_monitors":
+                    self.healthy_monitor_count,
+
+            },
+
+        }
+        # =====================================================
     # Shutdown
     # =====================================================
 
@@ -474,14 +663,14 @@ class ProductionEngine:
 
         self.running = False
 
-        self.logger.info(
-            "Production Engine shutting down."
-        )
-
         await self.save_state()
 
+        self.logger.info(
+            "Production Engine stopped."
+        )
+
     # =====================================================
-    # Debug
+    # Debug Representation
     # =====================================================
 
     def __repr__(self) -> str:
@@ -494,6 +683,8 @@ class ProductionEngine:
 
             f"monitors={self.monitor_count}, "
 
-            f"queued_events={self.pending_event_count})"
+            f"queued_events={self.pending_event_count}, "
+
+            f"errors={self.error_count})"
 
         )
