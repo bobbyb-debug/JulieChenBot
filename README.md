@@ -12,6 +12,24 @@ Features
 - Slash Commands
 - AI Game Analysis
 
+Julie ChenBot
+=============
+
+Production Status
+
+✓ Engine 2.0
+✓ Watcher
+✓ Scheduler
+✓ Storage
+✓ Event Pipeline
+✓ Discord Announcer
+✓ Integration Tests
+
+Running Tests
+
+pip install -r requirements-dev.txt
+
+python -m pytest
 ---
 
 Inspired by the production style of Big Brother.

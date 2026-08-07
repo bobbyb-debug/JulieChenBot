@@ -9,32 +9,28 @@ from __future__ import annotations
 
 import sys
 
-from config import BOT_NAME, VERSION
 from core.application import JulieApplication
-from personality.julie import Julie
-from services.logger import ProductionLogger
-
-
-def banner() -> None:
-
-    print()
-    print("═" * 55)
-    print(f"🤖 {BOT_NAME} v{VERSION}")
-    print("═" * 55)
-    print()
+from services.logger import (
+    ProductionLogger,
+    generate_session_id,
+    shutdown_banner,
+    startup_banner,
+)
 
 
 def main() -> None:
 
     logger = ProductionLogger.get("Bot")
-    julie = Julie()
 
-    banner()
+    session_id = generate_session_id()
 
-    print(julie.startup())
+    print(startup_banner(session_id))
     print()
 
     logger.info("Production systems are coming online.")
+    logger.info("Session ID: %s", session_id)
+
+    app = None
 
     try:
 
@@ -50,8 +46,26 @@ def main() -> None:
 
     except KeyboardInterrupt:
 
+        # Read whatever engine stats are available; any missing
+        # link in the chain (app never built, engine never
+        # started) falls back to None, and shutdown_banner()
+        # reports those as "N/A".
+        engine = getattr(
+            getattr(getattr(app, "discord", None), "scheduler", None),
+            "engine",
+            None,
+        )
+
         print()
-        print(julie.shutdown())
+        print(
+            shutdown_banner(
+                session_id,
+                uptime=getattr(engine, "uptime", None),
+                tick_count=getattr(engine, "tick_count", None),
+                error_count=getattr(engine, "error_count", None),
+            )
+        )
+
         logger.info("Julie ChenBot stopped by user.")
 
     except Exception:
