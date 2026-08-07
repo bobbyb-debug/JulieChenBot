@@ -12,7 +12,7 @@ individual monitor classes.
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 from config import (
@@ -56,7 +56,7 @@ class ProductionEngine:
 
         self.announcer = ProductionAnnouncer()
 
-        self.started_at = datetime.utcnow()
+        self.started_at = datetime.now(UTC)
         self.running = False
         self.tick_count = 0
         self.error_count = 0
@@ -79,7 +79,7 @@ class ProductionEngine:
     def uptime(self) -> timedelta:
         """Returns how long the engine has been running."""
 
-        return datetime.utcnow() - self.started_at
+        return datetime.now(UTC) - self.started_at
 
     @property
     def monitor_count(self) -> int:
@@ -145,7 +145,7 @@ class ProductionEngine:
         """
 
         self.running = True
-        self.last_tick_at = datetime.utcnow()
+        self.last_tick_at = datetime.now(UTC)
 
         try:
             results, events = await self.watcher.run()
