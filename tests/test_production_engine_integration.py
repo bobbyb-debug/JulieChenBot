@@ -14,8 +14,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from database.storage import Storage
+from production.competition import CompetitionState, CompetitionType
 from production.engine import ProductionEngine
 from production.events import EventType, ProductionEvent
+from production.house_status import HouseStatus
 from production.monitors import MonitorResult, MonitorStatus
 from production.rss import FeedUpdate
 from services.scheduler import Scheduler
@@ -33,6 +35,38 @@ class SpyEvent(ProductionEvent):
         super().mark_announced()
 
 
+class HouseStatusDouble:
+    """Minimal stand-in for ProductionWatcher.house_status."""
+
+    def __init__(self) -> None:
+        self.current = HouseStatus()
+
+    def update(self, status: HouseStatus) -> None:
+        self.current = status
+
+    @property
+    def hoh(self) -> str:
+        return self.current.hoh
+
+
+class CompetitionDouble:
+    """Minimal stand-in for ProductionWatcher.competition."""
+
+    def __init__(self) -> None:
+        self.current = CompetitionState()
+
+    def update(self, state: CompetitionState) -> None:
+        self.current = state
+
+    @property
+    def winner(self) -> str:
+        return self.current.winner
+
+    @property
+    def competition(self) -> CompetitionType:
+        return self.current.competition
+
+
 class WatcherDouble:
     """Minimal watcher double with the ProductionWatcher public contract."""
 
@@ -47,6 +81,11 @@ class WatcherDouble:
         self.error = error
         self.run_calls = 0
         self.total_monitors = len(self.results)
+
+        # ProductionEngine feeds parsed RSS state through these public
+        # watcher collaborators before executing the watcher cycle.
+        self.house_status = HouseStatusDouble()
+        self.competition = CompetitionDouble()
 
     async def run(self) -> tuple[list[MonitorResult], list[ProductionEvent]]:
         self.run_calls += 1
