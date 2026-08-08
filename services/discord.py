@@ -8,6 +8,7 @@ Responsible for:
 • Loading slash commands
 • Starting Julie's Production Scheduler
 • Managing Presence
+• Binding Discord as a production output
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ class DiscordService:
             intents=intents,
             help_command=None,
         )
+
+        # Bind the existing Discord client to the production announcer.
+        # The engine remains Discord-agnostic; the announcer owns outputs.
+        self.scheduler.engine.announcer.bind_discord(self.bot)
 
         self.register_events()
 
@@ -101,10 +106,6 @@ class DiscordService:
                 self.logger.exception(
                     "Failed syncing slash commands."
                 )
-
-            #
-            # Start Production Scheduler
-            #
 
             asyncio.create_task(
                 self.scheduler.start()
