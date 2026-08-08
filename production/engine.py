@@ -18,10 +18,10 @@ from typing import Optional
 from config import BOT_NAME, BUILD, PHASE, VERSION
 from database.storage import Storage
 from production.announcer import ProductionAnnouncer
-from production.events import ProductionEvent
+from production.events import EventSeverity, EventType, ProductionEvent
 from production.monitors import MonitorResult, MonitorStatus
 from production.parser import ProductionParser
-from production.rss import JokersRSS
+from production.rss import FeedUpdate, JokersRSS
 from production.watcher import ProductionWatcher
 from services.logger import ProductionLogger
 
@@ -79,6 +79,28 @@ class ProductionEngine:
     def _format_uptime(uptime: timedelta) -> str:
         return str(timedelta(seconds=int(uptime.total_seconds())))
 
+    @staticmethod
+    def _rss_event(update: FeedUpdate) -> ProductionEvent:
+        """Converts one Joker's Updates item into a publishable event."""
+
+        detail = update.title.strip()
+        if update.description and update.description.strip():
+            detail = update.description.strip()
+
+        return ProductionEvent(
+            source="Joker's Updates",
+            event_type=EventType.RSS_UPDATE,
+            title="LIVE FEED UPDATE",
+            detail=detail,
+            severity=EventSeverity.INFO,
+            metadata={
+                "guid": update.guid,
+                "link": update.link,
+                "published": update.published,
+                "rss_title": update.title,
+            },
+        )
+
     async def tick(self) -> None:
         """Executes one complete production cycle."""
 
@@ -89,9 +111,9 @@ class ProductionEngine:
             had_rss_snapshot = bool(self.storage.last_guid)
             rss_update = self.rss.check()
 
-            # On first launch, check() deliberately stores the current item
-            # and returns None. Read that same current item once so Julie can
-            # establish an initial production snapshot immediately.
+            # On first launch, check() stores the current item and returns
+            # None. Read that same current item so Julie can publish an
+            # initial live-feed snapshot immediately.
             if rss_update is None and not had_rss_snapshot:
                 rss_update = self.rss.current()
                 if rss_update is not None:
@@ -103,11 +125,17 @@ class ProductionEngine:
             if rss_update is None:
                 self.logger.info("RSS: no new feed item.")
             else:
-                if had_rss_snapshot:
-                    self.logger.info(
-                        "RSS update detected: %s",
-                        rss_update.title,
-                    )
+                self.logger.info(
+                    "RSS update detected: %s",
+                    rss_update.title,
+                )
+
+                # Every newly surfaced RSS item is a production event. The
+                # parser may additionally recognize production-state changes,
+                # which are fed into the built-in monitors below.
+                self.pending_events.append(
+                    self._rss_event(rss_update)
+                )
 
                 parsed = self.parser.parse(rss_update)
 
