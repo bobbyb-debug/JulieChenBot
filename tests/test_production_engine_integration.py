@@ -17,6 +17,7 @@ from database.storage import Storage
 from production.engine import ProductionEngine
 from production.events import EventType, ProductionEvent
 from production.monitors import MonitorResult, MonitorStatus
+from production.rss import FeedUpdate
 from services.scheduler import Scheduler
 
 
@@ -56,6 +57,20 @@ class WatcherDouble:
             raise self.error
 
         return self.results, self.events
+
+
+class RSSDouble:
+    """Minimal RSS double that avoids network access in integration tests."""
+
+    def __init__(self, update: FeedUpdate | None = None) -> None:
+        self.update = update
+        self.check_calls = 0
+
+    def check(self) -> FeedUpdate | None:
+        self.check_calls += 1
+        update = self.update
+        self.update = None
+        return update
 
 
 class AnnouncerDouble:
@@ -129,12 +144,14 @@ def make_engine(
     storage: Storage,
     watcher: WatcherDouble | None = None,
     announcer: AnnouncerDouble | None = None,
+    rss_update: FeedUpdate | None = None,
 ) -> ProductionEngine:
     """Creates a real engine with controlled pipeline collaborators."""
 
     engine = ProductionEngine(storage=storage)
     engine.watcher = watcher or WatcherDouble()
     engine.announcer = announcer or AnnouncerDouble()
+    engine.rss = RSSDouble(rss_update)
 
     return engine
 
@@ -181,6 +198,33 @@ def test_tick_runs_complete_pipeline_and_clears_last_error(
     engine.process_events.assert_awaited_once()
     engine.announce.assert_awaited_once()
     engine.save_state.assert_awaited_once()
+
+
+def test_tick_applies_new_rss_state_to_monitors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A new RSS item is parsed and supplied to both built-in monitors."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    engine = make_engine(
+        Storage(),
+        rss_update=FeedUpdate(
+            guid="rss-1",
+            title="Morgan won HOH",
+            description="",
+            link="https://example.test/rss-1",
+            published="2026-08-08T00:00:00Z",
+        ),
+    )
+
+    asyncio.run(engine.tick())
+
+    assert engine.watcher.house_status.hoh == "Morgan"
+    assert engine.watcher.competition.winner == "Morgan"
+    assert engine.watcher.competition.competition.value == "Head of Household"
+    assert engine.tick_count == 1
 
 
 def test_failed_cycle_records_error_without_counting_success(
