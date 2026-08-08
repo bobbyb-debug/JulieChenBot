@@ -48,14 +48,10 @@ class WatcherDouble:
         self.run_calls = 0
         self.total_monitors = len(self.results)
 
-    async def run(
-        self,
-    ) -> tuple[list[MonitorResult], list[ProductionEvent]]:
+    async def run(self) -> tuple[list[MonitorResult], list[ProductionEvent]]:
         self.run_calls += 1
-
         if self.error is not None:
             raise self.error
-
         return self.results, self.events
 
 
@@ -72,23 +68,19 @@ class RSSDouble:
         self.update = None
         return update
 
+    def current(self) -> FeedUpdate | None:
+        return self.update
+
 
 class AnnouncerDouble:
     """Minimal announcer double that can fail for a chosen event."""
 
-    def __init__(
-        self,
-        failing_event: ProductionEvent | None = None,
-    ) -> None:
+    def __init__(self, failing_event: ProductionEvent | None = None) -> None:
         self.failing_event = failing_event
         self.events: list[ProductionEvent] = []
 
-    async def announce(
-        self,
-        event: ProductionEvent,
-    ) -> None:
+    async def announce(self, event: ProductionEvent) -> None:
         self.events.append(event)
-
         if event is self.failing_event:
             raise RuntimeError("announcement failed")
 
@@ -103,19 +95,15 @@ class EngineDouble:
 
     async def tick(self) -> None:
         self.tick_calls += 1
-
         if self.failure is not None:
             failure = self.failure
             self.failure = None
             raise failure
-
         if self.on_tick is not None:
             self.on_tick()
 
 
-def make_event(
-    title: str = "Production event",
-) -> SpyEvent:
+def make_event(title: str = "Production event") -> SpyEvent:
     """Creates an event with the repository's concrete event contract."""
 
     return SpyEvent(
@@ -126,9 +114,7 @@ def make_event(
     )
 
 
-def make_result(
-    events: list[ProductionEvent] | None = None,
-) -> MonitorResult:
+def make_result(events: list[ProductionEvent] | None = None) -> MonitorResult:
     """Creates a healthy result produced by a monitor."""
 
     return MonitorResult(
@@ -152,7 +138,6 @@ def make_engine(
     engine.watcher = watcher or WatcherDouble()
     engine.announcer = announcer or AnnouncerDouble()
     engine.rss = RSSDouble(rss_update)
-
     return engine
 
 
@@ -178,9 +163,7 @@ def test_tick_runs_complete_pipeline_and_clears_last_error(
         observed_pending_events.extend(engine.pending_events)
         await original_process_events()
 
-    engine.process_events = AsyncMock(
-        side_effect=observe_process_events,
-    )
+    engine.process_events = AsyncMock(side_effect=observe_process_events)
     engine.announce = AsyncMock(wraps=engine.announce)
     engine.save_state = AsyncMock(wraps=engine.save_state)
 
