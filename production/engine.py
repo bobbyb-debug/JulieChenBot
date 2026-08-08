@@ -28,18 +28,14 @@ from production.monitors import (
     MonitorResult,
     MonitorStatus,
 )
+from production.parser import ProductionParser
+from production.rss import JokersRSS
 from production.watcher import ProductionWatcher
 from services.logger import ProductionLogger
 
 
 class ProductionEngine:
-    """
-    Coordinates Julie ChenBot's production systems.
-
-    The engine runs registered monitors, queues their events, forwards
-    events to the announcer, and persists storage changes. It contains
-    no monitor-specific business logic.
-    """
+    """Coordinates Julie ChenBot's production systems."""
 
     def __init__(
         self,
@@ -49,6 +45,12 @@ class ProductionEngine:
         self.logger = ProductionLogger.get("Engine")
 
         self.storage = storage or Storage()
+
+        self.rss = JokersRSS(
+            storage=self.storage,
+        )
+
+        self.parser = ProductionParser()
 
         self.watcher = ProductionWatcher(
             storage=self.storage,
@@ -64,7 +66,6 @@ class ProductionEngine:
         self.last_tick_at: Optional[datetime] = None
 
         self.last_results: list[MonitorResult] = []
-
         self.pending_events: deque[ProductionEvent] = deque()
 
         self.logger.info(
@@ -77,20 +78,14 @@ class ProductionEngine:
 
     @property
     def uptime(self) -> timedelta:
-        """Returns how long the engine has been running."""
-
         return datetime.now(UTC) - self.started_at
 
     @property
     def monitor_count(self) -> int:
-        """Returns the number of registered monitors."""
-
         return self.watcher.total_monitors
 
     @property
     def healthy_monitor_count(self) -> int:
-        """Returns the number of healthy monitors in the last cycle."""
-
         return sum(
             result.status == MonitorStatus.HEALTHY
             for result in self.last_results
@@ -98,8 +93,6 @@ class ProductionEngine:
 
     @property
     def pending_event_count(self) -> int:
-        """Returns the number of queued production events."""
-
         return len(self.pending_events)
 
     # =====================================================
@@ -110,24 +103,17 @@ class ProductionEngine:
     def _iso(
         value: Optional[datetime],
     ) -> Optional[str]:
-        """Returns an ISO timestamp when a value is available."""
-
         if value is None:
             return None
-
         return value.isoformat()
 
     @staticmethod
     def _format_uptime(
         uptime: timedelta,
     ) -> str:
-        """Formats an uptime duration for display."""
-
         return str(
             timedelta(
-                seconds=int(
-                    uptime.total_seconds()
-                )
+                seconds=int(uptime.total_seconds())
             )
         )
 
@@ -136,18 +122,41 @@ class ProductionEngine:
     # =====================================================
 
     async def tick(self) -> None:
-        """
-        Executes one complete production cycle.
-
-        ProductionWatcher returns both monitor results and the events
-        collected from those results. The engine queues and announces
-        events without interpreting their contents.
-        """
+        """Executes one complete production cycle."""
 
         self.running = True
         self.last_tick_at = datetime.now(UTC)
 
         try:
+            rss_update = self.rss.check()
+
+            if rss_update is None:
+                self.logger.info("RSS: no new feed item.")
+            else:
+                self.logger.info(
+                    "RSS update detected: %s",
+                    rss_update.title,
+                )
+
+                parsed = self.parser.parse(rss_update)
+
+                if parsed.recognized:
+                    self.watcher.house_status.update(
+                        parsed.house_status
+                    )
+                    self.watcher.competition.update(
+                        parsed.competition
+                    )
+
+                    self.logger.info(
+                        "RSS production state applied: %s",
+                        ", ".join(parsed.fields),
+                    )
+                else:
+                    self.logger.info(
+                        "RSS update contained no recognized production state."
+                    )
+
             results, events = await self.watcher.run()
 
             self.last_results = results
@@ -179,12 +188,7 @@ class ProductionEngine:
     # =====================================================
 
     async def process_events(self) -> None:
-        """
-        Records queued events before announcement.
-
-        Event interpretation belongs to monitors and publishing belongs
-        to ProductionAnnouncer, so this stage only coordinates the flow.
-        """
+        """Records queued events before announcement."""
 
         if not self.pending_events:
             return
@@ -206,13 +210,7 @@ class ProductionEngine:
     # =====================================================
 
     async def announce(self) -> None:
-        """
-        Announces queued events in order.
-
-        An event is removed only after a successful announcement. A
-        failed announcement remains at the front of the queue for a
-        future cycle.
-        """
+        """Announces queued events in order."""
 
         while self.pending_events:
             event = self.pending_events.popleft()
@@ -235,13 +233,7 @@ class ProductionEngine:
     # =====================================================
 
     async def save_state(self) -> None:
-        """
-        Persists the storage state used by monitors.
-
-        Storage writes individual updates immediately. Saving here makes
-        the end-of-cycle persistence boundary explicit without inventing
-        a second runtime-state schema.
-        """
+        """Persists the storage state used by monitors."""
 
         self.storage.save()
 
@@ -260,10 +252,7 @@ class ProductionEngine:
             ),
             "running": self.running,
             "started_at": self._iso(self.started_at),
-            "uptime_seconds": round(
-                self.uptime.total_seconds(),
-                1,
-            ),
+            "uptime_seconds": round(self.uptime.total_seconds(), 1),
             "uptime": self._format_uptime(self.uptime),
             "tick_count": self.tick_count,
             "last_tick_at": self._iso(self.last_tick_at),
@@ -310,15 +299,9 @@ class ProductionEngine:
     # =====================================================
 
     async def shutdown(self) -> None:
-        """Stops the engine and persists monitor storage state."""
-
         self.running = False
-
         await self.save_state()
-
-        self.logger.info(
-            "Production Engine stopped."
-        )
+        self.logger.info("Production Engine stopped.")
 
     # =====================================================
     # Debug Representation
