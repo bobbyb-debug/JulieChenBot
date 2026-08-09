@@ -20,21 +20,29 @@ Fetcher = Callable[[], Awaitable[str]]
 
 
 class QuickviewMonitor(Monitor):
-    """Detects changes on the public JokersUpdates quickview pages."""
+    """Detects changes on one public JokersUpdates quickview page."""
 
-    STORAGE_KEY = "quickview_updates_last_hash"
     URL = "http://forums.jokersupdates.com/ubbthreads/quickview/updates.php"
+    STORAGE_KEY = "quickview_updates_last_hash"
     TITLE = "JOKERSUPDATES QUICKVIEW UPDATED"
+    SOURCE = "JokersUpdates Quickview"
 
     def __init__(
         self,
         storage: Storage | None = None,
         fetcher: Fetcher | None = None,
+        *,
+        url: str | None = None,
+        storage_key: str | None = None,
+        source: str | None = None,
     ) -> None:
         super().__init__()
         self.storage = storage or Storage()
+        self.url = url or self.URL
+        self.storage_key = storage_key or self.STORAGE_KEY
+        self.source = source or self.SOURCE
         self.fetcher = fetcher or self._fetch
-        logger.info("Quickview monitor initialized.")
+        logger.info("Quickview monitor initialized: %s", self.url)
 
     @staticmethod
     def normalize(html: str) -> str:
@@ -56,7 +64,7 @@ class QuickviewMonitor(Monitor):
             return response.read().decode("utf-8", errors="replace")
 
     async def _fetch(self) -> str:
-        return await asyncio.to_thread(self._fetch_sync, self.URL)
+        return await asyncio.to_thread(self._fetch_sync, self.url)
 
     async def check(self) -> MonitorResult:
         try:
@@ -69,21 +77,21 @@ class QuickviewMonitor(Monitor):
                     status=MonitorStatus.DEGRADED,
                     changed=False,
                     detail="Quickview returned no visible page content.",
-                    metadata={"url": self.URL},
+                    metadata={"url": self.url},
                 )
 
             digest = hashlib.sha256(visible.encode("utf-8")).hexdigest()
-            previous = self.storage.get(self.STORAGE_KEY, "")
+            previous = self.storage.get(self.storage_key, "")
 
             if not previous:
-                self.storage.set(self.STORAGE_KEY, digest)
-                logger.info("Created first Quickview snapshot.")
+                self.storage.set(self.storage_key, digest)
+                logger.info("Created first Quickview snapshot: %s", self.url)
                 return MonitorResult(
                     monitor=self.name,
                     status=MonitorStatus.HEALTHY,
                     changed=False,
                     detail="Initial Quickview snapshot captured.",
-                    metadata={"url": self.URL},
+                    metadata={"url": self.url},
                 )
 
             if digest == previous:
@@ -92,27 +100,27 @@ class QuickviewMonitor(Monitor):
                     status=MonitorStatus.HEALTHY,
                     changed=False,
                     detail="Quickview unchanged.",
-                    metadata={"url": self.URL},
+                    metadata={"url": self.url},
                 )
 
-            self.storage.set(self.STORAGE_KEY, digest)
+            self.storage.set(self.storage_key, digest)
             event = ProductionEvent(
-                source="Quickview",
+                source=self.source,
                 event_type=EventType.TIMELINE,
                 title=self.TITLE,
                 detail="JokersUpdates quickview content changed.",
                 severity=EventSeverity.NOTICE,
-                metadata={"url": self.URL},
+                metadata={"url": self.url},
             )
 
-            logger.info("Quickview page changed.")
+            logger.info("Quickview page changed: %s", self.url)
             return MonitorResult(
                 monitor=self.name,
                 status=MonitorStatus.HEALTHY,
                 changed=True,
                 detail="Quickview page changed.",
                 events=[event],
-                metadata={"url": self.URL},
+                metadata={"url": self.url},
             )
 
         except Exception as exc:
@@ -122,5 +130,14 @@ class QuickviewMonitor(Monitor):
                 status=MonitorStatus.DEGRADED,
                 changed=False,
                 detail=f"Quickview check failed: {exc}",
-                metadata={"url": self.URL},
+                metadata={"url": self.url},
             )
+
+
+class BBUpdatesMonitor(QuickviewMonitor):
+    """Monitors the legacy JokersUpdates BB updates quickview page."""
+
+    URL = "http://forums.jokersupdates.com/ubbthreads/quickview/bbupdates.php"
+    STORAGE_KEY = "bbupdates_last_hash"
+    TITLE = "JOKERSUPDATES BB UPDATES UPDATED"
+    SOURCE = "JokersUpdates BB Updates"
