@@ -17,6 +17,7 @@ from production.events import ProductionEvent
 from production.hamsterwatch import HamsterwatchMonitor
 from production.house_status import HouseStatusMonitor
 from production.monitors import Monitor, MonitorResult, MonitorStatus
+from production.quickview import QuickviewMonitor
 from production.x_updates import XUpdatesMonitor
 from services.logger import ProductionLogger
 
@@ -32,6 +33,7 @@ class ProductionWatcher:
         self.house_status: HouseStatusMonitor
         self.competition: CompetitionMonitor
         self.hamsterwatch: HamsterwatchMonitor
+        self.quickview: QuickviewMonitor
         self.x_updates: XUpdatesMonitor
         self._register_builtin_monitors()
         logger.info("Production Watcher initialized.")
@@ -46,6 +48,9 @@ class ProductionWatcher:
 
         self.hamsterwatch = HamsterwatchMonitor(storage=self.storage)
         self.register(self.hamsterwatch)
+
+        self.quickview = QuickviewMonitor(storage=self.storage)
+        self.register(self.quickview)
 
         self.x_updates = XUpdatesMonitor(storage=self.storage)
         self.register(self.x_updates)
