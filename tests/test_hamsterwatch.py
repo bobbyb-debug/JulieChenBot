@@ -27,7 +27,7 @@ def fetcher(value):
 
 def test_first_run_baselines_without_event():
     storage = FakeStorage()
-    monitor = HamsterwatchMonitor(storage=storage, fetch=fetcher("<body>v1</body>"))
+    monitor = HamsterwatchMonitor(storage=storage, fetcher=fetcher("<body>v1</body>"))
     result = asyncio.run(monitor.check())
     assert result.status == MonitorStatus.HEALTHY
     assert result.changed is False
@@ -37,7 +37,7 @@ def test_first_run_baselines_without_event():
 
 def test_unchanged_page_produces_no_event():
     storage = FakeStorage()
-    monitor = HamsterwatchMonitor(storage=storage, fetch=fetcher("<body>v1</body>"))
+    monitor = HamsterwatchMonitor(storage=storage, fetcher=fetcher("<body>v1</body>"))
     asyncio.run(monitor.check())
     result = asyncio.run(monitor.check())
     assert result.changed is False
@@ -46,9 +46,9 @@ def test_unchanged_page_produces_no_event():
 
 def test_changed_page_produces_one_timeline_event():
     storage = FakeStorage()
-    monitor = HamsterwatchMonitor(storage=storage, fetch=fetcher("<body>v1</body>"))
+    monitor = HamsterwatchMonitor(storage=storage, fetcher=fetcher("<body>v1</body>"))
     asyncio.run(monitor.check())
-    monitor.fetch = fetcher("<body>v2</body>")
+    monitor.fetcher = fetcher("<body>v2</body>")
     result = asyncio.run(monitor.check())
     assert result.changed is True
     assert len(result.events) == 1
@@ -60,7 +60,7 @@ def test_changed_page_produces_one_timeline_event():
 def test_fetch_failure_is_degraded():
     monitor = HamsterwatchMonitor(
         storage=FakeStorage(),
-        fetch=fetcher(ConnectionError("offline")),
+        fetcher=fetcher(ConnectionError("offline")),
     )
     result = asyncio.run(monitor.check())
     assert result.status == MonitorStatus.DEGRADED
@@ -77,9 +77,9 @@ def test_hamsterwatch_is_registered_with_watcher():
 def test_hamsterwatch_event_flows_through_watcher():
     storage = FakeStorage()
     watcher = ProductionWatcher(storage=storage)
-    watcher.hamsterwatch.fetch = fetcher("<body>v1</body>")
+    watcher.hamsterwatch.fetcher = fetcher("<body>v1</body>")
     asyncio.run(watcher.run())
-    watcher.hamsterwatch.fetch = fetcher("<body>v2</body>")
+    watcher.hamsterwatch.fetcher = fetcher("<body>v2</body>")
     _, events = asyncio.run(watcher.run())
     hamster_events = [event for event in events if event.source == "Hamsterwatch"]
     assert len(hamster_events) == 1
