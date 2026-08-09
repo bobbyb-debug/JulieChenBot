@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from collections.abc import Awaitable, Callable
 from html import unescape
 from urllib.request import Request, urlopen
 
@@ -15,6 +16,8 @@ from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("Hamsterwatch")
 
+Fetcher = Callable[[], Awaitable[str]]
+
 
 class HamsterwatchMonitor(Monitor):
     """Detects changes to the public Hamsterwatch Big Brother page."""
@@ -22,9 +25,14 @@ class HamsterwatchMonitor(Monitor):
     URL = "https://hamsterwatch.com/"
     STORAGE_KEY = "hamsterwatch_last_hash"
 
-    def __init__(self, storage: Storage | None = None) -> None:
+    def __init__(
+        self,
+        storage: Storage | None = None,
+        fetcher: Fetcher | None = None,
+    ) -> None:
         super().__init__()
         self.storage = storage or Storage()
+        self.fetcher = fetcher or self._fetch
         logger.info("Hamsterwatch monitor initialized.")
 
     @staticmethod
@@ -46,13 +54,13 @@ class HamsterwatchMonitor(Monitor):
         with urlopen(request, timeout=20) as response:
             return response.read().decode("utf-8", errors="replace")
 
-    async def fetch(self) -> str:
+    async def _fetch(self) -> str:
         """Fetch the page without blocking the production event loop."""
         return await asyncio.to_thread(self._fetch_sync, self.URL)
 
     async def check(self) -> MonitorResult:
         try:
-            html = await self.fetch()
+            html = await self.fetcher()
             visible = self.normalize(html)
 
             if not visible:
