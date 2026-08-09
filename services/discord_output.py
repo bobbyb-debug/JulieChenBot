@@ -3,15 +3,9 @@ Julie ChenBot Discord Production Output
 =======================================
 
 Routes ProductionEvents to the appropriate Discord channels.
-
-This module is intentionally an output adapter: it knows about Discord,
-channel routing, and presentation, but it does not interpret RSS feeds or
-production state.
 """
 
 from __future__ import annotations
-
-from collections.abc import Iterable
 
 import discord
 
@@ -41,9 +35,7 @@ class DiscordOutputRouter:
 
     async def publish(self, event: ProductionEvent) -> None:
         """Routes and publishes one production event."""
-
         destinations = self._destinations(event)
-
         if not destinations:
             self.logger.warning(
                 "No Discord destination configured for event: %s",
@@ -53,24 +45,16 @@ class DiscordOutputRouter:
 
         sent = 0
         seen: set[int] = set()
-
         for channel_id, channel_name in destinations:
             channel = await self._resolve_channel(channel_id, channel_name)
-
             if channel is None:
-                self.logger.warning(
-                    "Discord channel unavailable: #%s",
-                    channel_name,
-                )
+                self.logger.warning("Discord channel unavailable: #%s", channel_name)
                 continue
-
             if channel.id in seen:
                 continue
-
             seen.add(channel.id)
             await channel.send(embed=self._build_embed(event))
             sent += 1
-
             self.logger.info(
                 "Published %s to #%s.",
                 event.event_type.value,
@@ -82,19 +66,13 @@ class DiscordOutputRouter:
                 f"Unable to publish {event.event_type.value}: no Discord destination was reachable."
             )
 
-    def _destinations(
-        self,
-        event: ProductionEvent,
-    ) -> list[tuple[int, str]]:
-        """Returns configured channel destinations for an event."""
-
+    def _destinations(self, event: ProductionEvent) -> list[tuple[int, str]]:
         destinations: list[tuple[int, str]] = []
 
-        if event.event_type == EventType.RSS_UPDATE:
+        if event.event_type in {EventType.RSS_UPDATE, EventType.TIMELINE}:
             destinations.append(
                 (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"])
             )
-
         elif event.event_type in {
             EventType.HOUSE_STATUS_CHANGED,
             EventType.HOH_CHANGED,
@@ -104,26 +82,20 @@ class DiscordOutputRouter:
             EventType.FEEDS_UP,
             EventType.FEEDS_DOWN,
         }:
-            destinations.extend(
-                [
-                    (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
-                    (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
-                ]
-            )
-
+            destinations.extend([
+                (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
+                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
+            ])
         elif event.event_type in {
             EventType.COMPETITION_STARTED,
             EventType.COMPETITION_FINISHED,
             EventType.COMPETITION_CHANGED,
             EventType.COMPETITION_WINNER,
         }:
-            destinations.extend(
-                [
-                    (PRODUCTION_CHANNEL, self._CHANNEL_NAMES["production"]),
-                    (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
-                ]
-            )
-
+            destinations.extend([
+                (PRODUCTION_CHANNEL, self._CHANNEL_NAMES["production"]),
+                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
+            ])
         else:
             destinations.append(
                 (PRODUCTION_CHANNEL, self._CHANNEL_NAMES["production"])
@@ -135,33 +107,20 @@ class DiscordOutputRouter:
             EventSeverity.CRITICAL,
         } and PRODUCTION_LOG_CHANNEL:
             destinations.append(
-                (
-                    PRODUCTION_LOG_CHANNEL,
-                    self._CHANNEL_NAMES["production_log"],
-                )
+                (PRODUCTION_LOG_CHANNEL, self._CHANNEL_NAMES["production_log"])
             )
 
         return destinations
 
-    async def _resolve_channel(
-        self,
-        channel_id: int,
-        channel_name: str,
-    ):
-        """Resolves a configured channel ID, then falls back to its name."""
-
+    async def _resolve_channel(self, channel_id: int, channel_name: str):
         if channel_id:
             channel = self.bot.get_channel(channel_id)
             if channel is not None:
                 return channel
-
             try:
                 return await self.bot.fetch_channel(channel_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                self.logger.exception(
-                    "Failed to fetch Discord channel %s.",
-                    channel_id,
-                )
+                self.logger.exception("Failed to fetch Discord channel %s.", channel_id)
 
         return discord.utils.find(
             lambda channel: getattr(channel, "name", "") == channel_name,
@@ -170,8 +129,6 @@ class DiscordOutputRouter:
 
     @staticmethod
     def _build_embed(event: ProductionEvent) -> discord.Embed:
-        """Builds the Discord presentation for a production event."""
-
         colors = {
             EventSeverity.DEBUG: 0x95A5A6,
             EventSeverity.INFO: 0x3498DB,
@@ -183,6 +140,8 @@ class DiscordOutputRouter:
 
         if event.event_type == EventType.RSS_UPDATE:
             title = "🟦 LIVE FEED UPDATE"
+        elif event.event_type == EventType.TIMELINE and event.source == "Hamsterwatch":
+            title = "🐹 HAMSTERWATCH UPDATE"
         else:
             title = event.title
 
@@ -193,21 +152,18 @@ class DiscordOutputRouter:
             timestamp=event.created_at,
         )
 
-        link = event.metadata.get("link")
+        link = event.metadata.get("link") or event.metadata.get("url")
         if link:
+            label = "Hamsterwatch" if event.source == "Hamsterwatch" else "Joker's Updates"
             embed.add_field(
                 name="🔗 Read More",
-                value=f"[Joker's Updates]({link})",
+                value=f"[{label}]({link})",
                 inline=False,
             )
 
         published = event.metadata.get("published")
         if published:
-            embed.add_field(
-                name="🕒 Published",
-                value=str(published),
-                inline=False,
-            )
+            embed.add_field(name="🕒 Published", value=str(published), inline=False)
 
-        embed.set_footer(text="Julie ChenBot • Source: Joker's Updates")
+        embed.set_footer(text=f"Julie ChenBot • Source: {event.source}")
         return embed
