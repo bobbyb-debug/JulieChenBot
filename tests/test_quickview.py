@@ -52,7 +52,7 @@ def test_changed_page_produces_one_timeline_event():
     result = asyncio.run(monitor.check())
     assert result.changed is True
     assert len(result.events) == 1
-    assert result.events[0].source == "Quickview"
+    assert result.events[0].source == "JokersUpdates Quickview"
     assert result.events[0].event_type == EventType.TIMELINE
     assert result.events[0].metadata["url"] == monitor.URL
 
@@ -71,4 +71,4 @@ def test_fetch_failure_is_degraded():
 def test_quickview_is_registered_with_watcher():
     watcher = ProductionWatcher(storage=FakeStorage())
     assert watcher.quickview in watcher.monitors
-    assert watcher.total_monitors == 5
+    assert watcher.total_monitors == 6
