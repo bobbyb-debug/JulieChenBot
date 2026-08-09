@@ -16,7 +16,7 @@ This module intentionally contains no business logic.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -107,6 +107,10 @@ class ProductionEvent:
 
     Events are produced by monitors and consumed by the
     Production Engine.
+
+    All event timestamps are stored as timezone-aware UTC.
+    This prevents Discord and other output adapters from
+    interpreting a UTC timestamp as local time.
     """
 
     source: str
@@ -120,7 +124,7 @@ class ProductionEvent:
     severity: EventSeverity = EventSeverity.INFO
 
     created_at: datetime = field(
-        default_factory=datetime.utcnow
+        default_factory=lambda: datetime.now(UTC)
     )
 
     metadata: dict[str, Any] = field(
@@ -128,6 +132,16 @@ class ProductionEvent:
     )
 
     announced: bool = False
+
+    def __post_init__(self) -> None:
+        """Normalize event timestamps to timezone-aware UTC."""
+
+        if self.created_at.tzinfo is None:
+            # Backward compatibility for events created by older code
+            # with naive UTC timestamps.
+            self.created_at = self.created_at.replace(tzinfo=UTC)
+        else:
+            self.created_at = self.created_at.astimezone(UTC)
 
     # ======================================================
     # Helpers
@@ -140,7 +154,7 @@ class ProductionEvent:
         """
 
         return (
-            datetime.utcnow() - self.created_at
+            datetime.now(UTC) - self.created_at
         ).total_seconds()
 
     @property
