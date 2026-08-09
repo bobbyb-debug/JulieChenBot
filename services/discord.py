@@ -20,7 +20,7 @@ import pkgutil
 import discord
 from discord.ext import commands
 
-from config import BOT_NAME, DISCORD_TOKEN
+from config import BOT_NAME, DISCORD_TOKEN, LIVE_UPDATES_CHANNEL
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
 
@@ -92,19 +92,46 @@ class DiscordService:
 
             self.load_commands()
 
+            # Global commands can take time to propagate. Sync directly to
+            # the configured live-feed channel's guild during development so
+            # new commands such as /posttest appear immediately. The guild
+            # command copy is local to that server and does not affect the
+            # eventual global command deployment.
+            try:
+                live_channel = self.bot.get_channel(LIVE_UPDATES_CHANNEL)
+                guild = live_channel.guild if live_channel is not None else None
+
+                if guild is not None:
+                    guild_synced = await self.bot.tree.sync(guild=guild)
+                    self.logger.info(
+                        "Synced %s slash command(s) to guild %s.",
+                        len(guild_synced),
+                        guild.id,
+                    )
+                else:
+                    self.logger.warning(
+                        "Could not resolve LIVE_UPDATES_CHANNEL=%s for guild command sync.",
+                        LIVE_UPDATES_CHANNEL,
+                    )
+
+            except Exception:
+                self.logger.exception(
+                    "Failed syncing guild slash commands."
+                )
+
             try:
 
                 synced = await self.bot.tree.sync()
 
                 self.logger.info(
-                    "Synced %s slash command(s).",
+                    "Synced %s global slash command(s).",
                     len(synced),
                 )
 
             except Exception:
 
                 self.logger.exception(
-                    "Failed syncing slash commands."
+                    "Failed syncing global slash commands."
                 )
 
             asyncio.create_task(
