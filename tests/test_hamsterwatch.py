@@ -1,7 +1,7 @@
 import asyncio
 
 from production.events import EventType
-from production.hamsterwatch import HamsterwatchMonitor, STORAGE_KEY
+from production.hamsterwatch import HamsterwatchMonitor
 from production.monitors import MonitorStatus
 from production.watcher import ProductionWatcher
 
@@ -32,7 +32,7 @@ def test_first_run_baselines_without_event():
     assert result.status == MonitorStatus.HEALTHY
     assert result.changed is False
     assert result.events == []
-    assert storage.get(STORAGE_KEY)
+    assert storage.get(monitor.STORAGE_KEY)
 
 
 def test_unchanged_page_produces_no_event():
