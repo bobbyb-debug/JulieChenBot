@@ -222,6 +222,41 @@ def test_tick_runs_complete_pipeline_and_clears_last_error(
     engine.save_state.assert_awaited_once()
 
 
+def test_tick_publishes_unrecognized_rss_item_as_live_feed_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Every surfaced RSS item is published even when the parser recognizes no state."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    rss_update = FeedUpdate(
+        guid="rss-live-feed-1",
+        title="09:13 PM PST - Angela was dropping F bombs so much that they think BB won't be able to use much of the scene for TV. (NT)",
+        description="",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=30876270",
+        published="2026-08-09T04:13:00Z",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(
+        Storage(),
+        announcer=announcer,
+        rss_update=rss_update,
+    )
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.event_type is EventType.RSS_UPDATE
+    assert event.title == "LIVE FEED UPDATE"
+    assert event.detail == rss_update.title
+    assert event.metadata["guid"] == rss_update.guid
+    assert event.metadata["link"] == rss_update.link
+    assert event.announced is True
+    assert engine.pending_event_count == 0
+
+
 def test_tick_applies_new_rss_state_to_monitors(
     tmp_path: Path,
     monkeypatch,
