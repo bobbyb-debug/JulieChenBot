@@ -92,8 +92,7 @@ class XUpdatesMonitor(Monitor):
                     metadata={"username": self.USERNAME},
                 )
 
-            # X returns posts newest-first. The stored ID is the watermark,
-            # so a restart cannot repost everything in the recent timeline.
+            # X returns posts newest-first. The stored ID is the watermark.
             previous_id = str(self.storage.get(self.LAST_POST_ID_KEY, ""))
             newest_id = str(posts[0].get("id", ""))
 
@@ -108,17 +107,23 @@ class XUpdatesMonitor(Monitor):
                     metadata={"username": self.USERNAME},
                 )
 
-            new_posts: list[dict] = []
-            for post in reversed(posts):
-                if str(post.get("id", "")) == previous_id:
-                    new_posts = []
-                    break
-                new_posts.append(post)
+            # The API response is newest-first. If the watermark is present,
+            # everything before it is genuinely new. Preserve chronological
+            # publication order when creating events.
+            watermark_index = next(
+                (
+                    index
+                    for index, post in enumerate(posts)
+                    if str(post.get("id", "")) == previous_id
+                ),
+                None,
+            )
 
-            if not new_posts:
-                # If the watermark fell outside the returned window, do not
-                # manufacture a flood of old posts. Advance only to newest.
-                if newest_id != previous_id and all(str(p.get("id", "")) != previous_id for p in posts):
+            if watermark_index is None:
+                # The watermark has fallen outside the requested API window.
+                # Do not replay an arbitrary batch of old posts. Advance the
+                # watermark and wait for the next poll.
+                if newest_id != previous_id:
                     self.storage.set(self.LAST_POST_ID_KEY, newest_id)
                     return MonitorResult(
                         monitor=self.name,
@@ -128,6 +133,16 @@ class XUpdatesMonitor(Monitor):
                         metadata={"username": self.USERNAME},
                     )
 
+                return MonitorResult(
+                    monitor=self.name,
+                    status=MonitorStatus.HEALTHY,
+                    changed=False,
+                    detail=f"No new posts from @{self.USERNAME}.",
+                    metadata={"username": self.USERNAME},
+                )
+
+            new_posts = list(reversed(posts[:watermark_index]))
+            if not new_posts:
                 return MonitorResult(
                     monitor=self.name,
                     status=MonitorStatus.HEALTHY,
@@ -168,7 +183,21 @@ class XUpdatesMonitor(Monitor):
                 metadata={"username": self.USERNAME},
             )
 
-        except (HTTPError, URLError) as exc:
+        except HTTPError as exc:
+            if exc.code == 401:
+                detail = "X API authentication failed (401). Check X_BEARER_TOKEN."
+                logger.error("%s", detail)
+            else:
+                detail = f"X Updates check failed: {exc}"
+                logger.exception("X Updates API request failed.")
+            return MonitorResult(
+                monitor=self.name,
+                status=MonitorStatus.DEGRADED,
+                changed=False,
+                detail=detail,
+                metadata={"username": self.USERNAME, "http_status": exc.code},
+            )
+        except URLError as exc:
             logger.exception("X Updates API request failed.")
             return MonitorResult(
                 monitor=self.name,
