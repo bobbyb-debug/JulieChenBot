@@ -121,8 +121,9 @@ class XUpdatesMonitor(Monitor):
 
             if watermark_index is None:
                 # The watermark has fallen outside the requested API window.
-                # Do not replay an arbitrary batch of old posts. Advance the
-                # watermark and wait for the next poll.
+                # Advance the watermark to the newest returned post and wait
+                # for the next poll rather than replaying an arbitrary batch of
+                # older content.
                 if newest_id != previous_id:
                     self.storage.set(self.LAST_POST_ID_KEY, newest_id)
                     return MonitorResult(
