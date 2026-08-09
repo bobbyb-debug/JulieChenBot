@@ -92,6 +92,10 @@ class Storage:
     def last_title(self) -> str:
         return self.get("last_title", "")
 
+    @last_title.setter
+    def last_title(self, value: str) -> None:
+        self.set("last_title", value)
+
     @property
     def last_published(self) -> str:
         return self.get("last_published", "")
