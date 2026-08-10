@@ -109,6 +109,15 @@ HOUSE_STATUS_IMAGE = (
     "bbupdatesblock1786231774.png"
 )
 
+# Page scraped to discover the CURRENT bbupdatesblock*.png filename.
+# The image filename embeds a Unix timestamp and rotates whenever the
+# house status changes, so HOUSE_STATUS_IMAGE above is only a fallback
+# seed — discovery is the source of truth at runtime.
+HOUSE_STATUS_PAGE = os.getenv(
+    "HOUSE_STATUS_PAGE",
+    JOKERS_HOME,
+)
+
 # ==========================================================
 # Logging
 # ==========================================================

@@ -7,6 +7,10 @@ Routes ProductionEvents to the appropriate Discord channels.
 
 from __future__ import annotations
 
+import asyncio
+import io
+from urllib.request import Request, urlopen
+
 import discord
 
 from config import (
@@ -53,7 +57,7 @@ class DiscordOutputRouter:
             if channel.id in seen:
                 continue
             seen.add(channel.id)
-            await channel.send(embed=self._build_embed(event))
+            await self._send(channel, event)
             sent += 1
             self.logger.info(
                 "Published %s to #%s.",
@@ -65,6 +69,55 @@ class DiscordOutputRouter:
             raise RuntimeError(
                 f"Unable to publish {event.event_type.value}: no Discord destination was reachable."
             )
+
+    async def _send(self, channel, event: ProductionEvent) -> None:
+        """Sends one event, attaching the image for IMAGE_CHANGED.
+
+        The house-status image filename rotates, so hot-linking it in
+        an embed means the picture can break after the fact. Uploading
+        the bytes to Discord makes the post permanent.
+        """
+
+        embed = self._build_embed(event)
+
+        if event.event_type != EventType.IMAGE_CHANGED:
+            await channel.send(embed=embed)
+            return
+
+        link = event.metadata.get("link") or event.metadata.get("url")
+        payload = await self._download(link) if link else None
+
+        if payload is None:
+            # Fall back to hot-linking rather than dropping the post.
+            await channel.send(embed=embed)
+            return
+
+        filename = "house_status.png"
+        embed.set_image(url=f"attachment://{filename}")
+
+        await channel.send(
+            embed=embed,
+            file=discord.File(io.BytesIO(payload), filename=filename),
+        )
+
+    async def _download(self, url: str) -> bytes | None:
+        """Downloads image bytes, returning None on any failure."""
+
+        def _get() -> bytes:
+            request = Request(
+                url,
+                headers={"User-Agent": "JulieChenBot/1.0"},
+            )
+            with urlopen(request, timeout=20) as response:
+                return response.read()
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception:
+            self.logger.warning(
+                "Could not download image for attachment: %s", url
+            )
+            return None
 
     def _destinations(self, event: ProductionEvent) -> list[tuple[int, str]]:
         destinations: list[tuple[int, str]] = []
