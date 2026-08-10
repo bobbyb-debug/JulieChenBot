@@ -23,7 +23,7 @@ Future responsibilities include:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 from database.storage import Storage
@@ -354,7 +354,7 @@ class HouseStatusMonitor(Monitor):
         return {
 
             "timestamp":
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
 
             "hoh":
                 self.current.hoh,
