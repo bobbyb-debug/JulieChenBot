@@ -103,3 +103,30 @@ def test_duplicate_channel_configuration_only_sends_once(monkeypatch) -> None:
     )
 
     assert len(channel.messages) == 1
+
+
+def test_house_image_update_routes_to_house_status_and_embeds_image(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+    event = ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="JokersUpdates house-status image changed after episode air.",
+        severity=EventSeverity.NOTICE,
+        metadata={
+            "url": "http://www.jokersupdates.com/ubbthreads/images/headers/bigbrother/hg/bbupdatesblock1786231774.png"
+        },
+    )
+
+    asyncio.run(router.publish(event))
+
+    assert len(house.messages) == 1
+    assert len(live.messages) == 1
+    house_embed = house.messages[0]["embed"]
+    assert house_embed.title == "🏠 HOUSE STATUS UPDATED"
+    assert house_embed.image.url == event.metadata["url"]
