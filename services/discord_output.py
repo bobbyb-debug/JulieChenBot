@@ -75,6 +75,7 @@ class DiscordOutputRouter:
             )
         elif event.event_type in {
             EventType.HOUSE_STATUS_CHANGED,
+            EventType.IMAGE_CHANGED,
             EventType.HOH_CHANGED,
             EventType.NOMINATIONS_CHANGED,
             EventType.POV_CHANGED,
@@ -142,6 +143,8 @@ class DiscordOutputRouter:
             title = "🟦 LIVE FEED UPDATE"
         elif event.event_type == EventType.TIMELINE and event.source == "Hamsterwatch":
             title = "🐹 HAMSTERWATCH UPDATE"
+        elif event.event_type == EventType.IMAGE_CHANGED:
+            title = "🏠 HOUSE STATUS UPDATED"
         else:
             title = event.title
 
@@ -156,10 +159,13 @@ class DiscordOutputRouter:
         if link:
             label = "Hamsterwatch" if event.source == "Hamsterwatch" else "Joker's Updates"
             embed.add_field(
-                name="🔗 Read More",
+                name="🔗 Source",
                 value=f"[{label}]({link})",
                 inline=False,
             )
+
+        if event.event_type == EventType.IMAGE_CHANGED and link:
+            embed.set_image(url=link)
 
         published = event.metadata.get("published")
         if published:
