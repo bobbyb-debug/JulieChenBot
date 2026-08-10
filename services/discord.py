@@ -20,7 +20,12 @@ import pkgutil
 import discord
 from discord.ext import commands
 
-from config import BOT_NAME, DISCORD_TOKEN, LIVE_UPDATES_CHANNEL
+from config import (
+    BOT_NAME,
+    DISCORD_TOKEN,
+    ENABLE_SCHEDULER,
+    LIVE_UPDATES_CHANNEL,
+)
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
 from services.ai_service import generate_julie_response
@@ -142,13 +147,17 @@ class DiscordService:
                     "Failed syncing global slash commands."
                 )
 
-            asyncio.create_task(
-                self.scheduler.start()
-            )
-
-            self.logger.info(
-                "Production Scheduler started."
-            )
+            if ENABLE_SCHEDULER:
+                asyncio.create_task(
+                    self.scheduler.start()
+                )
+                self.logger.info(
+                    "Production Scheduler started."
+                )
+            else:
+                self.logger.info(
+                    "Production Scheduler disabled (ENABLE_SCHEDULER=false)."
+                )
 
             print()
             print("=" * 60)

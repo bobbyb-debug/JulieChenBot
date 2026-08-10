@@ -50,6 +50,21 @@ CHECK_INTERVAL = 60  # Seconds between update checks
 
 DEBUG = False
 
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a conventional true/false value from the environment."""
+
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Keep monitoring off until it is explicitly enabled in a production host.
+ENABLE_SCHEDULER = env_flag("ENABLE_SCHEDULER", default=False)
+
 # ==========================================================
 # Build Information
 # ==========================================================
