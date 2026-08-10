@@ -48,7 +48,9 @@ VERSION = "1.0.0"
 
 CHECK_INTERVAL = 60  # Seconds between update checks
 
-DEBUG = False # ==========================================================
+DEBUG = False
+
+# ==========================================================
 # Build Information
 # ==========================================================
 
@@ -86,7 +88,8 @@ GUILD_ID = env_int("GUILD_ID")
 
 LIVE_UPDATES_CHANNEL = env_int("LIVE_UPDATES_CHANNEL")
 PRODUCTION_CHANNEL = env_int("PRODUCTION_CHANNEL")
-HOUSE_STATUS_CHANNEL = env_int("HOUSE_STATUS_CHANNEL")
+# House-status was explicitly provisioned for Julie's production feed.
+HOUSE_STATUS_CHANNEL = env_int("HOUSE_STATUS_CHANNEL", 1534566047611617371)
 PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 
 # ==========================================================
@@ -102,7 +105,8 @@ JOKERS_HOME = (
 )
 
 HOUSE_STATUS_IMAGE = (
-    "https://www.jokersupdates.com/ubbthreads/images/headers/bigbrother/hg/"
+    "http://www.jokersupdates.com/ubbthreads/images/headers/bigbrother/hg/"
+    "bbupdatesblock1786231774.png"
 )
 
 # ==========================================================
