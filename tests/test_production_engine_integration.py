@@ -99,6 +99,7 @@ class RSSDouble:
 
     def __init__(self, update: FeedUpdate | None = None) -> None:
         self.update = update
+        self.updates: list[FeedUpdate] = [update] if update else []
         self.check_calls = 0
 
     def check(self) -> FeedUpdate | None:
@@ -106,6 +107,15 @@ class RSSDouble:
         update = self.update
         self.update = None
         return update
+
+    def check_all(self, limit: int | None = None) -> list[FeedUpdate]:
+        """Mirrors JokersRSS.check_all: drains pending updates."""
+        self.check_calls += 1
+        updates = self.updates
+        self.updates = []
+        if updates:
+            self.update = None
+        return updates
 
     def current(self) -> FeedUpdate | None:
         return self.update

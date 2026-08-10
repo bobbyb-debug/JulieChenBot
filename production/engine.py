@@ -109,22 +109,30 @@ class ProductionEngine:
 
         try:
             had_rss_snapshot = bool(self.storage.last_guid)
-            rss_update = self.rss.check()
+            rss_updates = self.rss.check_all()
 
-            # On first launch, check() stores the current item and returns
-            # None. Read that same current item so Julie can publish an
+            # On first launch, check_all() records the feed and returns
+            # nothing. Read the current item so Julie can publish an
             # initial live-feed snapshot immediately.
-            if rss_update is None and not had_rss_snapshot:
-                rss_update = self.rss.current()
-                if rss_update is not None:
+            if not rss_updates and not had_rss_snapshot:
+                initial = self.rss.current()
+                if initial is not None:
+                    rss_updates = [initial]
                     self.logger.info(
                         "RSS initial snapshot loaded: %s",
-                        rss_update.title,
+                        initial.title,
                     )
 
-            if rss_update is None:
+            if not rss_updates:
                 self.logger.info("RSS: no new feed item.")
             else:
+                self.logger.info(
+                    "RSS: %s update(s) to announce.",
+                    len(rss_updates),
+                )
+
+            # Oldest first, so the channel reads chronologically.
+            for rss_update in rss_updates:
                 self.logger.info(
                     "RSS update detected: %s",
                     rss_update.title,

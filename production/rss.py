@@ -19,7 +19,7 @@ from typing import Optional
 
 import feedparser
 
-from config import RSS_FEED
+from config import RSS_FEED, RSS_MAX_BACKFILL
 from database.storage import Storage
 from services.logger import ProductionLogger
 
@@ -57,13 +57,18 @@ class JokersRSS:
     latest feed item even after restarting.
     """
 
+    SEEN_KEY = "seen_guids"
+    SEEN_LIMIT = 300
+
     def __init__(
         self,
         storage: Optional[Storage] = None,
+        max_backfill: Optional[int] = None,
     ) -> None:
 
         self.feed_url = RSS_FEED
         self.storage = storage or Storage()
+        self.max_backfill = max_backfill or RSS_MAX_BACKFILL
 
         logger.info(
             "Jokers RSS engine initialized."
@@ -95,6 +100,32 @@ class JokersRSS:
     # Latest Feed Entry
     # ======================================================
 
+    def entries(self) -> list[FeedUpdate]:
+        """
+        Returns every item currently in the feed, newest first.
+        """
+
+        feed = self.download()
+
+        if not feed.entries:
+
+            logger.warning(
+                "RSS feed returned no entries."
+            )
+
+            return []
+
+        return [
+            FeedUpdate(
+                guid=getattr(entry, "id", ""),
+                title=getattr(entry, "title", ""),
+                description=getattr(entry, "description", ""),
+                link=getattr(entry, "link", ""),
+                published=getattr(entry, "published", ""),
+            )
+            for entry in feed.entries
+        ]
+
     def latest(self) -> Optional[FeedUpdate]:
 
         feed = self.download()
@@ -120,6 +151,109 @@ class JokersRSS:
     # ======================================================
     # New Update?
     # ======================================================
+
+    def check_all(
+        self,
+        limit: Optional[int] = None,
+    ) -> list[FeedUpdate]:
+        """
+        Returns every feed item Julie has not announced yet,
+        oldest first, so nothing is missed while she is offline.
+
+        Deduplication uses a bounded ledger of recently seen GUIDs
+        rather than only the newest GUID. That way an item is never
+        announced twice even if last_guid is lost, rewound, or the
+        feed briefly reorders.
+
+        First run:
+            Records the whole current feed and returns [] so Julie
+            does not dump the entire backlog into Discord on a
+            fresh install.
+        """
+
+        limit = limit or self.max_backfill
+
+        updates = self.entries()
+
+        if not updates:
+            return []
+
+        last_guid = self.storage.last_guid
+        seen = set(self.storage.get(self.SEEN_KEY, []))
+
+        # First launch: snapshot everything, announce nothing.
+        if not last_guid and not seen:
+
+            logger.info(
+                "Creating first RSS snapshot (%s item(s) recorded).",
+                len(updates),
+            )
+
+            self._remember(updates[0])
+            self._record_seen(updates)
+
+            return []
+
+        fresh = [
+            update
+            for update in updates
+            if update.guid and update.guid != last_guid
+            and update.guid not in seen
+        ]
+
+        if not fresh:
+
+            logger.info(
+                "No new Jokers updates."
+            )
+
+            return []
+
+        # updates arrive newest first; announce oldest first so the
+        # channel reads in chronological order.
+        fresh.reverse()
+
+        skipped: list[FeedUpdate] = []
+
+        if len(fresh) > limit:
+
+            skipped = fresh[:-limit]
+            fresh = fresh[-limit:]
+
+            logger.warning(
+                "Catch-up capped at %s item(s); %s older item(s) "
+                "marked as seen without announcing.",
+                limit,
+                len(skipped),
+            )
+
+        logger.info(
+            "NEW Jokers updates detected: %s item(s).",
+            len(fresh),
+        )
+
+        # Everything we looked at is now seen, including anything
+        # skipped by the cap, so it cannot resurface later.
+        self._record_seen(skipped + fresh)
+        self._remember(fresh[-1])
+
+        return fresh
+
+    def _record_seen(self, updates: list[FeedUpdate]) -> None:
+        """
+        Adds GUIDs to the bounded seen ledger.
+        """
+
+        seen = list(self.storage.get(self.SEEN_KEY, []))
+
+        for update in updates:
+            if update.guid and update.guid not in seen:
+                seen.append(update.guid)
+
+        if len(seen) > self.SEEN_LIMIT:
+            seen = seen[-self.SEEN_LIMIT:]
+
+        self.storage.set(self.SEEN_KEY, seen)
 
     def check(self) -> Optional[FeedUpdate]:
         """

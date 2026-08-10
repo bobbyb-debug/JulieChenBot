@@ -113,6 +113,11 @@ HOUSE_STATUS_IMAGE = (
 # The image filename embeds a Unix timestamp and rotates whenever the
 # house status changes, so HOUSE_STATUS_IMAGE above is only a fallback
 # seed — discovery is the source of truth at runtime.
+# Maximum number of missed RSS items announced in one catch-up pass.
+# Prevents a long outage from flooding the channel; anything older is
+# marked as seen without announcing.
+RSS_MAX_BACKFILL = env_int("RSS_MAX_BACKFILL", 15)
+
 HOUSE_STATUS_PAGE = os.getenv(
     "HOUSE_STATUS_PAGE",
     JOKERS_HOME,
