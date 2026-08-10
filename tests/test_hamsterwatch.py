@@ -71,7 +71,7 @@ def test_fetch_failure_is_degraded():
 def test_hamsterwatch_is_registered_with_watcher():
     watcher = ProductionWatcher(storage=FakeStorage())
     assert watcher.hamsterwatch in watcher.monitors
-    assert watcher.total_monitors == 6
+    assert watcher.total_monitors == 7
 
 
 def test_hamsterwatch_event_flows_through_watcher():
