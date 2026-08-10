@@ -15,6 +15,7 @@ from database.storage import Storage
 from production.competition import CompetitionMonitor
 from production.events import ProductionEvent
 from production.hamsterwatch import HamsterwatchMonitor
+from production.house_image import HouseImageMonitor
 from production.house_status import HouseStatusMonitor
 from production.monitors import Monitor, MonitorResult, MonitorStatus
 from production.quickview import BBUpdatesMonitor, QuickviewMonitor
@@ -31,6 +32,7 @@ class ProductionWatcher:
         self.storage = storage or Storage()
         self.monitors: list[Monitor] = []
         self.house_status: HouseStatusMonitor
+        self.house_image: HouseImageMonitor
         self.competition: CompetitionMonitor
         self.hamsterwatch: HamsterwatchMonitor
         self.quickview: QuickviewMonitor
@@ -43,6 +45,9 @@ class ProductionWatcher:
         """Registers Julie's built-in monitoring systems."""
         self.house_status = HouseStatusMonitor(storage=self.storage)
         self.register(self.house_status)
+
+        self.house_image = HouseImageMonitor(storage=self.storage)
+        self.register(self.house_image)
 
         self.competition = CompetitionMonitor()
         self.register(self.competition)
