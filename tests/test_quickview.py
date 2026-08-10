@@ -71,4 +71,4 @@ def test_fetch_failure_is_degraded():
 def test_quickview_is_registered_with_watcher():
     watcher = ProductionWatcher(storage=FakeStorage())
     assert watcher.quickview in watcher.monitors
-    assert watcher.total_monitors == 6
+    assert watcher.total_monitors == 7
