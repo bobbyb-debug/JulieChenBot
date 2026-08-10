@@ -7,6 +7,7 @@ import hashlib
 from collections.abc import Awaitable, Callable
 from urllib.request import Request, urlopen
 
+from config import HOUSE_STATUS_IMAGE
 from database.storage import Storage
 from production.events import EventSeverity, EventType, ProductionEvent
 from production.monitors import Monitor, MonitorResult, MonitorStatus
@@ -20,9 +21,8 @@ Fetcher = Callable[[], Awaitable[bytes]]
 class HouseImageMonitor(Monitor):
     """Detects changes in the JokersUpdates house-status image."""
 
-    URL = "http://www.jokersupdates.com/ubbthreads/images/headers/bigbrother/hg/bbupdatesblock1786231774.png"
+    URL = HOUSE_STATUS_IMAGE
     STORAGE_KEY = "house_image_last_hash"
-    CHANNEL_ID_KEY = "house_updates_channel_id"
 
     def __init__(
         self,
@@ -39,10 +39,9 @@ class HouseImageMonitor(Monitor):
         self.fetcher = fetcher or self._fetch
         logger.info("House image monitor initialized: %s", self.image_url)
 
-    @staticmethod
-    def _fetch_sync(url: str) -> bytes:
+    def _fetch_sync(self) -> bytes:
         request = Request(
-            url,
+            self.image_url,
             headers={
                 "User-Agent": "JulieChenBot/1.0",
                 "Accept": "image/png,image/*;q=0.8,*/*;q=0.5",
@@ -52,7 +51,7 @@ class HouseImageMonitor(Monitor):
             return response.read()
 
     async def _fetch(self) -> bytes:
-        return await asyncio.to_thread(self._fetch_sync, self.image_url)
+        return await asyncio.to_thread(self._fetch_sync)
 
     async def check(self) -> MonitorResult:
         try:
