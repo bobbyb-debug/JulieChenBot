@@ -1,13 +1,13 @@
-"""
-Julie ChenBot
-=============
-
-Main entry point for Julie ChenBot.
-"""
+# Julie ChenBot
+# =============
+#
+# Main entry point for Julie ChenBot.
 
 from __future__ import annotations
 
 import sys
+import signal
+import asyncio
 
 from core.application import JulieApplication
 from services.logger import (
@@ -37,6 +37,28 @@ def main() -> None:
         logger.info("Loading application...")
 
         app = JulieApplication()
+
+        # Register shutdown signal handlers to gracefully stop Discord service
+        def _signal_handler(_signum, _frame):
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    app.discord.shutdown(),
+                )
+            else:
+                # Fallback: run shutdown synchronously
+                try:
+                    asyncio.run(app.discord.shutdown())
+                except Exception:
+                    pass
+
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(_sig, _signal_handler)
 
         logger.info("Application loaded successfully.")
 

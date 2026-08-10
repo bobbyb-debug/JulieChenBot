@@ -7,3 +7,4 @@ python-dotenv
 aiosqlite
 apscheduler
 Pillow
+google-genai

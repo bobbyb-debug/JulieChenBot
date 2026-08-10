@@ -23,6 +23,7 @@ from discord.ext import commands
 from config import BOT_NAME, DISCORD_TOKEN, LIVE_UPDATES_CHANNEL
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
+from services.ai_service import generate_julie_response
 
 
 class DiscordService:
@@ -99,7 +100,11 @@ class DiscordService:
             # eventual global command deployment.
             try:
                 live_channel = self.bot.get_channel(LIVE_UPDATES_CHANNEL)
-                guild = live_channel.guild if live_channel is not None else None
+                guild = (
+                    live_channel.guild
+                    if live_channel is not None
+                    else None
+                )
 
                 if guild is not None:
                     guild_synced = await self.bot.tree.sync(guild=guild)
@@ -110,7 +115,10 @@ class DiscordService:
                     )
                 else:
                     self.logger.warning(
-                        "Could not resolve LIVE_UPDATES_CHANNEL=%s for guild command sync.",
+                        (
+                            "Could not resolve LIVE_UPDATES_CHANNEL=%s "
+                            "for guild command sync."
+                        ),
                         LIVE_UPDATES_CHANNEL,
                     )
 
@@ -161,6 +169,49 @@ class DiscordService:
             self.logger.info(
                 "Discord connection resumed."
             )
+
+        @self.bot.event
+        async def on_message(message):
+            # Never respond to other bots
+            if message.author.bot:
+                return
+
+            # Trigger Julie's AI when mentioned or in DMs
+            is_mentioned = self.bot.user in message.mentions
+            is_dm = isinstance(message.channel, discord.DMChannel)
+
+            if is_mentioned or is_dm:
+                # Remove mention token from the message text
+                clean_text = (
+                    message.content
+                    .replace(
+                        f"<@{self.bot.user.id}>",
+                        "",
+                    )
+                    .strip()
+                )
+
+                if not clean_text:
+                    await message.channel.send(
+                        "Good evening, Houseguest. Did you need "
+                        "the Executive Producer?"
+                    )
+                    return
+
+                async with message.channel.typing():
+                    try:
+                        ai_reply = await generate_julie_response(
+                            message.channel.id,
+                            clean_text,
+                        )
+                        await message.channel.send(ai_reply)
+                    except Exception:
+                        self.logger.exception(
+                            "Failed while generating Julie response."
+                        )
+
+            # Allow other command processors to run
+            await self.bot.process_commands(message)
 
     # ==========================================================
     # Slash Commands
@@ -230,3 +281,18 @@ class DiscordService:
         )
 
         self.bot.run(DISCORD_TOKEN)
+
+    async def shutdown(self) -> None:
+        """Gracefully stop scheduler and close the bot connection."""
+
+        try:
+            # Stop the scheduler loop
+            self.scheduler.stop()
+
+            # Close the Discord connection
+            await self.bot.close()
+
+            self.logger.info("DiscordService shutdown complete.")
+
+        except Exception:
+            self.logger.exception("Error during DiscordService.shutdown()")
