@@ -70,7 +70,7 @@ async def generate_julie_response(channel_id: int, user_text: str) -> str:
         conversation_history = update_and_get_history(channel_id, user_text)
 
         response = ai_client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-3.6-flash",
             contents=conversation_history,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
