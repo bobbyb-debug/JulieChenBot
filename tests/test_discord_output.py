@@ -112,6 +112,17 @@ def test_house_image_update_routes_to_house_status_and_embeds_image(monkeypatch)
     house = FakeChannel(1, "house-status")
     live = FakeChannel(2, "live-updates")
     router = DiscordOutputRouter(FakeBot([house, live]))
+
+    # Stub the download so this test never touches the network. Without
+    # this the result depends on whether jokersupdates.com is reachable:
+    # a successful download attaches the file, a failed one falls back to
+    # hot-linking, and the test would assert different things on
+    # different machines.
+    async def fake_download(url):
+        return b"fake-png-bytes"
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
     event = ProductionEvent(
         source="HouseImage",
         event_type=EventType.IMAGE_CHANGED,
@@ -129,4 +140,41 @@ def test_house_image_update_routes_to_house_status_and_embeds_image(monkeypatch)
     assert len(live.messages) == 1
     house_embed = house.messages[0]["embed"]
     assert house_embed.title == "🏠 HOUSE STATUS UPDATED"
-    assert house_embed.image.url == event.metadata["url"]
+    # The image is uploaded as an attachment rather than hot-linked, so
+    # the post cannot break when the source filename rotates away.
+    assert house_embed.image.url == "attachment://house_status.png"
+    assert house.messages[0]["file"] is not None
+    # The original URL is still reachable in the Source field.
+    assert event.metadata["url"] in str(house_embed.fields[0].value)
+
+
+def test_house_image_falls_back_to_hotlink_when_download_fails(monkeypatch) -> None:
+    """A failed download must still post, using the plain URL."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+
+    async def failed_download(url):
+        return None
+
+    monkeypatch.setattr(router, "_download", failed_download)
+
+    url = "http://www.jokersupdates.com/x/bbupdatesblock1786231774.png"
+    event = ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="changed",
+        severity=EventSeverity.NOTICE,
+        metadata={"url": url},
+    )
+
+    asyncio.run(router.publish(event))
+
+    assert len(house.messages) == 1
+    assert house.messages[0].get("file") is None
+    assert house.messages[0]["embed"].image.url == url
