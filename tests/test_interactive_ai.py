@@ -305,21 +305,36 @@ def test_extract_text_falls_back_when_parts_are_empty():
 # reintroducing cut-off replies in production.
 
 
-def test_thinking_budget_is_disabled_in_config():
-    from google.genai import types
+# ==========================================================
+# Truncation fix history
+# ==========================================================
+#
+# Attempt 1: thinking_config=ThinkingConfig(thinking_budget=0) to
+# disable Gemini's hidden "thinking" tokens, which were consuming
+# the entire max_output_tokens budget before any visible reply was
+# generated (confirmed via _extract_text's finish_reason logging:
+# MAX_TOKENS with only 90 characters produced against a 700-token
+# budget).
+#
+# That construct validates fine client-side, but the live API
+# rejected it outright for this model:
+#   AI Service Error: 400 INVALID_ARGUMENT. Request contains an
+#   invalid argument.
+# Constructing the config object without error was never proof the
+# API would accept it — that gap is exactly why this broke every
+# single AI call instead of just truncating some of them. Reverted.
+#
+# Attempt 2 (current): raise max_output_tokens enough (2000) that
+# even with mandatory hidden thinking tokens, there should be
+# budget left for a real visible reply. This doesn't touch
+# thinking_config at all, so it can't reproduce the 400 error.
+# Unverified against the live API by the same token as attempt 1 —
+# flagging that honestly rather than repeating the same mistake.
 
-    config = types.GenerateContentConfig(
-        max_output_tokens=600,
-        temperature=0.8,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
 
-    assert config.thinking_config.thinking_budget == 0
-
-
-def test_ai_service_configs_disable_thinking():
-    """Guards against someone editing ai_service.py and dropping the
-    thinking_config line without noticing."""
+def test_ai_service_does_not_set_thinking_config():
+    """Guards against reintroducing the config that caused live
+    400 INVALID_ARGUMENT errors on every AI call."""
 
     import inspect
 
@@ -327,7 +342,25 @@ def test_ai_service_configs_disable_thinking():
 
     source = inspect.getsource(ai_service)
 
-    assert source.count("thinking_config=types.ThinkingConfig(thinking_budget=0)") == 2, (
-        "Expected thinking to be disabled in both "
-        "generate_julie_response and generate_recap"
+    assert "thinking_config" not in source, (
+        "thinking_config caused a live 400 INVALID_ARGUMENT error "
+        "for this model — see the comment above before re-adding it, "
+        "and verify against the real API before shipping, not just "
+        "that the object constructs locally."
+    )
+
+
+def test_ai_service_uses_a_large_token_budget():
+    """The current mitigation: enough headroom that hidden thinking
+    tokens shouldn't starve the visible reply."""
+
+    import inspect
+
+    import services.ai_service as ai_service
+
+    source = inspect.getsource(ai_service)
+
+    assert source.count("max_output_tokens=2000") == 2, (
+        "Expected both generate_julie_response and generate_recap "
+        "to use the raised token budget"
     )

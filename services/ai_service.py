@@ -251,9 +251,8 @@ async def generate_julie_response(
             contents=conversation_history,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                max_output_tokens=600,
+                max_output_tokens=2000,
                 temperature=0.8,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
 
@@ -306,9 +305,8 @@ async def generate_recap(entries: list[str]) -> str:
             ],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
-                max_output_tokens=700,
+                max_output_tokens=2000,
                 temperature=0.7,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         return _extract_text(response)
