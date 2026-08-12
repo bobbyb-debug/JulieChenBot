@@ -23,6 +23,7 @@ def register(discord_service) -> None:
         name="forget",
         description="Clears Julie's chat memory for this channel.",
     )
+    @discord.app_commands.default_permissions(administrator=True)
     async def forget(interaction: discord.Interaction):
 
         removed = clear_history(interaction.channel_id)

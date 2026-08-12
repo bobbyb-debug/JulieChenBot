@@ -28,6 +28,7 @@ def register(discord_service) -> None:
         name="status",
         description="Shows Julie's current production status.",
     )
+    @discord.app_commands.default_permissions(administrator=True)
     async def status(interaction: discord.Interaction):
 
         engine = discord_service.scheduler.engine

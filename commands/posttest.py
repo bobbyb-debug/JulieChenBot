@@ -24,6 +24,7 @@ def register(discord_service) -> None:
         name="posttest",
         description="Tests Julie's production Discord output.",
     )
+    @discord.app_commands.default_permissions(administrator=True)
     async def posttest(interaction: discord.Interaction):
         event = ProductionEvent(
             source="Julie ChenBot",

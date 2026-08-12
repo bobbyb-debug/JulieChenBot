@@ -6,6 +6,12 @@ Tells users what Julie can actually do. Kept as a single hand-written
 list rather than generated from the command tree, so the wording can
 explain each command in plain terms instead of just repeating its
 one-line slash-command description.
+
+/forget, /posttest, and /status are Administrator-only (Discord
+enforces this itself via default_permissions on each command), so
+this help text only lists them for admins — showing a command a
+regular member can't actually run just invites a confusing "you
+don't have permission" error.
 """
 
 from __future__ import annotations
@@ -17,6 +23,19 @@ from services.logger import ProductionLogger
 logger = ProductionLogger.get("Help")
 
 
+def _is_admin(interaction: discord.Interaction) -> bool:
+    """Checks administrator status, safely, even outside a guild.
+
+    interaction.user is a discord.Member (with guild_permissions) in
+    a server, but a plain discord.User (with no such attribute) in a
+    DM. Treat that missing-attribute case as non-admin rather than
+    raising.
+    """
+
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    return bool(permissions and permissions.administrator)
+
+
 def register(discord_service) -> None:
     """Registers the /help slash command."""
 
@@ -25,6 +44,8 @@ def register(discord_service) -> None:
         description="Shows what Julie ChenBot can do.",
     )
     async def help_command(interaction: discord.Interaction):
+
+        is_admin = _is_admin(interaction)
 
         embed = discord.Embed(
             title="🎥 Julie ChenBot — What I Can Do",
@@ -35,15 +56,21 @@ def register(discord_service) -> None:
             color=0x3498DB,
         )
 
+        chat_lines = [
+            "**@mention me** or **DM me** anytime — I'll reply in "
+            "character, and I remember our conversation.",
+            "`/chat <message>` — same thing, as a slash command.",
+        ]
+
+        if is_admin:
+            chat_lines.append(
+                "`/forget` — wipes my memory of this channel's "
+                "conversation, fresh start. *(Admin only)*"
+            )
+
         embed.add_field(
             name="💬 Talk to me",
-            value=(
-                "**@mention me** or **DM me** anytime — I'll reply in "
-                "character, and I remember our conversation.\n"
-                "`/chat <message>` — same thing, as a slash command.\n"
-                "`/forget` — wipes my memory of this channel's "
-                "conversation, fresh start."
-            ),
+            value="\n".join(chat_lines),
             inline=False,
         )
 
@@ -69,17 +96,24 @@ def register(discord_service) -> None:
             inline=False,
         )
 
-        embed.add_field(
-            name="🔧 Diagnostics",
-            value=(
-                "`/status` — my current health: uptime, monitors, "
-                "last error if any\n"
-                "`/ping` — quick online check\n"
-                "`/posttest` — sends a test post to confirm Discord "
-                "output is working"
-            ),
-            inline=False,
-        )
+        if is_admin:
+            embed.add_field(
+                name="🔧 Diagnostics *(Admin only)*",
+                value=(
+                    "`/status` — my current health: uptime, monitors, "
+                    "last error if any\n"
+                    "`/ping` — quick online check\n"
+                    "`/posttest` — sends a test post to confirm "
+                    "Discord output is working"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="🔧 Diagnostics",
+                value="`/ping` — quick online check",
+                inline=False,
+            )
 
         embed.set_footer(
             text=(
@@ -91,7 +125,8 @@ def register(discord_service) -> None:
         await interaction.response.send_message(embed=embed)
 
         logger.info(
-            "/help used by %s (%s)",
+            "/help used by %s (%s), admin=%s",
             interaction.user,
             interaction.user.id,
+            is_admin,
         )

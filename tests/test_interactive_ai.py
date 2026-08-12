@@ -364,3 +364,72 @@ def test_ai_service_uses_a_large_token_budget():
         "Expected both generate_julie_response and generate_recap "
         "to use the raised token budget"
     )
+
+
+# ==========================================================
+# Admin-restricted commands
+# ==========================================================
+#
+# /forget, /posttest, and /status are Administrator-only. Discord
+# itself enforces default_permissions, so these tests confirm the
+# permission bit is actually set (not just that our own code checks
+# something) and that /help's dynamic content matches what a given
+# user can actually run.
+
+
+def test_admin_only_commands_have_administrator_permission_set():
+    import discord
+
+    from services.discord import DiscordService
+
+    ds = DiscordService.__new__(DiscordService)  # skip full __init__
+    import discord.ext.commands as dc
+    ds.bot = dc.Bot(command_prefix="!", intents=discord.Intents.default())
+
+    import commands.forget as forget_module
+    import commands.posttest as posttest_module
+    import commands.status as status_module
+    import commands.ping as ping_module
+
+    class FakeEngine:
+        class watcher:
+            house_status = type("H", (), {"current": None})()
+
+    ds.scheduler = type("S", (), {"engine": FakeEngine()})()
+    ds.command = lambda *a, **kw: ds.bot.tree.command(*a, **kw)
+
+    for module in (forget_module, posttest_module, status_module, ping_module):
+        module.register(ds)
+
+    for name in ("forget", "posttest", "status"):
+        cmd = ds.bot.tree.get_command(name)
+        assert cmd.default_permissions is not None, f"{name} should be restricted"
+        assert cmd.default_permissions.administrator is True
+
+    ping_cmd = ds.bot.tree.get_command("ping")
+    assert ping_cmd.default_permissions is None, "/ping must stay open to everyone"
+
+
+def test_help_is_admin_safe():
+    """_is_admin must never raise, including for a plain discord.User
+    (the DM case) which has no guild_permissions attribute at all."""
+
+    import discord
+
+    from commands.help import _is_admin
+
+    class FakeMemberInteraction:
+        class user:
+            guild_permissions = discord.Permissions(administrator=True)
+
+    class FakeNonAdminInteraction:
+        class user:
+            guild_permissions = discord.Permissions(administrator=False)
+
+    class FakeDMInteraction:
+        class user:
+            pass  # no guild_permissions attribute at all
+
+    assert _is_admin(FakeMemberInteraction()) is True
+    assert _is_admin(FakeNonAdminInteraction()) is False
+    assert _is_admin(FakeDMInteraction()) is False
