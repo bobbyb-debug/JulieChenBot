@@ -39,35 +39,30 @@ class ProductionParser:
 
     _HOH_WIN_PATTERNS = (
         re.compile(
-            r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*)"
-            r"\s+(?:won|wins)\s+(?:the\s+)?(?:HOH|head\s+of\s+household)\b",
-            re.IGNORECASE,
+            r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,2})"
+            r"\s+(?i:won|wins)\s+(?:the\s+)?(?i:HOH|head\s+of\s+household)\b"
         ),
         re.compile(
-            r"\b(?:HOH|head\s+of\s+household)\s+(?:is|goes\s+to)\s+"
-            r"(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*)\b",
-            re.IGNORECASE,
+            r"\b(?i:HOH|head\s+of\s+household)\s+(?i:is|goes\s+to)\s+"
+            r"(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,2})\b"
         ),
     )
 
     _POV_WIN_PATTERNS = (
         re.compile(
-            r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*)"
-            r"\s+(?:won|wins)\s+(?:the\s+)?(?:POV|power\s+of\s+veto|veto)\b",
-            re.IGNORECASE,
+            r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,2})"
+            r"\s+(?i:won|wins)\s+(?:the\s+)?(?i:POV|power\s+of\s+veto|veto)\b"
         ),
         re.compile(
-            r"\b(?:POV|power\s+of\s+veto|veto)\s+(?:winner|goes\s+to)\s+"
-            r"(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*)\b",
-            re.IGNORECASE,
+            r"\b(?i:POV|power\s+of\s+veto|veto)\s+(?i:winner|goes\s+to)\s+"
+            r"(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,2})\b"
         ),
     )
 
     _COMPETITION_WIN_PATTERN = re.compile(
-        r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*)"
-        r"\s+(?:won|wins)\s+(?:the\s+)?"
-        r"(?P<kind>AI\s+Arena|Battle\s+Back|Luxury)\b",
-        re.IGNORECASE,
+        r"\b(?P<name>[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*){0,2})"
+        r"\s+(?i:won|wins)\s+(?:the\s+)?"
+        r"(?P<kind>(?i:AI\s+Arena|Battle\s+Back|Luxury))\b"
     )
 
     _NOMINATION_PATTERNS = (
@@ -117,6 +112,24 @@ class ProductionParser:
         "veto was not used",
         "did not use the veto",
         "didn't use the veto",
+    )
+
+    # Matches discourse markers indicating a mention is reported or
+    # hypothetical speech ("Drew brings up if Yash won HOH") rather
+    # than a direct announcement of a real result. BB live-feed
+    # recaps are full of houseguests referencing past, hypothetical,
+    # or rumored outcomes in conversation.
+    _REPORTED_SPEECH_MARKERS = re.compile(
+        r"\b(?:if|whether|when|since|after|before"
+        r"|recalls?|recalled|remembers?|remembered"
+        r"|mentions?|mentioned|asks?|asked"
+        r"|wonders?|wondered|brings?\s+up|brought\s+up"
+        r"|talks?\s+about|talked\s+about|discuss(?:es|ed)?"
+        r"|thinks?|thought|said|claims?|claimed"
+        r"|reminds?|reminded|notes?|noted"
+        r"|points?\s+out|pointed\s+out|references?|referenced)"
+        r"\s+(?:\S+\s+){0,4}$",
+        re.IGNORECASE,
     )
 
     def __init__(self) -> None:
@@ -224,38 +237,80 @@ class ProductionParser:
         value = re.sub(r"<[^>]+>", " ", value)
         return re.sub(r"\s+", " ", value).strip()
 
-    @staticmethod
+    @classmethod
     def _extract_winner(
+        cls,
         text: str,
         patterns: tuple[re.Pattern[str], ...],
     ) -> Optional[str]:
         for pattern in patterns:
-            match = pattern.search(text)
-            if match:
+            for match in pattern.finditer(text):
                 name = re.sub(r"\s+", " ", match.group("name").strip(" ,.-"))
-                if name:
-                    return name
+                if not name:
+                    continue
+                if not cls._is_genuine_announcement(text, match, name):
+                    continue
+                return name
         return None
+
+    @classmethod
+    def _is_genuine_announcement(
+        cls,
+        text: str,
+        match: "re.Match[str]",
+        name: str,
+    ) -> bool:
+        """Rejects matches that look like a name/result but aren't a
+        genuine, direct announcement.
+
+        Two independent checks:
+
+        re.IGNORECASE case-folds the entire pattern it's applied to,
+        including the [A-Z] meant to require a capitalized name, so
+        without this check the pattern would accept any lowercase
+        word right before "won HOH" as if it were a name. Verifying
+        capitalization here, against the real text, restores what
+        the character class looks like it already guarantees but
+        doesn't under IGNORECASE.
+
+        Separately, BB live-feed recaps are full of houseguests
+        referencing past or hypothetical outcomes in conversation
+        ("Drew brings up if Yash won HOH") -- rejecting matches
+        immediately preceded by reported-speech markers keeps those
+        from being read as fresh results.
+        """
+
+        if not name[0].isupper():
+            return False
+
+        preceding = text[max(0, match.start() - 80):match.start()]
+        if cls._REPORTED_SPEECH_MARKERS.search(preceding):
+            return False
+
+        return True
 
     def _extract_competition_winner(
         self,
         text: str,
     ) -> Optional[tuple[CompetitionType, str]]:
-        match = self._COMPETITION_WIN_PATTERN.search(text)
-        if match is None:
-            return None
+        for match in self._COMPETITION_WIN_PATTERN.finditer(text):
+            name = match.group("name").strip(" ,.-")
 
-        name = match.group("name").strip(" ,.-")
-        kind = match.group("kind").lower()
+            if not self._is_genuine_announcement(text, match, name):
+                continue
 
-        if kind == "ai arena":
-            competition = CompetitionType.AI_ARENA
-        elif kind == "battle back":
-            competition = CompetitionType.BATTLE_BACK
-        else:
-            competition = CompetitionType.LUXURY
+            kind = match.group("kind").lower()
 
-        return competition, name
+            if kind == "ai arena":
+                competition = CompetitionType.AI_ARENA
+            elif kind == "battle back":
+                competition = CompetitionType.BATTLE_BACK
+            else:
+                competition = CompetitionType.LUXURY
+
+            return competition, name
+
+        return None
 
     def _extract_names(
         self,
