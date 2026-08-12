@@ -201,3 +201,90 @@ def test_cooldown_expires_after_the_window():
     c._ai_cooldowns[1] = time.monotonic() - 999
 
     assert c._ai_cooldown_remaining(user_id=1) == 0.0
+
+
+# ==========================================================
+# _extract_text diagnostic extraction
+# ==========================================================
+
+
+class FakePart:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeContent:
+    def __init__(self, parts):
+        self.parts = parts
+
+
+class FakeFinishReason:
+    def __init__(self, name):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+
+class FakeCandidate:
+    def __init__(self, parts, finish_reason="STOP"):
+        self.content = FakeContent(parts)
+        self.finish_reason = FakeFinishReason(finish_reason)
+
+
+class FakeResponse:
+    def __init__(self, parts, finish_reason="STOP", text_fallback=""):
+        self.candidates = [FakeCandidate(parts, finish_reason)]
+        self.text = text_fallback
+
+
+def test_extract_text_joins_all_parts():
+    from services.ai_service import _extract_text
+
+    response = FakeResponse(
+        [FakePart("Hello, "), FakePart("Houseguest!")]
+    )
+
+    assert _extract_text(response) == "Hello, Houseguest!"
+
+
+def test_extract_text_logs_non_stop_reason(capsys):
+    from services.ai_service import _extract_text
+
+    response = FakeResponse(
+        [FakePart("cut off mid")], finish_reason="MAX_TOKENS"
+    )
+
+    _extract_text(response)
+
+    captured = capsys.readouterr()
+    assert "MAX_TOKENS" in captured.out
+
+
+def test_extract_text_does_not_log_normal_stop(capsys):
+    from services.ai_service import _extract_text
+
+    response = FakeResponse([FakePart("complete.")], finish_reason="STOP")
+
+    _extract_text(response)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_extract_text_falls_back_to_response_text_on_malformed_candidate():
+    from services.ai_service import _extract_text
+
+    class BrokenResponse:
+        candidates = None  # will raise when indexed
+        text = "fallback text"
+
+    assert _extract_text(BrokenResponse()) == "fallback text"
+
+
+def test_extract_text_falls_back_when_parts_are_empty():
+    from services.ai_service import _extract_text
+
+    response = FakeResponse([], finish_reason="SAFETY", text_fallback="fallback")
+
+    assert _extract_text(response) == "fallback"

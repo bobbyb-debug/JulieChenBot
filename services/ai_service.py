@@ -180,6 +180,47 @@ def format_game_state(house_status, competition) -> str:
     )
 
 
+def _extract_text(response) -> str:
+    """Extracts response text directly from candidate parts, and logs
+    the finish reason when generation stopped for any reason other
+    than a normal completion.
+
+    Reading parts directly, rather than trusting the response.text
+    convenience property, guards against that property silently
+    dropping content if a response ever spans multiple parts. The
+    finish_reason log is what actually tells us, next time a reply
+    cuts off mid-sentence, whether it was a token limit, a safety
+    filter, or something else — logging it now costs nothing and
+    turns a guess into an answer.
+    """
+
+    try:
+        candidate = response.candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        parts = getattr(candidate.content, "parts", None) or []
+        text = "".join(getattr(part, "text", "") or "" for part in parts)
+
+        reason_name = getattr(finish_reason, "name", str(finish_reason))
+
+        if reason_name not in ("STOP", "None"):
+            print(
+                f"AI Service: generation finished with reason="
+                f"{reason_name} (parts={len(parts)}, "
+                f"text_length={len(text)})"
+            )
+
+        if text:
+            return text
+
+    except Exception as exc:
+        print(
+            f"AI Service: failed reading response parts directly "
+            f"({exc}); falling back to response.text."
+        )
+
+    return getattr(response, "text", "") or ""
+
+
 async def generate_julie_response(
     channel_id: int,
     user_text: str,
@@ -210,13 +251,14 @@ async def generate_julie_response(
             contents=conversation_history,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                max_output_tokens=400,
+                max_output_tokens=600,
                 temperature=0.8,
             ),
         )
 
-        append_ai_response(channel_id, response.text)
-        return response.text
+        reply_text = _extract_text(response)
+        append_ai_response(channel_id, reply_text)
+        return reply_text
 
     except Exception as e:
         print(f"AI Service Error: {e}")
@@ -263,11 +305,11 @@ async def generate_recap(entries: list[str]) -> str:
             ],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
-                max_output_tokens=500,
+                max_output_tokens=700,
                 temperature=0.7,
             ),
         )
-        return response.text
+        return _extract_text(response)
 
     except Exception as e:
         print(f"AI Recap Error: {e}")
