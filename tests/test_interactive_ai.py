@@ -288,3 +288,46 @@ def test_extract_text_falls_back_when_parts_are_empty():
     response = FakeResponse([], finish_reason="SAFETY", text_fallback="fallback")
 
     assert _extract_text(response) == "fallback"
+
+
+# ==========================================================
+# Thinking-token regression guard
+# ==========================================================
+#
+# The truncation bug (responses cutting off mid-sentence) was traced
+# to Gemini's hidden "thinking" tokens consuming the entire
+# max_output_tokens budget before any visible reply was generated
+# (confirmed via _extract_text's finish_reason logging: MAX_TOKENS
+# with only 90 characters produced against a 700-token budget).
+# thinking_config=ThinkingConfig(thinking_budget=0) disables that.
+# This test exists so a future SDK upgrade that silently drops or
+# renames this parameter fails loudly here, rather than quietly
+# reintroducing cut-off replies in production.
+
+
+def test_thinking_budget_is_disabled_in_config():
+    from google.genai import types
+
+    config = types.GenerateContentConfig(
+        max_output_tokens=600,
+        temperature=0.8,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+
+    assert config.thinking_config.thinking_budget == 0
+
+
+def test_ai_service_configs_disable_thinking():
+    """Guards against someone editing ai_service.py and dropping the
+    thinking_config line without noticing."""
+
+    import inspect
+
+    import services.ai_service as ai_service
+
+    source = inspect.getsource(ai_service)
+
+    assert source.count("thinking_config=types.ThinkingConfig(thinking_budget=0)") == 2, (
+        "Expected thinking to be disabled in both "
+        "generate_julie_response and generate_recap"
+    )

@@ -253,6 +253,7 @@ async def generate_julie_response(
                 system_instruction=system_instruction,
                 max_output_tokens=600,
                 temperature=0.8,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
 
@@ -307,6 +308,7 @@ async def generate_recap(entries: list[str]) -> str:
                 system_instruction=SYSTEM_INSTRUCTION,
                 max_output_tokens=700,
                 temperature=0.7,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         return _extract_text(response)
