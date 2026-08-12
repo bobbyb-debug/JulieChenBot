@@ -68,7 +68,12 @@ def test_fetch_failure_is_degraded():
     assert result.events == []
 
 
-def test_quickview_is_registered_with_watcher():
+def test_quickview_is_instantiated_but_not_registered():
+    """Quickview/BBUpdates duplicate RSS's own board with whole-page
+    hashing and no real content extraction, so they're kept available
+    but intentionally not part of the active monitor set."""
+
     watcher = ProductionWatcher(storage=FakeStorage())
-    assert watcher.quickview in watcher.monitors
-    assert watcher.total_monitors == 7
+    assert watcher.quickview not in watcher.monitors
+    assert watcher.bb_updates not in watcher.monitors
+    assert watcher.total_monitors == 5

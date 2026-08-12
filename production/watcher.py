@@ -55,11 +55,18 @@ class ProductionWatcher:
         self.hamsterwatch = HamsterwatchMonitor(storage=self.storage)
         self.register(self.hamsterwatch)
 
+        # Quickview and BBUpdates both watch the same bbusaupdates board
+        # RSS already covers, but hash the entire page (ads, counters,
+        # timestamps included) rather than extracting real content, so
+        # every "changed" notification says only "content changed" with
+        # nothing in it. BBUpdatesMonitor is the JokersUpdates page's own
+        # "(old)" legacy duplicate of Quickview's page, so between the
+        # two of them and RSS, three monitors were watching one board.
+        # Kept instantiated (in case anything references them directly)
+        # but not registered, so they no longer run or post.
         self.quickview = QuickviewMonitor(storage=self.storage)
-        self.register(self.quickview)
 
         self.bb_updates = BBUpdatesMonitor(storage=self.storage)
-        self.register(self.bb_updates)
 
         self.x_updates = XUpdatesMonitor(storage=self.storage)
         self.register(self.x_updates)
