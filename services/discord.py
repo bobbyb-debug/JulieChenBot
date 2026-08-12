@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import pkgutil
+import time
 
 import discord
 from discord.ext import commands
@@ -28,7 +29,9 @@ from config import (
 )
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
-from services.ai_service import generate_julie_response
+from services.ai_service import format_game_state, generate_julie_response
+
+AI_COOLDOWN_SECONDS = 8
 
 
 class DiscordService:
@@ -38,6 +41,8 @@ class DiscordService:
         self.logger = ProductionLogger.get("Discord")
 
         self.scheduler = Scheduler()
+
+        self._ai_cooldowns: dict[int, float] = {}
 
         intents = discord.Intents.default()
         intents.guilds = True
@@ -55,6 +60,57 @@ class DiscordService:
         self.scheduler.engine.announcer.bind_discord(self.bot)
 
         self.register_events()
+
+    # ==========================================================
+    # AI Chat
+    # ==========================================================
+
+    def _ai_cooldown_remaining(self, user_id: int) -> float:
+        """Returns seconds left on a user's cooldown, or 0 if clear."""
+
+        last_used = self._ai_cooldowns.get(user_id, 0.0)
+        elapsed = time.monotonic() - last_used
+        remaining = AI_COOLDOWN_SECONDS - elapsed
+
+        return max(0.0, remaining)
+
+    async def generate_ai_reply(
+        self,
+        user_id: int,
+        channel_id: int,
+        user_text: str,
+    ) -> str:
+        """Generates Julie's AI reply, applying cooldown and real game
+        state context.
+
+        Shared by the mention/DM handler and the /chat command, so both
+        entry points behave identically rather than drifting apart.
+
+        Returns a cooldown message if the user is rate-limited, rather
+        than raising, since callers just send whatever string comes
+        back.
+        """
+
+        remaining = self._ai_cooldown_remaining(user_id)
+
+        if remaining > 0:
+            return (
+                f"⏳ Slow down, Houseguest — give me {remaining:.0f} "
+                "more second(s) before your next question."
+            )
+
+        self._ai_cooldowns[user_id] = time.monotonic()
+
+        house_status = self.scheduler.engine.watcher.house_status.current
+        competition = self.scheduler.engine.watcher.competition.current
+
+        game_state = format_game_state(house_status, competition)
+
+        return await generate_julie_response(
+            channel_id,
+            user_text,
+            game_state=game_state,
+        )
 
     # ==========================================================
     # Events
@@ -112,6 +168,7 @@ class DiscordService:
                 )
 
                 if guild is not None:
+                    self.bot.tree.copy_global_to(guild=guild)
                     guild_synced = await self.bot.tree.sync(guild=guild)
                     self.logger.info(
                         "Synced %s slash command(s) to guild %s.",
@@ -209,7 +266,8 @@ class DiscordService:
 
                 async with message.channel.typing():
                     try:
-                        ai_reply = await generate_julie_response(
+                        ai_reply = await self.generate_ai_reply(
+                            message.author.id,
                             message.channel.id,
                             clean_text,
                         )

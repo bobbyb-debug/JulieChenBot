@@ -34,6 +34,7 @@ def register(discord_service) -> None:
             created_at=datetime.now(UTC),
             metadata={
                 "link": "https://www.jokersupdates.com/",
+                "test": True,
             },
         )
 

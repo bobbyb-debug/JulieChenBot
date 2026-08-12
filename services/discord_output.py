@@ -201,6 +201,9 @@ class DiscordOutputRouter:
         else:
             title = event.title
 
+        if event.metadata.get("test"):
+            title = f"🧪 [TEST] {title}"
+
         embed = discord.Embed(
             title=title,
             description=event.detail,
