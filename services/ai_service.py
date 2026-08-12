@@ -108,8 +108,90 @@ def append_ai_response(channel_id: int, ai_text: str) -> None:
     _append_message(channel_id, "model", ai_text)
 
 
-async def generate_julie_response(channel_id: int, user_text: str) -> str:
-    """Contacts Gemini using the correct context and returns the text."""
+def clear_history(channel_id: int) -> int:
+    """Deletes all persisted chat history for a channel.
+
+    Returns the number of messages removed.
+    """
+
+    connection = _connection()
+
+    try:
+        cursor = connection.execute(
+            "DELETE FROM chat_messages WHERE channel_id = ?",
+            (channel_id,),
+        )
+        connection.commit()
+        return cursor.rowcount
+    finally:
+        connection.close()
+
+
+def format_game_state(house_status, competition) -> str:
+    """Formats currently tracked production data for Gemini's context.
+
+    Only includes facts that are actually known. Explicitly instructs
+    Julie not to guess beyond this list, since a wrong confident answer
+    is worse than an honest "I don't know yet."
+    """
+
+    lines: list[str] = []
+
+    if house_status.hoh:
+        lines.append(f"Head of Household: {house_status.hoh}")
+
+    if house_status.nominees:
+        lines.append(
+            f"Nominees: {', '.join(house_status.nominees)}"
+        )
+
+    if house_status.veto_holder:
+        used = "used" if house_status.veto_used else "not yet used"
+        lines.append(
+            f"Power of Veto: held by {house_status.veto_holder} ({used})"
+        )
+
+    if house_status.have_nots:
+        lines.append(
+            f"Have-Nots: {', '.join(house_status.have_nots)}"
+        )
+
+    if house_status.feeds:
+        lines.append(f"Feed status: {house_status.feeds}")
+
+    if competition.active:
+        lines.append(
+            f"Competition currently in progress: {competition.competition.value}"
+        )
+    elif competition.winner:
+        lines.append(
+            f"Most recent competition winner: {competition.winner} "
+            f"({competition.competition.value})"
+        )
+
+    if not lines:
+        return ""
+
+    return (
+        "Current known Big Brother house state. Only state facts from "
+        "this list when asked about game status. If something is not "
+        "listed here, say you don't know yet rather than guessing:\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+async def generate_julie_response(
+    channel_id: int,
+    user_text: str,
+    game_state: str = "",
+) -> str:
+    """Contacts Gemini using the correct context and returns the text.
+
+    game_state, when provided, is real tracked production data (current
+    HOH, nominees, veto, etc.) appended to the system instruction so
+    Julie answers accurately instead of deflecting on questions she
+    actually has data for.
+    """
     if ai_client is None:
         return (
             "⚠️ Julie cannot answer right now because GEMINI_API_KEY is not configured. "
@@ -119,11 +201,15 @@ async def generate_julie_response(channel_id: int, user_text: str) -> str:
     try:
         conversation_history = update_and_get_history(channel_id, user_text)
 
+        system_instruction = SYSTEM_INSTRUCTION
+        if game_state:
+            system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{game_state}"
+
         response = ai_client.models.generate_content(
             model="gemini-3.6-flash",
             contents=conversation_history,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
+                system_instruction=system_instruction,
                 max_output_tokens=400,
                 temperature=0.8,
             ),
@@ -138,3 +224,51 @@ async def generate_julie_response(channel_id: int, user_text: str) -> str:
             "⚠️ *Static feedback on the production headset*... Expect the unexpected, "
             "Houseguests! My processors encountered an error."
         )
+
+
+async def generate_recap(entries: list[str]) -> str:
+    """Summarizes recent live-feed updates in Julie's voice.
+
+    Unlike generate_julie_response, this is a one-off call with no
+    persisted chat history — a recap is a summary, not a conversation.
+    """
+
+    if ai_client is None:
+        return (
+            "⚠️ Julie cannot summarize right now because GEMINI_API_KEY "
+            "is not configured."
+        )
+
+    if not entries:
+        return "Nothing new to recap yet, Houseguest."
+
+    joined = "\n".join(f"- {entry}" for entry in entries)
+
+    prompt = (
+        "Summarize the following recent Big Brother live feed updates "
+        "into a short, punchy recap (5-8 sentences max), in character. "
+        "Group related moments together. Only use information present "
+        "below; do not invent details.\n\n"
+        f"{joined}"
+    )
+
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=prompt)],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                max_output_tokens=500,
+                temperature=0.7,
+            ),
+        )
+        return response.text
+
+    except Exception as e:
+        print(f"AI Recap Error: {e}")
+        return "⚠️ *Static feedback on the production headset*... recap unavailable right now."

@@ -29,6 +29,9 @@ from services.logger import ProductionLogger
 class ProductionEngine:
     """Coordinates Julie ChenBot's production systems."""
 
+    RECAP_KEY = "recap_buffer"
+    RECAP_LIMIT = 100
+
     def __init__(self, storage: Optional[Storage] = None) -> None:
         self.logger = ProductionLogger.get("Engine")
         self.storage = storage or Storage()
@@ -204,10 +207,36 @@ class ProductionEngine:
             try:
                 await self.announcer.announce(event)
                 event.mark_announced()
+                self._record_recap(event)
             except Exception:
                 self.pending_events.appendleft(event)
                 self.logger.exception("Announcement failed.")
                 break
+
+    def _record_recap(self, event: ProductionEvent) -> None:
+        """Appends an announced RSS update to the rolling recap buffer.
+
+        Only real live-feed updates are recorded; monitor-generated
+        events (image changes, competition state) are not, since /recap
+        is specifically "what happened on the feeds."
+        """
+
+        if event.event_type != EventType.RSS_UPDATE:
+            return
+
+        buffer = list(self.storage.get(self.RECAP_KEY, []))
+        buffer.append(event.detail)
+
+        if len(buffer) > self.RECAP_LIMIT:
+            buffer = buffer[-self.RECAP_LIMIT:]
+
+        self.storage.set(self.RECAP_KEY, buffer)
+
+    def recent_updates(self, limit: int = 20) -> list[str]:
+        """Returns the most recent announced live-feed updates."""
+
+        buffer = list(self.storage.get(self.RECAP_KEY, []))
+        return buffer[-limit:]
 
     async def save_state(self) -> None:
         """Persists the storage state used by monitors."""
