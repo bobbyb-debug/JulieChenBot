@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import threading
-from pathlib import Path
 from typing import Any
+
+from config import DATA
 
 
 class Storage:
-    FILE = Path("data/storage.json")
+    FILE = DATA / "storage.json"
 
     DEFAULT_DATA = {
         "last_guid": "",

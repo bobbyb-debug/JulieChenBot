@@ -32,11 +32,16 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent
 
 ASSETS = ROOT / "assets"
-DATABASE = ROOT / "database"
-LOGS = ROOT / "logs"
+# Set STATE_DIR to a persistent disk mount when deploying Julie. Railway
+# volumes are available at the configured absolute mount path (for example,
+# /data), while local development keeps state inside the project folder.
+STATE_DIR = Path(os.getenv("STATE_DIR", ROOT)).expanduser()
+DATABASE = STATE_DIR / "database"
+DATA = STATE_DIR / "data"
+LOGS = STATE_DIR / "logs"
 
 # Ensure required folders exist
-for directory in (ASSETS, DATABASE, LOGS):
+for directory in (ASSETS, DATA, DATABASE, LOGS):
     directory.mkdir(parents=True, exist_ok=True)
 
 # ==========================================================
