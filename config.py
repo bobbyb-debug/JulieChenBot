@@ -106,9 +106,11 @@ def env_int(name: str, default: int = 0) -> int:
 
 GUILD_ID = env_int("GUILD_ID")
 
-LIVE_UPDATES_CHANNEL = env_int("LIVE_UPDATES_CHANNEL")
+# Live-updates and house-status were both explicitly provisioned for
+# Julie's production feed, so both get real defaults the same way —
+# routing keeps working even without the env vars set.
+LIVE_UPDATES_CHANNEL = env_int("LIVE_UPDATES_CHANNEL", 1534581029871026347)
 PRODUCTION_CHANNEL = env_int("PRODUCTION_CHANNEL")
-# House-status was explicitly provisioned for Julie's production feed.
 HOUSE_STATUS_CHANNEL = env_int("HOUSE_STATUS_CHANNEL", 1534566047611617371)
 PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 

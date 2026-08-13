@@ -698,3 +698,84 @@ def test_empty_groq_content_falls_back_to_gemini(monkeypatch, tmp_path):
     )
 
     assert reply == "Gemini says hi"
+
+
+# ==========================================================
+# generate_recap: game state + Hamsterwatch source provenance
+# ==========================================================
+#
+# /recap now combines three sources — tracked game state, recent
+# Joker's Updates, and a small retrieved slice of Hamsterwatch
+# history — and the model must never blur which is which. These
+# tests check the actual prompt text sent to the provider, since
+# that's the only thing enforcing that distinction at generation time.
+
+
+def test_recap_still_works_with_only_entries_backward_compatible(monkeypatch, tmp_path):
+    """The pre-existing call shape (positional entries, no kwargs)
+    must keep working unchanged."""
+
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess("Groq recap"),
+        gemini=FakeGeminiClientFailure(),
+    )
+
+    reply = asyncio.run(ai_service.generate_recap(["update one"]))
+
+    assert reply == "Groq recap"
+
+
+def test_recap_returns_placeholder_when_nothing_to_summarize(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=None)
+
+    reply = asyncio.run(ai_service.generate_recap([]))
+
+    assert reply == "Nothing new to recap yet, Houseguest."
+
+
+def test_recap_prompt_labels_each_source_for_provenance(monkeypatch, tmp_path):
+    groq = FakeGroqClientSuccess("recap reply")
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path, groq=groq, gemini=FakeGeminiClientFailure(),
+    )
+
+    asyncio.run(
+        ai_service.generate_recap(
+            ["Kamu went to the DR."],
+            game_state="Head of Household: LaLa",
+            hamsterwatch_entries=[
+                "[Day 37 - 2026-08-12] Day 37 recap: LaLa and Devens talked strategy."
+            ],
+        )
+    )
+
+    prompt = groq.calls[0]["messages"][1]["content"]
+
+    assert "CURRENT GAME STATE" in prompt
+    assert "RECENT JOKER'S UPDATES" in prompt
+    assert "RELEVANT HAMSTERWATCH HISTORY" in prompt
+    assert "Head of Household: LaLa" in prompt
+    assert "Kamu went to the DR." in prompt
+    assert "Day 37" in prompt
+    assert "LaLa and Devens talked strategy" in prompt
+    # The instruction telling the model not to conflate the two sources.
+    assert "Hamsterwatch" in prompt and "Joker's" in prompt
+
+
+def test_recap_omits_sections_that_are_not_provided(monkeypatch, tmp_path):
+    """A recap with no Hamsterwatch hits and no tracked game state
+    must not print an empty labeled section for either."""
+
+    groq = FakeGroqClientSuccess("recap reply")
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path, groq=groq, gemini=FakeGeminiClientFailure(),
+    )
+
+    asyncio.run(ai_service.generate_recap(["Kamu went to the DR."]))
+
+    prompt = groq.calls[0]["messages"][1]["content"]
+
+    assert "CURRENT GAME STATE" not in prompt
+    assert "RELEVANT HAMSTERWATCH HISTORY" not in prompt
+    assert "RECENT JOKER'S UPDATES" in prompt

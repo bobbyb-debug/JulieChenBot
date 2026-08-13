@@ -178,3 +178,94 @@ def test_house_image_falls_back_to_hotlink_when_download_fails(monkeypatch) -> N
     assert len(house.messages) == 1
     assert house.messages[0].get("file") is None
     assert house.messages[0]["embed"].image.url == url
+
+
+# ==========================================================
+# Hamsterwatch notifications
+# ==========================================================
+
+
+def _hamsterwatch_event(**metadata_overrides) -> ProductionEvent:
+    metadata = {
+        "url": "http://hamsterwatch.com/bb28/081026.shtml",
+        "link": "http://hamsterwatch.com/bb28/081026.shtml",
+        "bb_day": 37,
+        "article_date": "2026-08-12",
+        "published": "2026-08-12",
+        "heading": "Day 37 - Wednesday - August 12, 2026",
+        "summary": "LaLa and Devens talked strategy about next week's veto.",
+        "count": 1,
+    }
+    metadata.update(metadata_overrides)
+    return ProductionEvent(
+        source="Hamsterwatch",
+        event_type=EventType.TIMELINE,
+        title="HAMSTERWATCH UPDATED",
+        detail="Day 37 - Wednesday - August 12, 2026\n\nLaLa and Devens talked strategy.",
+        severity=EventSeverity.NOTICE,
+        metadata=metadata,
+    )
+
+
+def test_hamsterwatch_event_routes_to_live_updates_only(monkeypatch) -> None:
+    """Hamsterwatch commentary is feed-adjacent content, not house
+    state — it must not be confused with house-status routing."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 999)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(999, "house-status")
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+
+    asyncio.run(router.publish(_hamsterwatch_event()))
+
+    assert len(live.messages) == 1
+    assert len(house.messages) == 0
+
+
+def test_hamsterwatch_embed_shows_day_title_bb_day_field_and_link(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event()))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATE — Day 37"
+    assert any(
+        field.name == "📅 BB Day" and field.value == "37" for field in embed.fields
+    )
+    assert any(
+        field.name == "🕒 Published" and field.value == "2026-08-12"
+        for field in embed.fields
+    )
+    source_field = next(field for field in embed.fields if field.name == "🔗 Source")
+    assert "hamsterwatch.com/bb28/081026.shtml" in source_field.value
+    assert "Hamsterwatch" in source_field.value
+
+
+def test_hamsterwatch_multi_day_event_shows_count_in_title(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event(count=2, bb_day=38)))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATE — 2 new recaps"
+
+
+def test_hamsterwatch_event_without_bb_day_uses_plain_title(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event(bb_day=None, count=1)))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATE"
+    assert not any(field.name == "📅 BB Day" for field in embed.fields)

@@ -410,25 +410,62 @@ async def generate_julie_response(
     return reply_text
 
 
-async def generate_recap(entries: list[str]) -> str:
+async def generate_recap(
+    entries: list[str],
+    *,
+    game_state: str = "",
+    hamsterwatch_entries: list[str] | None = None,
+) -> str:
     """Summarizes recent live-feed updates in Julie's voice: Groq
     first, Gemini if Groq can't answer.
+
+    Combines up to three clearly-labeled sources in one prompt so the
+    model never blurs where information came from:
+
+        - game_state: real tracked production data (current HOH,
+          nominees, veto, etc.) — same input format as
+          generate_julie_response's game_state.
+        - entries: recent Joker's Updates live-feed update strings.
+        - hamsterwatch_entries: a small, pre-selected slice of
+          Hamsterwatch recap history (never the whole archive —
+          callers are expected to retrieve only what's relevant via
+          HamsterwatchArchive.find_relevant before calling this).
 
     Unlike generate_julie_response, this is a one-off call with no
     persisted chat history — a recap is a summary, not a conversation.
     """
 
-    if not entries:
+    if not entries and not hamsterwatch_entries and not game_state:
         return "Nothing new to recap yet, Houseguest."
 
-    joined = "\n".join(f"- {entry}" for entry in entries)
+    sections: list[str] = []
+
+    if game_state:
+        sections.append(f"=== CURRENT GAME STATE ===\n{game_state}")
+
+    if entries:
+        joined_entries = "\n".join(f"- {entry}" for entry in entries)
+        sections.append(
+            f"=== RECENT JOKER'S UPDATES (live feed, right now) ===\n{joined_entries}"
+        )
+
+    if hamsterwatch_entries:
+        joined_hamsterwatch = "\n\n".join(hamsterwatch_entries)
+        sections.append(
+            "=== RELEVANT HAMSTERWATCH HISTORY (Dingo's Hamsterwatch recap "
+            f"site, background context on earlier days) ===\n{joined_hamsterwatch}"
+        )
 
     prompt = (
-        "Summarize the following recent Big Brother live feed updates "
+        "Summarize what's happening in the Big Brother house right now "
         "into a short, punchy recap (5-8 sentences max), in character. "
         "Group related moments together. Only use information present "
-        "below; do not invent details.\n\n"
-        f"{joined}"
+        "below; do not invent details. The sections below come from "
+        "different sources on purpose - keep that straight: Joker's "
+        "Updates is live, up-to-the-minute feed activity; Hamsterwatch "
+        "is a fan recap site providing background on earlier days. Never "
+        "present Hamsterwatch commentary as if it were a live Joker's "
+        "Updates report, or vice versa.\n\n" + "\n\n".join(sections)
     )
 
     reply_text = _try_groq_chat(

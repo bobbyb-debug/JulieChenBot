@@ -23,6 +23,24 @@ from production.events import EventSeverity, EventType, ProductionEvent
 from services.logger import ProductionLogger
 
 
+def _hamsterwatch_title(event: ProductionEvent) -> str:
+    """Builds the Hamsterwatch embed title from event metadata.
+
+    Surfaces the BB day (or the count of new recaps, for a multi-day
+    catch-up) directly in the title so it's visible without opening
+    the embed body.
+    """
+
+    count = event.metadata.get("count", 1)
+    bb_day = event.metadata.get("bb_day")
+
+    if count and count > 1:
+        return f"🐹 HAMSTERWATCH UPDATE — {count} new recaps"
+    if bb_day:
+        return f"🐹 HAMSTERWATCH UPDATE — Day {bb_day}"
+    return "🐹 HAMSTERWATCH UPDATE"
+
+
 class DiscordOutputRouter:
     """Publishes ProductionEvents to configured Discord channels."""
 
@@ -195,7 +213,7 @@ class DiscordOutputRouter:
         if event.event_type == EventType.RSS_UPDATE:
             title = "🟦 LIVE FEED UPDATE"
         elif event.event_type == EventType.TIMELINE and event.source == "Hamsterwatch":
-            title = "🐹 HAMSTERWATCH UPDATE"
+            title = _hamsterwatch_title(event)
         elif event.event_type == EventType.IMAGE_CHANGED:
             title = "🏠 HOUSE STATUS UPDATED"
         else:
@@ -226,6 +244,13 @@ class DiscordOutputRouter:
         published = event.metadata.get("published")
         if published:
             embed.add_field(name="🕒 Published", value=str(published), inline=False)
+
+        if event.source == "Hamsterwatch" and event.metadata.get("bb_day"):
+            embed.add_field(
+                name="📅 BB Day",
+                value=str(event.metadata["bb_day"]),
+                inline=True,
+            )
 
         embed.set_footer(text=f"Julie ChenBot • Source: {event.source}")
         return embed
