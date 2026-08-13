@@ -11,6 +11,7 @@ individual monitor classes.
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Optional
@@ -112,13 +113,20 @@ class ProductionEngine:
 
         try:
             had_rss_snapshot = bool(self.storage.last_guid)
-            rss_updates = self.rss.check_all()
+            # check_all() is synchronous and performs a real network
+            # fetch (see production/rss.py). Running it directly here
+            # would block the whole asyncio event loop -- including
+            # Discord's heartbeat and every other monitor -- for the
+            # duration of that fetch. asyncio.to_thread() runs it on a
+            # worker thread instead, so a slow/stalled feed can no
+            # longer freeze the bot.
+            rss_updates = await asyncio.to_thread(self.rss.check_all)
 
             # On first launch, check_all() records the feed and returns
             # nothing. Read the current item so Julie can publish an
             # initial live-feed snapshot immediately.
             if not rss_updates and not had_rss_snapshot:
-                initial = self.rss.current()
+                initial = await asyncio.to_thread(self.rss.current)
                 if initial is not None:
                     rss_updates = [initial]
                     self.logger.info(

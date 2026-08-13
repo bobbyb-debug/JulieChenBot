@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+from urllib.request import Request, urlopen
 
 import feedparser
 
@@ -24,6 +25,15 @@ from database.storage import Storage
 from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("RSS")
+
+_USER_AGENT = "JulieChenBot/1.0"
+
+# feedparser.parse() has no timeout parameter in the installed version
+# (verified via inspect.signature on feedparser 6.0.14) and performs
+# its own network fetch internally when given a URL, unbounded -- a
+# stalled connection can hang indefinitely. This is the same bound
+# used by every other Julie monitor's urlopen() call.
+_FETCH_TIMEOUT = 20
 
 
 # ======================================================
@@ -84,8 +94,30 @@ class JokersRSS:
             "Checking Jokers RSS feed..."
         )
 
+        # Fetch the bytes ourselves with a bounded timeout, then hand
+        # feedparser only the already-fetched bytes to parse -- this
+        # removes feedparser's own unbounded network fetch entirely
+        # (it does parsing only here, no I/O). A fetch failure or
+        # timeout degrades to an empty feed rather than raising,
+        # matching the "no entries" outcome entries()/latest() already
+        # handle for any other empty or malformed feed response.
+        try:
+            request = Request(
+                self.feed_url,
+                headers={"User-Agent": _USER_AGENT},
+            )
+            with urlopen(request, timeout=_FETCH_TIMEOUT) as response:
+                raw = response.read()
+        except Exception as exc:
+
+            logger.warning(
+                "RSS feed fetch failed: %s", exc
+            )
+
+            return feedparser.parse(b"")
+
         feed = feedparser.parse(
-            self.feed_url
+            raw
         )
 
         if feed.bozo:
