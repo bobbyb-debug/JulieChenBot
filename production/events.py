@@ -133,6 +133,19 @@ class ProductionEvent:
 
     announced: bool = False
 
+    # Names of destinations (see DiscordOutputRouter._CHANNEL_NAMES)
+    # that have already successfully received this event. A single
+    # event can route to multiple Discord channels; when one succeeds
+    # and another fails, engine.announce() requeues this exact same
+    # ProductionEvent instance for retry (see production/engine.py),
+    # so tracking delivery here -- rather than anywhere in the
+    # output layer -- means a retry naturally skips destinations that
+    # already got it, without a separate lookup table to keep in
+    # sync.
+    delivered_to: set[str] = field(
+        default_factory=set
+    )
+
     def __post_init__(self) -> None:
         """Normalize event timestamps to timezone-aware UTC."""
 

@@ -56,7 +56,24 @@ class DiscordOutputRouter:
         self.logger = ProductionLogger.get("DiscordOutput")
 
     async def publish(self, event: ProductionEvent) -> None:
-        """Routes and publishes one production event."""
+        """Routes and publishes one production event.
+
+        Delivery is tracked per destination on the event itself
+        (event.delivered_to), not just as an overall success/failure
+        for the whole call. This matters because engine.announce()
+        retries a failed publish() by requeuing this exact same
+        ProductionEvent instance (see production/engine.py) -- so a
+        destination that already succeeded must never be sent to
+        again on retry, and a destination that failed (whether
+        because it couldn't be resolved or because channel.send()
+        itself raised) must remain eligible for the next attempt.
+
+        Each destination is fully isolated from the others: one
+        destination's resolution failure or send failure never
+        prevents another destination in the same call from being
+        attempted, and never causes an already-delivered destination
+        to be resent.
+        """
         destinations = self._destinations(event)
         if not destinations:
             self.logger.warning(
@@ -65,27 +82,56 @@ class DiscordOutputRouter:
             )
             return
 
-        sent = 0
-        seen: set[int] = set()
+        failed_destinations: list[str] = []
+        seen_channel_ids: set[int] = set()
+
         for channel_id, channel_name in destinations:
+            if channel_name in event.delivered_to:
+                # Already delivered on a previous attempt -- never resend.
+                continue
+
             channel = await self._resolve_channel(channel_id, channel_name)
             if channel is None:
                 self.logger.warning("Discord channel unavailable: #%s", channel_name)
+                failed_destinations.append(channel_name)
                 continue
-            if channel.id in seen:
+
+            if channel.id in seen_channel_ids:
+                # Two logical destinations resolved to the same physical
+                # channel within this call; it was already sent to once
+                # above, so this one counts as delivered without a
+                # second physical send.
+                event.delivered_to.add(channel_name)
                 continue
-            seen.add(channel.id)
-            await self._send(channel, event)
-            sent += 1
+            seen_channel_ids.add(channel.id)
+
+            try:
+                await self._send(channel, event)
+            except Exception as exc:
+                # Isolated to this destination: a send failure here
+                # must not affect any other destination in this call,
+                # and must not cause an already-successful destination
+                # to be retried.
+                self.logger.warning(
+                    "Discord send failed for #%s (%s): %s",
+                    channel_name,
+                    event.event_type.value,
+                    exc,
+                )
+                failed_destinations.append(channel_name)
+                continue
+
+            event.delivered_to.add(channel_name)
             self.logger.info(
                 "Published %s to #%s.",
                 event.event_type.value,
                 getattr(channel, "name", channel_name),
             )
 
-        if sent == 0:
+        if failed_destinations:
             raise RuntimeError(
-                f"Unable to publish {event.event_type.value}: no Discord destination was reachable."
+                f"Unable to publish {event.event_type.value} to: "
+                f"{', '.join(failed_destinations)}."
             )
 
     async def _send(self, channel, event: ProductionEvent) -> None:
