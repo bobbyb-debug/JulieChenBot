@@ -1,6 +1,7 @@
 # services/ai_service.py
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 
@@ -27,8 +28,31 @@ from config import DATABASE
 # open-source release), just hosted on Groq's infrastructure.
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Gemini's HTTP layer has no timeout at all when http_options is left
+# unset: an unset HttpOptions.timeout resolves to an explicit
+# timeout=None passed into the underlying httpx client, which
+# disables the timeout entirely rather than falling back to any
+# client default (verified empirically against a stalled connection
+# that accepted the TCP connection but never responded -- the call
+# never returned). GEMINI_TIMEOUT_MS bounds it explicitly.
+#
+# Value chosen relative to Groq's own default read timeout (60s,
+# resolved from the Groq SDK's own default Timeout when unconfigured
+# by this codebase): Gemini only runs as a fallback, after Groq has
+# already had its own chance -- and its own timeout budget -- to
+# answer, so it shouldn't get a second full 60s allowance stacked on
+# top of that. 30s is half of Groq's per-attempt bound: comfortably
+# above Gemini flash's typical multi-second response time, while
+# keeping the combined worst case (Groq's ~60s + Gemini's 30s) from
+# growing unbounded for a single interactive Discord reply.
+GEMINI_TIMEOUT_MS = 30_000
+
 ai_client = (
-    genai.Client(api_key=GEMINI_API_KEY)
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
     if GEMINI_API_KEY
     else None
 )
@@ -386,14 +410,22 @@ async def generate_julie_response(
     if game_state:
         system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{game_state}"
 
-    reply_text = _try_groq_chat(
+    # _try_groq_chat/_try_gemini_chat are synchronous SDK calls that
+    # perform real network I/O. Run each on a worker thread via
+    # asyncio.to_thread() rather than directly here, so a slow or
+    # stalled provider can no longer block the whole asyncio event
+    # loop -- Discord's heartbeat, other users' commands, and every
+    # scheduled monitor tick would otherwise freeze along with it.
+    reply_text = await asyncio.to_thread(
+        _try_groq_chat,
         _to_groq_messages(history, system_instruction),
         max_tokens=2000,
         temperature=0.8,
     )
 
     if reply_text is None:
-        reply_text = _try_gemini_chat(
+        reply_text = await asyncio.to_thread(
+            _try_gemini_chat,
             _to_gemini_contents(history),
             system_instruction,
             max_tokens=2000,
@@ -468,7 +500,11 @@ async def generate_recap(
         "Updates report, or vice versa.\n\n" + "\n\n".join(sections)
     )
 
-    reply_text = _try_groq_chat(
+    # Same off-thread treatment as generate_julie_response() -- see the
+    # comment there for why these two calls specifically must not run
+    # directly on the event loop.
+    reply_text = await asyncio.to_thread(
+        _try_groq_chat,
         [
             {"role": "system", "content": SYSTEM_INSTRUCTION},
             {"role": "user", "content": prompt},
@@ -478,7 +514,8 @@ async def generate_recap(
     )
 
     if reply_text is None:
-        reply_text = _try_gemini_chat(
+        reply_text = await asyncio.to_thread(
+            _try_gemini_chat,
             [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
             SYSTEM_INSTRUCTION,
             max_tokens=2000,
