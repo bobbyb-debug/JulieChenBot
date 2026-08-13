@@ -10,6 +10,8 @@ Stores production state between restarts.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from typing import Any
 
@@ -55,15 +57,47 @@ class Storage:
         self._merge_defaults()
 
     def save(self) -> None:
+        """Writes storage.json atomically.
+
+        Writing directly to self.FILE would leave a corruption window
+        if the process is interrupted mid-write (Railway restart, OOM
+        kill, crash). Instead: write the complete new contents to a
+        temp file in the same directory, flush and fsync it, then
+        atomically swap it in with os.replace() -- which is atomic on
+        both POSIX and Windows (Windows: MoveFileExW with
+        MOVEFILE_REPLACE_EXISTING; os.rename() alone would raise on
+        Windows if the destination already exists). If anything fails
+        before the replace, the existing storage.json is never opened
+        for writing at all, so it is left exactly as it was.
+        """
+
         with self._lock:
-            with self.FILE.open("w", encoding="utf-8") as f:
-                json.dump(
-                    self._data,
-                    f,
-                    indent=4,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
+
+            payload = json.dumps(
+                self._data,
+                indent=4,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.FILE.parent),
+                prefix=f".{self.FILE.name}.",
+                suffix=".tmp",
+            )
+
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                os.replace(tmp_name, self.FILE)
+
+            except Exception:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+                raise
 
     def _merge_defaults(self) -> None:
         changed = False
