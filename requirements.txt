@@ -8,3 +8,4 @@ aiosqlite
 apscheduler
 Pillow
 google-genai
+groq

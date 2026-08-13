@@ -6,17 +6,41 @@ import sqlite3
 
 from google import genai
 from google.genai import types
+from groq import Groq
 
 from config import DATABASE
 
-# Initialize Google GenAI client using the GEMINI_API_KEY environment variable.
-# Set GEMINI_API_KEY in .env or your environment before starting the bot.
+# ==========================================================
+# Providers
+# ==========================================================
+#
+# Groq is tried first (free, fast, open-weight models, no hidden
+# "thinking" tokens to trip over). Gemini is the fallback if Groq
+# isn't configured or its call fails for any reason - rate limit,
+# quota, network error, anything. Neither provider's outage takes
+# Julie's chat down alone.
+#
+# GROQ_MODEL: openai/gpt-oss-120b. Groq deprecated llama-3.3-70b-
+# versatile in June 2026 and recommends this as the replacement
+# for general-purpose/quality workloads (console.groq.com/docs/
+# deprecations) - a genuinely open-weight model (OpenAI's own
+# open-source release), just hosted on Groq's infrastructure.
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ai_client = (
     genai.Client(api_key=GEMINI_API_KEY)
     if GEMINI_API_KEY
     else None
 )
+GEMINI_MODEL = "gemini-3.6-flash"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+groq_client = (
+    Groq(api_key=GROQ_API_KEY)
+    if GROQ_API_KEY
+    else None
+)
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 CHAT_HISTORY_FILE = DATABASE / "chat_history.db"
 MAX_CONTEXT_MESSAGES = 16
@@ -29,6 +53,18 @@ SYSTEM_INSTRUCTION = (
     "conversations. Keep responses sharp, highly interactive, witty, and perfectly tailored "
     "for a fast-paced chat channel. Do not talk like a bland assistant; you control the game!"
 )
+
+
+# ==========================================================
+# Conversation history
+# ==========================================================
+#
+# Stored and returned in a plain, provider-agnostic shape -
+# list[tuple[role, text]], with role always "user" or "model" -
+# and converted into each provider's own required format only at
+# call time (_to_gemini_contents / _to_groq_messages below). This
+# is what lets Groq and Gemini share one history without either
+# provider's SDK shape leaking into storage.
 
 
 def _connection() -> sqlite3.Connection:
@@ -67,7 +103,7 @@ def _append_message(channel_id: int, role: str, text: str) -> None:
         connection.close()
 
 
-def _recent_history(channel_id: int) -> list[types.Content]:
+def _recent_history(channel_id: int) -> list[tuple[str, str]]:
     """Returns the latest context window in chronological order."""
 
     connection = _connection()
@@ -86,16 +122,13 @@ def _recent_history(channel_id: int) -> list[types.Content]:
     finally:
         connection.close()
 
-    return [
-        types.Content(
-            role=role,
-            parts=[types.Part.from_text(text=content)],
-        )
-        for role, content in reversed(rows)
-    ]
+    return [(role, content) for role, content in reversed(rows)]
 
 
-def update_and_get_history(channel_id: int, user_text: str) -> list[types.Content]:
+def update_and_get_history(
+    channel_id: int,
+    user_text: str,
+) -> list[tuple[str, str]]:
     """Saves a user message and returns recent persistent conversation context."""
 
     _append_message(channel_id, "user", user_text)
@@ -127,8 +160,45 @@ def clear_history(channel_id: int) -> int:
         connection.close()
 
 
+def _to_gemini_contents(
+    history: list[tuple[str, str]],
+) -> list[types.Content]:
+    """Converts stored (role, text) history into Gemini's Content shape."""
+
+    return [
+        types.Content(role=role, parts=[types.Part.from_text(text=text)])
+        for role, text in history
+    ]
+
+
+def _to_groq_messages(
+    history: list[tuple[str, str]],
+    system_instruction: str,
+) -> list[dict]:
+    """Converts stored (role, text) history into OpenAI-shaped messages.
+
+    Groq's API is OpenAI-compatible: role must be "system", "user", or
+    "assistant" - "model" (Gemini's convention) is remapped here.
+    """
+
+    messages = [{"role": "system", "content": system_instruction}]
+
+    for role, text in history:
+        messages.append({
+            "role": "assistant" if role == "model" else "user",
+            "content": text,
+        })
+
+    return messages
+
+
+# ==========================================================
+# Game state (provider-agnostic - plain text either way)
+# ==========================================================
+
+
 def format_game_state(house_status, competition) -> str:
-    """Formats currently tracked production data for Gemini's context.
+    """Formats currently tracked production data for the model's context.
 
     Only includes facts that are actually known. Explicitly instructs
     Julie not to guess beyond this list, since a wrong confident answer
@@ -180,7 +250,12 @@ def format_game_state(house_status, competition) -> str:
     )
 
 
-def _extract_text(response) -> str:
+# ==========================================================
+# Gemini response parsing
+# ==========================================================
+
+
+def _extract_gemini_text(response) -> str:
     """Extracts response text directly from candidate parts, and logs
     the finish reason when generation stopped for any reason other
     than a normal completion.
@@ -204,7 +279,7 @@ def _extract_text(response) -> str:
 
         if reason_name not in ("STOP", "None"):
             print(
-                f"AI Service: generation finished with reason="
+                f"AI Service: Gemini finished with reason="
                 f"{reason_name} (parts={len(parts)}, "
                 f"text_length={len(text)})"
             )
@@ -214,11 +289,82 @@ def _extract_text(response) -> str:
 
     except Exception as exc:
         print(
-            f"AI Service: failed reading response parts directly "
+            f"AI Service: failed reading Gemini response parts directly "
             f"({exc}); falling back to response.text."
         )
 
     return getattr(response, "text", "") or ""
+
+
+# ==========================================================
+# Per-provider calls
+# ==========================================================
+#
+# Each of these returns the reply text, or None on ANY failure -
+# missing API key, network error, rate limit, quota, malformed
+# response, anything. None means "try the next provider," never
+# an exception the caller has to handle. This is what makes the
+# fallback in generate_julie_response/generate_recap a plain
+# sequential check rather than nested try/except.
+
+
+def _try_groq_chat(
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+) -> str | None:
+
+    if groq_client is None:
+        return None
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        text = response.choices[0].message.content
+
+        return text or None
+
+    except Exception as exc:
+        print(f"Groq Error: {exc}")
+        return None
+
+
+def _try_gemini_chat(
+    contents,
+    system_instruction: str,
+    max_tokens: int,
+    temperature: float,
+) -> str | None:
+
+    if ai_client is None:
+        return None
+
+    try:
+        response = ai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+            ),
+        )
+
+        return _extract_gemini_text(response) or None
+
+    except Exception as exc:
+        print(f"AI Service Error: {exc}")
+        return None
+
+
+# ==========================================================
+# Public entry points
+# ==========================================================
 
 
 async def generate_julie_response(
@@ -226,60 +372,51 @@ async def generate_julie_response(
     user_text: str,
     game_state: str = "",
 ) -> str:
-    """Contacts Gemini using the correct context and returns the text.
+    """Generates Julie's reply: Groq first, Gemini if Groq can't answer.
 
     game_state, when provided, is real tracked production data (current
     HOH, nominees, veto, etc.) appended to the system instruction so
     Julie answers accurately instead of deflecting on questions she
     actually has data for.
     """
-    if ai_client is None:
-        return (
-            "⚠️ Julie cannot answer right now because GEMINI_API_KEY is not configured. "
-            "Please set GEMINI_API_KEY in your .env file and restart the bot."
+
+    history = update_and_get_history(channel_id, user_text)
+
+    system_instruction = SYSTEM_INSTRUCTION
+    if game_state:
+        system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{game_state}"
+
+    reply_text = _try_groq_chat(
+        _to_groq_messages(history, system_instruction),
+        max_tokens=2000,
+        temperature=0.8,
+    )
+
+    if reply_text is None:
+        reply_text = _try_gemini_chat(
+            _to_gemini_contents(history),
+            system_instruction,
+            max_tokens=2000,
+            temperature=0.8,
         )
 
-    try:
-        conversation_history = update_and_get_history(channel_id, user_text)
-
-        system_instruction = SYSTEM_INSTRUCTION
-        if game_state:
-            system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{game_state}"
-
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=conversation_history,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                max_output_tokens=2000,
-                temperature=0.8,
-            ),
-        )
-
-        reply_text = _extract_text(response)
-        append_ai_response(channel_id, reply_text)
-        return reply_text
-
-    except Exception as e:
-        print(f"AI Service Error: {e}")
+    if reply_text is None:
         return (
             "⚠️ *Static feedback on the production headset*... Expect the unexpected, "
-            "Houseguests! My processors encountered an error."
+            "Houseguests! Both my Groq and Gemini feeds are down right now."
         )
+
+    append_ai_response(channel_id, reply_text)
+    return reply_text
 
 
 async def generate_recap(entries: list[str]) -> str:
-    """Summarizes recent live-feed updates in Julie's voice.
+    """Summarizes recent live-feed updates in Julie's voice: Groq
+    first, Gemini if Groq can't answer.
 
     Unlike generate_julie_response, this is a one-off call with no
     persisted chat history — a recap is a summary, not a conversation.
     """
-
-    if ai_client is None:
-        return (
-            "⚠️ Julie cannot summarize right now because GEMINI_API_KEY "
-            "is not configured."
-        )
 
     if not entries:
         return "Nothing new to recap yet, Houseguest."
@@ -294,23 +431,27 @@ async def generate_recap(entries: list[str]) -> str:
         f"{joined}"
     )
 
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt)],
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                max_output_tokens=2000,
-                temperature=0.7,
-            ),
-        )
-        return _extract_text(response)
+    reply_text = _try_groq_chat(
+        [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=2000,
+        temperature=0.7,
+    )
 
-    except Exception as e:
-        print(f"AI Recap Error: {e}")
-        return "⚠️ *Static feedback on the production headset*... recap unavailable right now."
+    if reply_text is None:
+        reply_text = _try_gemini_chat(
+            [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+            SYSTEM_INSTRUCTION,
+            max_tokens=2000,
+            temperature=0.7,
+        )
+
+    if reply_text is None:
+        return (
+            "⚠️ *Static feedback on the production headset*... recap unavailable — "
+            "both Groq and Gemini are down right now."
+        )
+
+    return reply_text

@@ -4,6 +4,7 @@ for Gemini, the recap buffer, and per-user cooldown.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -239,7 +240,7 @@ class FakeResponse:
 
 
 def test_extract_text_joins_all_parts():
-    from services.ai_service import _extract_text
+    from services.ai_service import _extract_gemini_text as _extract_text
 
     response = FakeResponse(
         [FakePart("Hello, "), FakePart("Houseguest!")]
@@ -249,7 +250,7 @@ def test_extract_text_joins_all_parts():
 
 
 def test_extract_text_logs_non_stop_reason(capsys):
-    from services.ai_service import _extract_text
+    from services.ai_service import _extract_gemini_text as _extract_text
 
     response = FakeResponse(
         [FakePart("cut off mid")], finish_reason="MAX_TOKENS"
@@ -262,7 +263,7 @@ def test_extract_text_logs_non_stop_reason(capsys):
 
 
 def test_extract_text_does_not_log_normal_stop(capsys):
-    from services.ai_service import _extract_text
+    from services.ai_service import _extract_gemini_text as _extract_text
 
     response = FakeResponse([FakePart("complete.")], finish_reason="STOP")
 
@@ -273,7 +274,7 @@ def test_extract_text_does_not_log_normal_stop(capsys):
 
 
 def test_extract_text_falls_back_to_response_text_on_malformed_candidate():
-    from services.ai_service import _extract_text
+    from services.ai_service import _extract_gemini_text as _extract_text
 
     class BrokenResponse:
         candidates = None  # will raise when indexed
@@ -283,7 +284,7 @@ def test_extract_text_falls_back_to_response_text_on_malformed_candidate():
 
 
 def test_extract_text_falls_back_when_parts_are_empty():
-    from services.ai_service import _extract_text
+    from services.ai_service import _extract_gemini_text as _extract_text
 
     response = FakeResponse([], finish_reason="SAFETY", text_fallback="fallback")
 
@@ -352,7 +353,12 @@ def test_ai_service_does_not_set_thinking_config():
 
 def test_ai_service_uses_a_large_token_budget():
     """The current mitigation: enough headroom that hidden thinking
-    tokens shouldn't starve the visible reply."""
+    tokens shouldn't starve the visible reply.
+
+    max_output_tokens=2000 became max_tokens=2000 passed through to
+    both providers when Groq-fallback was added, so this checks the
+    call sites in generate_julie_response/generate_recap rather than
+    a single Gemini-specific literal."""
 
     import inspect
 
@@ -360,9 +366,10 @@ def test_ai_service_uses_a_large_token_budget():
 
     source = inspect.getsource(ai_service)
 
-    assert source.count("max_output_tokens=2000") == 2, (
-        "Expected both generate_julie_response and generate_recap "
-        "to use the raised token budget"
+    assert source.count("max_tokens=2000") == 4, (
+        "Expected both the Groq and Gemini call in each of "
+        "generate_julie_response/generate_recap to request the "
+        "raised token budget (2 functions x 2 providers = 4)"
     )
 
 
@@ -433,3 +440,261 @@ def test_help_is_admin_safe():
     assert _is_admin(FakeMemberInteraction()) is True
     assert _is_admin(FakeNonAdminInteraction()) is False
     assert _is_admin(FakeDMInteraction()) is False
+
+
+# ==========================================================
+# Groq-first, Gemini-fallback
+# ==========================================================
+#
+# Added after Gemini's free tier was cut to 20 requests/day and
+# real usage exhausted it mid-session. Groq (free, open-weight
+# models) is tried first; Gemini is the fallback if Groq isn't
+# configured or fails for any reason, so neither provider's own
+# limits or outages take Julie's chat down alone.
+
+
+class FakeGroqMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class FakeGroqChoice:
+    def __init__(self, content):
+        self.message = FakeGroqMessage(content)
+
+
+class FakeGroqResponse:
+    def __init__(self, content):
+        self.choices = [FakeGroqChoice(content)]
+
+
+class FakeGroqClientSuccess:
+    def __init__(self, content="Groq reply"):
+        self._content = content
+        self.calls = []
+
+    class _Completions:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def create(self, **kwargs):
+            self.outer.calls.append(kwargs)
+            return FakeGroqResponse(self.outer._content)
+
+    @property
+    def chat(self):
+        outer = self
+
+        class _Chat:
+            completions = FakeGroqClientSuccess._Completions(outer)
+
+        return _Chat()
+
+
+class FakeGroqClientFailure:
+    class chat:
+        class completions:
+            @staticmethod
+            def create(**kwargs):
+                raise RuntimeError("simulated Groq failure")
+
+
+class FakeGeminiPart:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeGeminiContent:
+    def __init__(self, text):
+        self.parts = [FakeGeminiPart(text)]
+
+
+class FakeGeminiFinishReason:
+    name = "STOP"
+
+
+class FakeGeminiCandidate:
+    def __init__(self, text):
+        self.content = FakeGeminiContent(text)
+        self.finish_reason = FakeGeminiFinishReason()
+
+
+class FakeGeminiResponse:
+    def __init__(self, text):
+        self.candidates = [FakeGeminiCandidate(text)]
+        self.text = text
+
+
+class FakeGeminiClientSuccess:
+    def __init__(self, text="Gemini reply"):
+        self.models = type(
+            "M", (),
+            {"generate_content": staticmethod(
+                lambda **kwargs: FakeGeminiResponse(text)
+            )},
+        )()
+
+
+class FakeGeminiClientFailure:
+    class models:
+        @staticmethod
+        def generate_content(**kwargs):
+            raise RuntimeError("simulated Gemini failure")
+
+
+def _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=None):
+    import services.ai_service as ai_service
+
+    monkeypatch.setattr(
+        ai_service, "CHAT_HISTORY_FILE", tmp_path / "chat_history.db"
+    )
+    monkeypatch.setattr(ai_service, "groq_client", groq)
+    monkeypatch.setattr(ai_service, "ai_client", gemini)
+    return ai_service
+
+
+def test_groq_messages_map_model_role_to_assistant():
+    from services.ai_service import _to_groq_messages
+
+    history = [("user", "hi"), ("model", "hello")]
+    messages = _to_groq_messages(history, "system prompt")
+
+    assert messages[0] == {"role": "system", "content": "system prompt"}
+    assert messages[1] == {"role": "user", "content": "hi"}
+    assert messages[2] == {"role": "assistant", "content": "hello"}
+
+
+def test_gemini_contents_preserve_roles():
+    from services.ai_service import _to_gemini_contents
+
+    history = [("user", "hi"), ("model", "hello")]
+    contents = _to_gemini_contents(history)
+
+    assert contents[0].role == "user"
+    assert contents[1].role == "model"
+
+
+def test_groq_tried_first_gemini_untouched(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess("Groq says hi"),
+        gemini=FakeGeminiClientFailure(),  # would raise if ever called
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(1, "hello")
+    )
+
+    assert reply == "Groq says hi"
+
+
+def test_falls_back_to_gemini_when_groq_fails(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientFailure(),
+        gemini=FakeGeminiClientSuccess("Gemini says hi"),
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(2, "hello")
+    )
+
+    assert reply == "Gemini says hi"
+
+
+def test_falls_back_when_groq_not_configured(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=None,
+        gemini=FakeGeminiClientSuccess("Gemini says hi"),
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(3, "hello")
+    )
+
+    assert reply == "Gemini says hi"
+
+
+def test_friendly_error_when_both_providers_down(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientFailure(),
+        gemini=FakeGeminiClientFailure(),
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(4, "hello")
+    )
+
+    assert "Groq and Gemini" in reply
+
+
+def test_friendly_error_when_neither_provider_configured(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path, groq=None, gemini=None,
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(5, "hello")
+    )
+
+    assert "Groq and Gemini" in reply
+
+
+def test_history_round_trips_regardless_of_which_provider_answered(
+    monkeypatch, tmp_path,
+):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess("Groq reply"),
+        gemini=FakeGeminiClientFailure(),
+    )
+
+    asyncio.run(ai_service.generate_julie_response(6, "hi Julie"))
+
+    history = ai_service._recent_history(6)
+
+    assert history[-2] == ("user", "hi Julie")
+    assert history[-1] == ("model", "Groq reply")
+
+
+def test_recap_also_tries_groq_first(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess("Groq recap"),
+        gemini=FakeGeminiClientFailure(),
+    )
+
+    reply = asyncio.run(ai_service.generate_recap(["update one"]))
+
+    assert reply == "Groq recap"
+
+
+def test_recap_falls_back_to_gemini(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientFailure(),
+        gemini=FakeGeminiClientSuccess("Gemini recap"),
+    )
+
+    reply = asyncio.run(ai_service.generate_recap(["update one"]))
+
+    assert reply == "Gemini recap"
+
+
+def test_empty_groq_content_falls_back_to_gemini(monkeypatch, tmp_path):
+    """An empty/None content from Groq must count as failure, not
+    a successful empty reply."""
+
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess(content=None),
+        gemini=FakeGeminiClientSuccess("Gemini says hi"),
+    )
+
+    reply = asyncio.run(
+        ai_service.generate_julie_response(7, "hello")
+    )
+
+    assert reply == "Gemini says hi"
