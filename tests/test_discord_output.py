@@ -469,3 +469,103 @@ def test_no_duplicate_send_to_successful_destination_across_retry(monkeypatch) -
     asyncio.run(router.publish(event))  # retry
 
     assert len(house.messages) == 1, "successful destination must not be resent on retry"
+
+
+# ==========================================================
+# Competition event routing (A3 incident: COMPETITION_* used to
+# target a "production" destination with no real deployed Discord
+# channel behind it -- see config.py PRODUCTION_CHANNEL, which has
+# no hardcoded default unlike LIVE_UPDATES_CHANNEL/HOUSE_STATUS_CHANNEL.
+# Competition results must reach only real, deployed channels.)
+# ==========================================================
+
+
+def _competition_event(event_type: EventType) -> ProductionEvent:
+    return ProductionEvent(
+        source="Competition",
+        event_type=event_type,
+        title="Competition Winner",
+        detail="Yash",
+        severity=EventSeverity.IMPORTANT,
+    )
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.COMPETITION_STARTED,
+        EventType.COMPETITION_FINISHED,
+        EventType.COMPETITION_CHANGED,
+        EventType.COMPETITION_WINNER,
+    ],
+)
+def test_competition_events_route_to_house_status_and_live_updates(
+    event_type, monkeypatch
+) -> None:
+    """Competition events must reach the two real, deployed channels
+    -- never a "production" destination, which has never existed in
+    the deployed Discord server."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+
+    asyncio.run(router.publish(_competition_event(event_type)))  # must not raise
+
+    assert len(house.messages) == 1
+    assert len(live.messages) == 1
+
+
+def test_competition_event_destinations_never_include_production() -> None:
+    """Direct assertion on the routing table itself: no destination
+    named "production" is ever computed for a competition event,
+    regardless of what a bot happens to have channels for."""
+
+    router = DiscordOutputRouter(bot=None)
+
+    for event_type in (
+        EventType.COMPETITION_STARTED,
+        EventType.COMPETITION_FINISHED,
+        EventType.COMPETITION_CHANGED,
+        EventType.COMPETITION_WINNER,
+    ):
+        destinations = router._destinations(_competition_event(event_type))
+        names = {name for _, name in destinations}
+        assert "production" not in names
+        assert names == {"house-status", "live-updates"}
+
+
+def test_competition_event_no_longer_permanently_blocks_the_announcement_queue(
+    monkeypatch,
+) -> None:
+    """Reproduces the actual production incident end-to-end at the
+    router level: previously, a competition event's "production" leg
+    could never resolve (no such channel exists), which made
+    publish() raise every single time -- and since
+    ProductionEngine.announce() requeues a failed event at the front
+    of pending_events and stops for that tick (see
+    production/engine.py), nothing queued behind a competition event
+    was ever attempted again. With competition events now routed only
+    to real channels, publish() succeeds and no longer blocks
+    anything queued after it."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    # Deliberately no channel named/ID'd "production" anywhere on this
+    # bot -- matching the real deployed Discord server exactly.
+    router = DiscordOutputRouter(FakeBot([house, live]))
+
+    competition_event = _competition_event(EventType.COMPETITION_WINNER)
+    later_event = make_event()  # a later, unrelated RSS_UPDATE event
+
+    asyncio.run(router.publish(competition_event))  # must not raise
+    asyncio.run(router.publish(later_event))  # never reached before the fix
+
+    assert len(live.messages) == 2  # both events reached live-updates
+    assert len(house.messages) == 1  # only the competition event targets house-status

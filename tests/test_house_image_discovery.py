@@ -212,6 +212,45 @@ async def _test_rotated_filename_changed_content_does_announce():
     assert len(result.events) == 1
 
 
+async def _test_old_url_still_returns_200_but_page_now_references_new_image():
+    """Reproduces the actual production incident: the remembered URL
+    has NOT failed -- it still returns 200 with valid bytes -- but the
+    house-status page has moved on to a different filename with
+    different content. Before the fix, _acquire() returned as soon as
+    the remembered URL's fetch succeeded and never even looked at the
+    page, so this rotation was missed indefinitely."""
+
+    storage = temp_storage()
+    monitor, _ = make_monitor(
+        storage, PAGE, {DISCOVERED: b"old-content"}, start_url=DISCOVERED
+    )
+    await monitor.check()  # baseline snapshot at the old/remembered URL
+
+    # The page now references a rotated filename. The OLD URL is still
+    # live and returns valid, unchanged bytes if fetched directly --
+    # it never fails, never 404s.
+    monitor.page_fetcher = None
+
+    async def rotated_page():
+        return PAGE_ROTATED
+
+    monitor.page_fetcher = rotated_page
+
+    async def fetch(url):
+        if url == DISCOVERED:
+            return b"old-content"  # old URL: still 200, unchanged bytes
+        return b"new-content"  # new URL: 200, different bytes
+
+    monitor._fetch_image = fetch
+
+    result = await monitor.check()
+
+    assert monitor.image_url == ROTATED
+    assert result.changed is True
+    assert len(result.events) == 1
+    assert result.events[0].event_type.value == "image_changed"
+
+
 async def _test_total_failure_is_degraded_not_crash():
     storage = temp_storage()
     monitor, _ = make_monitor(storage, "<html>no image</html>", {})
@@ -249,6 +288,9 @@ def test_rotated_filename_changed_content_does_announce():
 
 def test_total_failure_is_degraded_not_crash():
     asyncio.run(_test_total_failure_is_degraded_not_crash())
+
+def test_old_url_still_returns_200_but_page_now_references_new_image():
+    asyncio.run(_test_old_url_still_returns_200_but_page_now_references_new_image())
 
 
 REAL_MARKUP = (

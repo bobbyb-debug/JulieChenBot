@@ -210,8 +210,24 @@ class DiscordOutputRouter:
             EventType.COMPETITION_CHANGED,
             EventType.COMPETITION_WINNER,
         }:
+            # PRODUCTION_CHANNEL has no configured/deployed real
+            # channel (there has never been a #production channel in
+            # the Discord server -- see config.py, which gives
+            # LIVE_UPDATES_CHANNEL and HOUSE_STATUS_CHANNEL real
+            # hardcoded default IDs but leaves PRODUCTION_CHANNEL
+            # unset). Routing competition results there made every
+            # COMPETITION_* event permanently undeliverable to that
+            # destination, and because engine.announce() requeues a
+            # failed event at the front of the queue and stops for
+            # that tick (see production/engine.py), a competition
+            # event became a permanent head-of-line block on every
+            # later event once A3 started persisting that queue across
+            # restarts. House-status is the real, deployed destination
+            # every other house-state-changing event type above
+            # already uses -- competition results are that same kind
+            # of event.
             destinations.extend([
-                (PRODUCTION_CHANNEL, self._CHANNEL_NAMES["production"]),
+                (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
                 (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
             ])
         else:

@@ -198,11 +198,36 @@ class HouseImageMonitor(Monitor):
     async def _acquire(self) -> tuple[bytes, bool]:
         """Returns (image_bytes, url_changed).
 
-        Tries the remembered URL first. If it fails and discovery is
-        enabled, rediscovers the current filename and retries once.
+        Discovers the current filename from the house-status page on
+        every check() -- not only when the remembered URL fails to
+        fetch. Joker's does not always 404 the previous file
+        immediately after rotating (see module docstring), so a
+        remembered URL that still returns bytes successfully is not
+        proof nothing changed: it can silently leave Julie hashing a
+        stale image forever. When discovery finds a URL different
+        from the remembered one, that URL's bytes are fetched and
+        used directly. When discovery agrees with the remembered URL,
+        or the page itself is unreachable, behavior falls through
+        unchanged from before: fetch the remembered URL, and only
+        rediscover-and-retry if that fetch itself fails.
         """
 
         original_url = self.image_url
+
+        if self._pinned_url is None:
+            discovered = await self.discover()
+
+            if discovered is not None and discovered != self.image_url:
+                image = await self._fetch_image(discovered)
+
+                if not image:
+                    raise RuntimeError(
+                        "Rediscovered house image returned no bytes."
+                    )
+
+                self._remember_url(discovered)
+
+                return image, True
 
         try:
             image = await self._fetch_image(self.image_url)

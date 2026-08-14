@@ -78,7 +78,7 @@ class ProductionParser:
     )
 
     _HAVE_NOT_PATTERN = re.compile(
-        r"\b(?:have[- ]?nots?)\s*(?:are|is|:)?\s*(?P<names>[^.!?]+)",
+        r"\b(?:have[- ]?nots?)\b\s*(?:are|is|:)?\s*(?P<names>[^.!?]+)",
         re.IGNORECASE,
     )
 

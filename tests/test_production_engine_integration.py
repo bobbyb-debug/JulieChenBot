@@ -14,12 +14,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from database.storage import Storage
+from production.announcer import ProductionAnnouncer
 from production.competition import CompetitionState, CompetitionType
 from production.engine import ProductionEngine
-from production.events import EventType, ProductionEvent
+from production.events import EventSeverity, EventType, ProductionEvent
 from production.house_status import HouseStatus
 from production.monitors import MonitorResult, MonitorStatus
 from production.rss import FeedUpdate
+from services.discord_output import DiscordOutputRouter
 from services.scheduler import Scheduler
 
 
@@ -336,6 +338,100 @@ def test_announcement_failure_requeues_events_in_original_order(
     assert first.announced is True
     assert failed.mark_announced_calls == 0
     assert list(engine.pending_events) == [failed, third]
+
+
+# ==========================================================
+# Competition routing regression (A3 incident)
+# ==========================================================
+#
+# Real production failure: a COMPETITION_WINNER event's "production"
+# Discord destination could never resolve (no such channel exists in
+# the deployed server -- see services/discord_output.py). Because
+# announce() above requeues a failed event at the front of
+# pending_events and stops for that tick, a competition event that
+# can never succeed becomes a PERMANENT head-of-line block: nothing
+# queued behind it -- including on every later tick, since A3 (see
+# production/engine.py _persist_pending_events()) durably persists
+# that exact queue state across restarts -- is ever announced again.
+#
+# This test exercises the real ProductionEngine.announce() loop
+# against a real DiscordOutputRouter (not the AnnouncerDouble used
+# above) wired to fake channels matching the real deployed server
+# (house-status, live-updates -- deliberately no "production"
+# channel), proving the routing fix eliminates this failure mode
+# rather than merely working around it.
+
+
+class _FakeChannel:
+    def __init__(self, channel_id: int, name: str) -> None:
+        self.id = channel_id
+        self.name = name
+        self.messages: list[dict] = []
+
+    async def send(self, **kwargs) -> None:
+        self.messages.append(kwargs)
+
+
+class _FakeBot:
+    def __init__(self, channels: list[_FakeChannel]) -> None:
+        self.channels = channels
+
+    def get_channel(self, channel_id: int):
+        return next((c for c in self.channels if c.id == channel_id), None)
+
+    async def fetch_channel(self, channel_id: int):
+        return self.get_channel(channel_id)
+
+    def get_all_channels(self):
+        return iter(self.channels)
+
+
+def test_competition_event_does_not_permanently_block_later_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A competition event, once queued alongside a later unrelated
+    event, must not permanently prevent that later event from
+    eventually being announced -- the real production failure mode."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = _FakeChannel(1, "house-status")
+    live = _FakeChannel(2, "live-updates")
+    # No "production"-named or -ID'd channel anywhere on this bot --
+    # matching the real deployed Discord server exactly.
+
+    engine = make_engine(Storage())
+    engine.announcer = ProductionAnnouncer()
+    engine.announcer._discord_output = DiscordOutputRouter(_FakeBot([house, live]))
+
+    competition_event = ProductionEvent(
+        source="Competition",
+        event_type=EventType.COMPETITION_WINNER,
+        title="Competition Winner",
+        detail="Yash",
+        severity=EventSeverity.IMPORTANT,
+    )
+    # RSS_UPDATE routes to live-updates -- a real destination, so any
+    # failure to announce it must come from the queue being blocked,
+    # not from this event also targeting an unresolvable channel.
+    later_event = ProductionEvent(
+        source="Joker's Updates",
+        event_type=EventType.RSS_UPDATE,
+        title="LIVE FEED UPDATE",
+        detail="Later, unrelated update.",
+    )
+    engine.pending_events = deque([competition_event, later_event])
+
+    asyncio.run(engine.announce())
+
+    assert competition_event.announced is True
+    assert later_event.announced is True
+    assert list(engine.pending_events) == []
+    assert len(live.messages) == 2
+    assert len(house.messages) == 1
 
 
 def test_scheduler_retries_after_error_and_runs_until_stopped(

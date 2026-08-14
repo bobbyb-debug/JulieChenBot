@@ -178,3 +178,76 @@ def test_parser_still_extracts_genuine_hoh_after_fix() -> None:
 
     assert parsed.recognized is True
     assert parsed.house_status.hoh == "Yash"
+
+
+# ==========================================================
+# False-positive regression: "have" + word starting with "not"
+# ==========================================================
+#
+# Observed in production: an RSS item containing ordinary conversational
+# text like "I have nothing against you" was parsed as a Have-Not
+# announcement and produced the corrupted entry "hing against you" in
+# Discord. _HAVE_NOT_PATTERN's "nots?" had no trailing word boundary,
+# so it matched the first three letters of ANY word starting with
+# "not" ("nothing", "noticed", "notified", ...) as long as it followed
+# "have ". A trailing \b now requires "not"/"nots" to be a whole word.
+
+
+def test_parser_still_extracts_genuine_have_not_announcement() -> None:
+    """The word-boundary fix must not break legitimate announcements."""
+
+    parser = ProductionParser()
+
+    parsed = parser.parse(
+        make_update("The Have-Nots are Chuk, Lyric, Jason and Rome")
+    )
+
+    assert parsed.house_status.have_nots == ("Chuk", "Lyric", "Jason", "Rome")
+    assert "have_nots" in parsed.fields
+
+
+def test_parser_extracts_singular_have_not_announcement() -> None:
+    """The singular form ('Have-Not is', no trailing 's') must still work."""
+
+    parser = ProductionParser()
+
+    parsed = parser.parse(
+        make_update("Have-Not is Jason.")
+    )
+
+    assert parsed.house_status.have_nots == ("Jason",)
+
+
+def test_parser_ignores_have_nothing_against_you() -> None:
+    """The exact shape of the real production false positive."""
+
+    parser = ProductionParser()
+
+    parsed = parser.parse(
+        make_update("Rome says I have nothing against you, just game talk.")
+    )
+
+    assert "have_nots" not in parsed.fields
+    assert parsed.house_status.have_nots == ()
+
+
+def test_parser_ignores_have_noticed() -> None:
+    parser = ProductionParser()
+
+    parsed = parser.parse(
+        make_update("Chuk says he and Lyric have noticed some shady conversations.")
+    )
+
+    assert "have_nots" not in parsed.fields
+    assert parsed.house_status.have_nots == ()
+
+
+def test_parser_ignores_have_notified() -> None:
+    parser = ProductionParser()
+
+    parsed = parser.parse(
+        make_update("Production says they have notified the houseguests of the twist.")
+    )
+
+    assert "have_nots" not in parsed.fields
+    assert parsed.house_status.have_nots == ()
