@@ -32,6 +32,7 @@ class ProductionEngine:
 
     RECAP_KEY = "recap_buffer"
     RECAP_LIMIT = 100
+    PENDING_EVENTS_KEY = "pending_events"
 
     def __init__(self, storage: Optional[Storage] = None) -> None:
         self.logger = ProductionLogger.get("Engine")
@@ -50,9 +51,70 @@ class ProductionEngine:
         self.last_tick_at: Optional[datetime] = None
 
         self.last_results: list[MonitorResult] = []
-        self.pending_events: deque[ProductionEvent] = deque()
+        # Seeded from storage rather than starting empty: a previous
+        # process instance may have crashed (or been redeployed) after
+        # queuing an event -- or after some but not all Discord
+        # destinations for it succeeded -- but before finishing
+        # delivery. Recovering those here and feeding them through the
+        # exact same pending_events queue that every normal tick uses
+        # means recovery re-enters the existing process_events()/
+        # announce() path rather than a separate one, and
+        # DiscordOutputRouter's existing delivered_to skip (see
+        # services/discord_output.py) is what actually prevents a
+        # destination that already succeeded before the crash from
+        # being resent.
+        self.pending_events: deque[ProductionEvent] = deque(
+            self._load_pending_events()
+        )
 
         self.logger.info("Production Engine initialized.")
+
+    def _load_pending_events(self) -> list[ProductionEvent]:
+        """Loads durably-persisted pending events left by a previous run."""
+
+        recovered: list[ProductionEvent] = []
+        for data in self.storage.get(self.PENDING_EVENTS_KEY, []):
+            try:
+                recovered.append(ProductionEvent.from_dict(data))
+            except Exception:
+                self.logger.warning(
+                    "Discarding unrecoverable pending event: %r", data
+                )
+
+        if recovered:
+            self.logger.info(
+                "Recovered %d pending event(s) from previous run.",
+                len(recovered),
+            )
+
+        return recovered
+
+    def _persist_pending_events(self) -> None:
+        """Durably persists the current pending-event queue.
+
+        Called once after process_events() has assembled this tick's
+        full pending list (before any Discord attempt) and once after
+        announce() finishes its pass (after Discord has been attempted,
+        capturing whatever per-destination delivered_to progress
+        DiscordOutputRouter.publish() made -- see
+        services/discord_output.py). storage.set() persists atomically
+        (see database/storage.py Storage.save()), so once this call
+        returns, the on-disk state matches self.pending_events exactly.
+
+        This does not make Discord delivery itself transactional: a
+        crash between a channel.send() succeeding and this call
+        running still loses that specific destination's delivered_to
+        update, since event.delivered_to is mutated in memory by
+        DiscordOutputRouter before publish() returns. That is an
+        unavoidable at-least-once window -- not a bug this persistence
+        is meant to close -- because the Discord API call and this
+        process's local disk write can never be one atomic operation.
+        """
+
+        self.storage.set(
+            self.PENDING_EVENTS_KEY,
+            [event.to_dict() for event in self.pending_events],
+        )
 
     @property
     def uptime(self) -> timedelta:
@@ -206,20 +268,37 @@ class ProductionEngine:
         for event in self.pending_events:
             self.logger.info("[%s] %s", event.source, event.title)
 
+        # Durably records this tick's full pending list -- including
+        # events not yet attempted -- before any Discord call is made,
+        # so a crash before announce() runs still leaves them
+        # recoverable on restart rather than lost with the process.
+        self._persist_pending_events()
+
     async def announce(self) -> None:
         """Announces queued events in order."""
 
-        while self.pending_events:
-            event = self.pending_events.popleft()
+        try:
+            while self.pending_events:
+                event = self.pending_events.popleft()
 
-            try:
-                await self.announcer.announce(event)
-                event.mark_announced()
-                self._record_recap(event)
-            except Exception:
-                self.pending_events.appendleft(event)
-                self.logger.exception("Announcement failed.")
-                break
+                try:
+                    await self.announcer.announce(event)
+                    event.mark_announced()
+                    self._record_recap(event)
+                except Exception:
+                    self.pending_events.appendleft(event)
+                    self.logger.exception("Announcement failed.")
+                    break
+        finally:
+            # Runs whether the loop drained everything, broke on a
+            # failed event, or announcer.announce() raised something
+            # _record_recap() itself couldn't -- self.pending_events
+            # always reflects the true state at that point (event
+            # fully delivered and popped, or requeued with whatever
+            # partial event.delivered_to progress
+            # DiscordOutputRouter.publish() made), so one persist call
+            # here is enough to keep storage in sync with it.
+            self._persist_pending_events()
 
     def _record_recap(self, event: ProductionEvent) -> None:
         """Appends an announced RSS update to the rolling recap buffer.

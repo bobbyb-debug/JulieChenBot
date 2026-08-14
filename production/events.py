@@ -218,6 +218,10 @@ class ProductionEvent:
 
             "announced": self.announced,
 
+            # Sorted for deterministic JSON output; reconstructed as a
+            # set on the way back in. See from_dict() below.
+            "delivered_to": sorted(self.delivered_to),
+
         }
 
     @classmethod
@@ -257,6 +261,10 @@ class ProductionEvent:
             announced=data.get(
                 "announced",
                 False,
+            ),
+
+            delivered_to=set(
+                data.get("delivered_to", [])
             ),
         )
 

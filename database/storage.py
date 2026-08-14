@@ -29,6 +29,15 @@ class Storage:
         "last_image_hash": "",
         "hamsterwatch_last_hash": "",
         "last_event": {},
+        # Durable queue of not-yet-fully-delivered ProductionEvents
+        # (see production/events.py ProductionEvent.to_dict()), so a
+        # process restart can resume delivery instead of losing
+        # events that were queued or partially delivered when the
+        # process stopped. Written/read as generic JSON via get()/
+        # set() -- this key carries no Discord-specific persistence
+        # logic of its own (see ProductionEngine._persist_pending_events
+        # in production/engine.py).
+        "pending_events": [],
         "statistics": {
             "rss_updates": 0,
             "announcements": 0,
