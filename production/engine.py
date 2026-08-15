@@ -22,6 +22,7 @@ from production.announcer import ProductionAnnouncer
 from production.competition import CompetitionState
 from production.events import EventSeverity, EventType, ProductionEvent
 from production.house_status import HouseStatus
+from production.imgur import ImgurResolver
 from production.knowledge import KnowledgeStore
 from production.monitors import MonitorResult, MonitorStatus
 from production.parser import ProductionParser
@@ -46,6 +47,11 @@ class ProductionEngine:
         self.parser = ProductionParser()
         self.watcher = ProductionWatcher(storage=self.storage)
         self.announcer = ProductionAnnouncer()
+        # Resolves the Imgur images behind an (IMG)-tagged RSS item
+        # (see production/imgur.py) -- one long-lived instance so its
+        # missing-Client-ID warning (config.IMGUR_CLIENT_ID) only logs
+        # once per process, not once per (IMG) post.
+        self.imgur = ImgurResolver()
 
         # Administrator-taught knowledge (see production/knowledge.py
         # and commands/teach.py). Unlike RSS-derived game state, this
@@ -245,22 +251,30 @@ class ProductionEngine:
         return str(timedelta(seconds=int(uptime.total_seconds())))
 
     @staticmethod
-    def _rss_event(update: FeedUpdate) -> ProductionEvent:
+    def _rss_event(
+        update: FeedUpdate, image_urls: list[str] | None = None
+    ) -> ProductionEvent:
         """Converts one Joker's Updates item into a publishable event.
 
-        image_url is carried through unchanged from FeedUpdate (see
-        production/rss.py _extract_image_url()) -- "" when the feed
-        provided no direct image for this item, which is the normal
-        case for an (IMG)-tagged item today (Joker's embeds those via
-        an Imgur widget this pipeline deliberately does not resolve).
-        DiscordOutputRouter treats an empty/missing image_url exactly
-        like an event with no image at all -- see services/
-        discord_output.py.
+        image_urls holds every image resolved for this update (see
+        production/imgur.py ImgurResolver, called from tick() below)
+        -- [] when the update has no image, same as before this
+        existed. metadata["image_urls"] carries the full list;
+        metadata["image_url"] is kept alongside it as the first
+        resolved image (or FeedUpdate's own image_url, if the RSS
+        feed already provided one directly -- see production/rss.py
+        _extract_image_url()) so any event recovered from storage by
+        A3's durability under the old single-image schema still
+        attaches its one image exactly as before. DiscordOutputRouter
+        treats an empty image_url/image_urls exactly like an event
+        with no image at all -- see services/discord_output.py.
         """
 
         detail = update.title.strip()
         if update.description and update.description.strip():
             detail = update.description.strip()
+
+        resolved_images = image_urls or []
 
         return ProductionEvent(
             source="Joker's Updates",
@@ -273,7 +287,9 @@ class ProductionEngine:
                 "link": update.link,
                 "published": update.published,
                 "rss_title": update.title,
-                "image_url": update.image_url,
+                "image_url": update.image_url
+                or (resolved_images[0] if resolved_images else ""),
+                "image_urls": resolved_images,
             },
         )
 
@@ -321,11 +337,23 @@ class ProductionEngine:
                     rss_update.title,
                 )
 
+                # Synchronous and, for an (IMG)-tagged item, performs
+                # real network requests (the Joker's post page, then
+                # Imgur's API per image -- see production/imgur.py).
+                # Offloaded to a worker thread for the same reason as
+                # check_all() above: this must never block the event
+                # loop. Every other update returns [] immediately
+                # without any network request (see
+                # ImgurResolver.resolve_images_for_update()).
+                image_urls = await asyncio.to_thread(
+                    self.imgur.resolve_images_for_update, rss_update
+                )
+
                 # Every newly surfaced RSS item is a production event. The
                 # parser may additionally recognize production-state changes,
                 # which are fed into the built-in monitors below.
                 self.pending_events.append(
-                    self._rss_event(rss_update)
+                    self._rss_event(rss_update, image_urls)
                 )
 
                 parsed = self.parser.parse(rss_update)

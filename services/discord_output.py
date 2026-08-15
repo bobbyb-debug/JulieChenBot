@@ -177,24 +177,26 @@ class DiscordOutputRouter:
         Two independent image sources feed into this, deliberately
         kept separate (see production/house_image.py's own module
         docstring for why): the rotating House Status graphic
-        (IMAGE_CHANGED, metadata["link"]/["url"]) and an individual
-        RSS (IMG) live-feed item's own image (RSS_UPDATE,
-        metadata["image_url"] -- see production/rss.py). Both are
-        uploaded as a real Discord attachment rather than hot-linked
+        (IMAGE_CHANGED, metadata["link"]/["url"]) and an RSS (IMG)
+        live-feed item's own image(s) (RSS_UPDATE,
+        metadata["image_urls"] -- see production/imgur.py). Both are
+        uploaded as real Discord attachments rather than hot-linked
         where possible, so the post stays useful even if the source
         URL later disappears or rotates.
 
-        For IMAGE_CHANGED specifically, a failed download falls back
-        to hot-linking (the embed already carries the link via
-        _build_embed()) rather than dropping the image entirely --
-        unchanged from before. For RSS_UPDATE, a failed image download
-        does not fall back to hot-linking a third-party, unverified
-        URL -- it simply sends the text update without an image,
-        exactly like an item that never had an image_url at all; the
-        text update is never lost either way.
+        RSS_UPDATE has its own multi-image path (_send_rss_update())
+        since a single Joker's Updates post can embed more than one
+        image. IMAGE_CHANGED never has more than one image, and a
+        failed download falls back to hot-linking (the embed already
+        carries the link via _build_embed()) rather than dropping the
+        image entirely -- unchanged from before.
         """
 
         embed = self._build_embed(event)
+
+        if event.event_type == EventType.RSS_UPDATE:
+            await self._send_rss_update(channel, embed, event)
+            return
 
         image_url = self._attachment_image_url(event)
 
@@ -212,11 +214,7 @@ class DiscordOutputRouter:
             await channel.send(embed=embed)
             return
 
-        filename = (
-            "house_status.png"
-            if event.event_type == EventType.IMAGE_CHANGED
-            else f"live_feed_image{_image_extension(payload)}"
-        )
+        filename = "house_status.png"
         embed.set_image(url=f"attachment://{filename}")
 
         await channel.send(
@@ -224,19 +222,92 @@ class DiscordOutputRouter:
             file=discord.File(io.BytesIO(payload), filename=filename),
         )
 
+    async def _send_rss_update(self, channel, embed, event: ProductionEvent) -> None:
+        """Sends one RSS_UPDATE event, attaching every image resolved
+        for it (see production/imgur.py) as separate Discord
+        attachments.
+
+        Each URL is downloaded and validated independently through
+        the same _download()/_looks_like_image() machinery
+        IMAGE_CHANGED uses above. One URL failing to download is
+        skipped and logged, not treated as fatal for the whole event
+        -- the images that did resolve are still posted. A failed
+        image download never falls back to hot-linking a third-party,
+        unverified URL, same as before this supported more than one
+        image. If none resolve, the update posts as plain text,
+        exactly like an item that never had an image at all; the text
+        update is never lost either way.
+        """
+
+        urls = self._attachment_image_urls(event)
+
+        if not urls:
+            await channel.send(embed=embed)
+            return
+
+        files: list[discord.File] = []
+        for index, url in enumerate(urls):
+            payload = await self._download(url)
+            if payload is None:
+                self.logger.warning(
+                    "Image unavailable for RSS_UPDATE (%s); skipping this image.",
+                    url,
+                )
+                continue
+
+            filename = (
+                f"live_feed_image{_image_extension(payload)}"
+                if len(urls) == 1
+                else f"live_feed_image_{index + 1}{_image_extension(payload)}"
+            )
+            files.append(discord.File(io.BytesIO(payload), filename=filename))
+
+        if not files:
+            self.logger.warning(
+                "Image unavailable for %s; sending text-only.",
+                event.event_type.value,
+            )
+            await channel.send(embed=embed)
+            return
+
+        embed.set_image(url=f"attachment://{files[0].filename}")
+
+        if len(files) == 1:
+            await channel.send(embed=embed, file=files[0])
+        else:
+            await channel.send(embed=embed, files=files)
+
     @staticmethod
     def _attachment_image_url(event: ProductionEvent) -> str | None:
-        """Returns the URL to attempt downloading as a Discord
-        attachment for this event, or None if this event type has no
-        image to attach."""
+        """Returns the House Status image URL to attempt downloading
+        as a Discord attachment for this event, or None if this event
+        type has no such image. RSS_UPDATE has its own multi-image
+        resolution -- see _attachment_image_urls()/_send_rss_update()."""
 
         if event.event_type == EventType.IMAGE_CHANGED:
             return event.metadata.get("link") or event.metadata.get("url") or None
 
-        if event.event_type == EventType.RSS_UPDATE:
-            return event.metadata.get("image_url") or None
-
         return None
+
+    @staticmethod
+    def _attachment_image_urls(event: ProductionEvent) -> list[str]:
+        """Returns every image URL to attempt attaching for one
+        RSS_UPDATE event, preserving order.
+
+        Prefers metadata["image_urls"] (see production/engine.py
+        _rss_event(), production/imgur.py) -- the full list this
+        pipeline resolves today. Falls back to the single
+        metadata["image_url"] so an event recovered from storage by
+        A3's durability from before this list existed still attaches
+        its one image exactly as before.
+        """
+
+        urls = event.metadata.get("image_urls")
+        if isinstance(urls, list) and urls:
+            return [url for url in urls if url]
+
+        single = event.metadata.get("image_url")
+        return [single] if single else []
 
     async def _download(
         self, url: str, *, max_bytes: int = _MAX_IMAGE_BYTES

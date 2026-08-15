@@ -269,6 +269,82 @@ def test_tick_publishes_unrecognized_rss_item_as_live_feed_update(
     assert engine.pending_event_count == 0
 
 
+def test_tick_resolves_imgur_images_for_img_tagged_rss_item(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An (IMG)-tagged RSS item's images are resolved through
+    ImgurResolver and land in the published event's metadata,
+    end-to-end through a real tick()."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    rss_update = FeedUpdate(
+        guid="rss-img-1",
+        title="7:55 AM HGs up and about. (NT) (IMG)",
+        description="7:55 AM HGs up and about. (NT) (IMG)",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=1",
+        published="2026-08-15T10:59:57-07:00",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(Storage(), announcer=announcer, rss_update=rss_update)
+
+    class StubImgurResolver:
+        def resolve_images_for_update(self, update):
+            assert update is rss_update
+            return ["https://i.imgur.com/resolved.jpg"]
+
+    engine.imgur = StubImgurResolver()
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.metadata["image_urls"] == ["https://i.imgur.com/resolved.jpg"]
+    assert event.metadata["image_url"] == "https://i.imgur.com/resolved.jpg"
+
+
+def test_tick_does_not_call_imgur_resolver_for_plain_rss_items(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A normal (non-(IMG)) RSS item must not trigger any Imgur
+    network request. Uses the real ImgurResolver (engine's default)
+    with urlopen blocked, so a regression that bypasses the "(IMG)"
+    gate in ImgurResolver.resolve_images_for_update() -- see
+    production/imgur.py -- is caught end-to-end through a real
+    tick(), not just at the unit level."""
+
+    import production.imgur as imgur_module
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not make a network request")
+
+    monkeypatch.setattr(imgur_module, "urlopen", fail_if_called)
+
+    rss_update = FeedUpdate(
+        guid="rss-plain-1",
+        title="Lala out of bed, wakes Melody. (NT)",
+        description="",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=2",
+        published="2026-08-15T07:02:00-07:00",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(Storage(), announcer=announcer, rss_update=rss_update)
+    # engine.imgur is the real ImgurResolver from ProductionEngine.__init__
+    # -- deliberately not replaced, so this exercises the actual gate.
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.metadata["image_urls"] == []
+    assert event.metadata["image_url"] == ""
+    assert event.detail == rss_update.title
+
+
 def test_tick_applies_new_rss_state_to_monitors(
     tmp_path: Path,
     monkeypatch,

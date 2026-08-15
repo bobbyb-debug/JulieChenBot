@@ -737,6 +737,116 @@ def test_rss_update_non_image_response_is_rejected(monkeypatch) -> None:
     assert live.messages[0].get("file") is None
 
 
+def _rss_event_with_images(image_urls: list[str]) -> ProductionEvent:
+    event = make_event()
+    event.metadata["image_urls"] = image_urls
+    return event
+
+
+def test_rss_update_with_multiple_images_attaches_all(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    downloaded = []
+
+    async def fake_download(url, **kwargs):
+        downloaded.append(url)
+        return _FAKE_JPEG if len(downloaded) == 1 else _FAKE_PNG
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    event = _rss_event_with_images(
+        ["https://i.imgur.com/one.jpg", "https://i.imgur.com/two.jpg"]
+    )
+    asyncio.run(router.publish(event))
+
+    assert downloaded == ["https://i.imgur.com/one.jpg", "https://i.imgur.com/two.jpg"]
+    assert len(live.messages) == 1
+    files = live.messages[0]["files"]
+    assert len(files) == 2
+    assert files[0].filename == "live_feed_image_1.jpg"
+    assert files[1].filename == "live_feed_image_2.png"
+    assert live.messages[0]["embed"].image.url == "attachment://live_feed_image_1.jpg"
+
+
+def test_rss_update_one_of_multiple_images_fails_posts_the_rest(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    async def fake_download(url, **kwargs):
+        if url == "https://i.imgur.com/bad.jpg":
+            return None
+        return _FAKE_JPEG
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    event = _rss_event_with_images(
+        ["https://i.imgur.com/good.jpg", "https://i.imgur.com/bad.jpg"]
+    )
+    asyncio.run(router.publish(event))
+
+    assert len(live.messages) == 1
+    assert live.messages[0].get("file") is not None
+    assert live.messages[0].get("files") is None
+    # Numbered by the image's original position in the post (there were
+    # two URLs, the first succeeded), not renumbered down to "1 of 1
+    # successful" -- so a filename always refers to the same source
+    # image regardless of which other images in the same post failed.
+    assert live.messages[0]["file"].filename == "live_feed_image_1.jpg"
+
+
+def test_rss_update_all_of_multiple_images_fail_sends_text_only(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    async def failing_download(url, **kwargs):
+        return None
+
+    monkeypatch.setattr(router, "_download", failing_download)
+
+    event = _rss_event_with_images(
+        ["https://i.imgur.com/one.jpg", "https://i.imgur.com/two.jpg"]
+    )
+    asyncio.run(router.publish(event))
+
+    assert len(live.messages) == 1
+    assert live.messages[0].get("file") is None
+    assert live.messages[0].get("files") is None
+    assert not live.messages[0]["embed"].image.url
+
+
+def test_rss_update_image_urls_takes_priority_over_legacy_image_url(monkeypatch) -> None:
+    """When both keys are present (shouldn't normally happen, but
+    proves the precedence), the new list wins."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    downloaded = []
+
+    async def fake_download(url, **kwargs):
+        downloaded.append(url)
+        return _FAKE_JPEG
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    event = make_event()
+    event.metadata["image_url"] = "https://example.test/legacy.jpg"
+    event.metadata["image_urls"] = ["https://i.imgur.com/new.jpg"]
+
+    asyncio.run(router.publish(event))
+
+    assert downloaded == ["https://i.imgur.com/new.jpg"]
+
+
 def test_house_status_image_behavior_is_unaffected_by_rss_image_attachment(
     monkeypatch,
 ) -> None:

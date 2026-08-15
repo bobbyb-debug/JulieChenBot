@@ -146,6 +146,21 @@ HOUSE_STATUS_PAGE = os.getenv(
 )
 
 # ==========================================================
+# Imgur
+# ==========================================================
+
+# Joker's Updates embeds (IMG)-tagged post images via an Imgur
+# client-side widget that only exposes an opaque image ID server-side
+# (see production/imgur.py). Resolving that ID into a real URL uses
+# Imgur's official public read API (https://apidocs.imgur.com/#image),
+# which requires a free, registered app's Client-ID sent as
+# `Authorization: Client-ID <id>` -- no OAuth, no user login. Left
+# unset, production/imgur.py.ImgurResolver logs one warning and
+# (IMG) posts fall back to text-only; nothing else in Julie is
+# affected.
+IMGUR_CLIENT_ID = os.getenv("IMGUR_CLIENT_ID", "")
+
+# ==========================================================
 # Logging
 # ==========================================================
 
