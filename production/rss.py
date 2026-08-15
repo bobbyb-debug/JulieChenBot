@@ -14,6 +14,7 @@ It does NOT communicate with Discord or the Production Engine.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -35,6 +36,66 @@ _USER_AGENT = "JulieChenBot/1.0"
 # used by every other Julie monitor's urlopen() call.
 _FETCH_TIMEOUT = 20
 
+# Matches a literal <img src="..."> in an item's own description/
+# content HTML -- see _extract_image_url() below for why this is
+# deliberately as far as detection goes.
+_IMG_SRC_PATTERN = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+def _extract_image_url(entry, description: str) -> str:
+    """Finds a direct, hotlinkable image URL for one RSS entry, if the
+    feed actually provides one. Returns "" when it doesn't -- this is
+    the normal case today (see below), not a bug.
+
+    Checked in order, all of it read from data feedparser/the feed
+    already handed us -- no additional network request is made here:
+
+        1. A standard media-RSS/Media RSS media:content or media:
+           thumbnail element, or a plain RSS <enclosure>, if
+           feedparser populated one on this entry.
+        2. A literal <img src="..."> embedded directly in the item's
+           own description/content HTML.
+
+    Verified directly against the live Joker's Updates RSS feed and
+    the individual post pages it links to: neither currently exposes
+    either of these for an (IMG)-tagged item. Joker's Updates embeds
+    each image via Imgur's client-side embed widget -- a `<blockquote
+    class="imgur-embed-pub" data-id="...">` that a browser's
+    JavaScript resolves into a real picture at view time -- which
+    never appears as an <img> tag, enclosure, or media element
+    anywhere in the feed or the linked page's server-rendered HTML.
+    That opaque Imgur ID is deliberately NOT resolved into a real
+    file URL here: doing so would mean guessing a URL shape (e.g.
+    assuming a specific file extension) or making an additional
+    request to Imgur itself just because the text says "(IMG)" --
+    neither of which this is allowed to do. An item with no
+    extractable image URL is handled exactly like an item with no
+    image at all by the rest of the pipeline (see production/
+    engine.py _rss_event(), services/discord_output.py) -- the text
+    update still posts normally.
+    """
+
+    for key in ("media_content", "media_thumbnail"):
+        media = entry.get(key) if hasattr(entry, "get") else None
+        if media:
+            url = media[0].get("url", "")
+            if url:
+                return url
+
+    enclosures = entry.get("enclosures") if hasattr(entry, "get") else None
+    if enclosures:
+        for enclosure in enclosures:
+            enclosure_type = enclosure.get("type", "")
+            url = enclosure.get("href", "") or enclosure.get("url", "")
+            if url and (not enclosure_type or enclosure_type.startswith("image/")):
+                return url
+
+    match = _IMG_SRC_PATTERN.search(description or "")
+    if match:
+        return match.group(1)
+
+    return ""
+
 
 # ======================================================
 # Feed Update
@@ -52,6 +113,10 @@ class FeedUpdate:
     description: str
     link: str
     published: str
+    # "" when the feed provides no direct image URL for this item --
+    # see _extract_image_url() above for exactly what this does and
+    # does not attempt.
+    image_url: str = ""
 
 
 # ======================================================
@@ -154,6 +219,9 @@ class JokersRSS:
                 description=getattr(entry, "description", ""),
                 link=getattr(entry, "link", ""),
                 published=getattr(entry, "published", ""),
+                image_url=_extract_image_url(
+                    entry, getattr(entry, "description", "")
+                ),
             )
             for entry in feed.entries
         ]
@@ -178,6 +246,7 @@ class JokersRSS:
             description=getattr(entry, "description", ""),
             link=getattr(entry, "link", ""),
             published=getattr(entry, "published", ""),
+            image_url=_extract_image_url(entry, getattr(entry, "description", "")),
         )
 
     # ======================================================

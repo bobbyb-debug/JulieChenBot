@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import services.discord_output as discord_output_module
 from production.events import EventSeverity, EventType, ProductionEvent
 from services.discord_output import DiscordOutputRouter
 
@@ -569,3 +570,203 @@ def test_competition_event_no_longer_permanently_blocks_the_announcement_queue(
 
     assert len(live.messages) == 2  # both events reached live-updates
     assert len(house.messages) == 1  # only the competition event targets house-status
+
+
+# ==========================================================
+# RSS (IMG) live-feed image attachment (separate from, and must not
+# affect, the House Status image system above)
+# ==========================================================
+
+_FAKE_JPEG = b"\xff\xd8\xff" + b"\x00" * 32  # passes the magic-number sniff
+_FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def _rss_event_with_image(image_url: str = "https://example.test/photo.jpg") -> ProductionEvent:
+    event = make_event()
+    event.metadata["image_url"] = image_url
+    return event
+
+
+def test_rss_update_without_image_url_sends_text_only(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    asyncio.run(router.publish(make_event()))  # no image_url in metadata at all
+
+    assert len(live.messages) == 1
+    assert live.messages[0].get("file") is None
+    assert live.messages[0]["embed"].image.url is None or not live.messages[0]["embed"].image.url
+
+
+def test_rss_update_with_image_url_attempts_download_and_attaches(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    downloaded = {}
+
+    async def fake_download(url, **kwargs):
+        downloaded["url"] = url
+        return _FAKE_JPEG
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    event = _rss_event_with_image("https://example.test/photo.jpg")
+    asyncio.run(router.publish(event))
+
+    assert downloaded["url"] == "https://example.test/photo.jpg"
+    assert len(live.messages) == 1
+    assert live.messages[0]["file"] is not None
+    assert live.messages[0]["embed"].image.url == "attachment://live_feed_image.jpg"
+    # The existing text/embed fields (title, detail, source, published)
+    # must be completely unaffected.
+    assert live.messages[0]["embed"].description == "Mallory & Melody in Pod BR."
+    assert live.messages[0]["embed"].title == "🟦 LIVE FEED UPDATE"
+
+
+def test_rss_update_image_filename_matches_detected_format(monkeypatch) -> None:
+    """A PNG payload gets a .png attachment filename, not a hardcoded
+    .jpg -- verifies the format is sniffed, not assumed."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    async def fake_download(url, **kwargs):
+        return _FAKE_PNG
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    asyncio.run(router.publish(_rss_event_with_image()))
+
+    assert live.messages[0]["embed"].image.url == "attachment://live_feed_image.png"
+
+
+def test_rss_update_image_download_failure_still_sends_text(monkeypatch) -> None:
+    """The optional image failing must not lose the event or prevent
+    the text update from posting -- and unlike House Status, must NOT
+    fall back to hot-linking the (unverified, third-party) URL."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    async def failing_download(url, **kwargs):
+        return None
+
+    monkeypatch.setattr(router, "_download", failing_download)
+
+    event = _rss_event_with_image()
+    asyncio.run(router.publish(event))  # must not raise
+
+    assert len(live.messages) == 1
+    assert live.messages[0].get("file") is None
+    embed = live.messages[0]["embed"]
+    assert not embed.image.url  # no hotlink fallback for RSS images
+    assert event.delivered_to == {"live-updates"}  # event itself is NOT lost
+
+
+def test_rss_update_oversized_image_is_rejected(monkeypatch) -> None:
+    """Exercises the real _download() (not a stub), proving the size
+    cap is actually enforced, not just documented."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    class HugeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self, n=-1):
+            return self._payload[:n] if n and n > 0 else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    oversized = _FAKE_JPEG + b"\x00" * discord_output_module._MAX_IMAGE_BYTES
+
+    monkeypatch.setattr(
+        "services.discord_output.urlopen",
+        lambda request, timeout=None: HugeResponse(oversized),
+    )
+
+    asyncio.run(router.publish(_rss_event_with_image()))
+
+    assert live.messages[0].get("file") is None  # rejected, fell back to text-only
+
+
+def test_rss_update_non_image_response_is_rejected(monkeypatch) -> None:
+    """Exercises the real _download(): an HTML error page (or any
+    non-image response) must never become a Discord attachment."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    live = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([live]))
+
+    class HtmlResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self, n=-1):
+            return self._payload[:n] if n and n > 0 else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "services.discord_output.urlopen",
+        lambda request, timeout=None: HtmlResponse(b"<html>404 Not Found</html>"),
+    )
+
+    asyncio.run(router.publish(_rss_event_with_image()))
+
+    assert live.messages[0].get("file") is None
+
+
+def test_house_status_image_behavior_is_unaffected_by_rss_image_attachment(
+    monkeypatch,
+) -> None:
+    """Regression guard: the House Status image path (hotlink fallback
+    on failure, fixed "house_status.png" filename) must be byte-for-
+    byte the same after generalizing _send()/_download() for RSS
+    images."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+
+    async def fake_download(url, **kwargs):
+        return b"fake-png-bytes"  # deliberately NOT a real magic number
+
+    monkeypatch.setattr(router, "_download", fake_download)
+
+    event = ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="changed",
+        severity=EventSeverity.NOTICE,
+        metadata={"url": "http://www.jokersupdates.com/x/house.png"},
+    )
+
+    asyncio.run(router.publish(event))
+
+    assert house.messages[0]["embed"].image.url == "attachment://house_status.png"
+    assert house.messages[0]["file"] is not None

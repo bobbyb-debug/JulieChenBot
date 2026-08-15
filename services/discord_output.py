@@ -23,6 +23,42 @@ from production.events import EventSeverity, EventType, ProductionEvent
 from services.logger import ProductionLogger
 
 
+# Reused by both image sources this router attaches (House Status
+# rotation, RSS (IMG) live-feed items): a conservative cap comfortably
+# under Discord's smallest guaranteed attachment limit, and a
+# lightweight magic-number sniff so an unexpected non-image response
+# (an HTML error page mislabeled as an image, for instance) is never
+# handed to Discord as an attachment.
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
+
+
+def _looks_like_image(data: bytes) -> bool:
+    if not data:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):  # JPEG
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):  # PNG
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")):  # GIF
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # WEBP
+        return True
+    return False
+
+
+def _image_extension(data: bytes) -> str:
+    """Picks a filename extension matching the actual sniffed format,
+    so an attachment's extension doesn't mismatch its real content."""
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
 def _hamsterwatch_title(event: ProductionEvent) -> str:
     """Builds the Hamsterwatch embed title from event metadata.
 
@@ -135,28 +171,52 @@ class DiscordOutputRouter:
             )
 
     async def _send(self, channel, event: ProductionEvent) -> None:
-        """Sends one event, attaching the image for IMAGE_CHANGED.
+        """Sends one event, attaching an image where this event type
+        has one available.
 
-        The house-status image filename rotates, so hot-linking it in
-        an embed means the picture can break after the fact. Uploading
-        the bytes to Discord makes the post permanent.
+        Two independent image sources feed into this, deliberately
+        kept separate (see production/house_image.py's own module
+        docstring for why): the rotating House Status graphic
+        (IMAGE_CHANGED, metadata["link"]/["url"]) and an individual
+        RSS (IMG) live-feed item's own image (RSS_UPDATE,
+        metadata["image_url"] -- see production/rss.py). Both are
+        uploaded as a real Discord attachment rather than hot-linked
+        where possible, so the post stays useful even if the source
+        URL later disappears or rotates.
+
+        For IMAGE_CHANGED specifically, a failed download falls back
+        to hot-linking (the embed already carries the link via
+        _build_embed()) rather than dropping the image entirely --
+        unchanged from before. For RSS_UPDATE, a failed image download
+        does not fall back to hot-linking a third-party, unverified
+        URL -- it simply sends the text update without an image,
+        exactly like an item that never had an image_url at all; the
+        text update is never lost either way.
         """
 
         embed = self._build_embed(event)
 
-        if event.event_type != EventType.IMAGE_CHANGED:
+        image_url = self._attachment_image_url(event)
+
+        if not image_url:
             await channel.send(embed=embed)
             return
 
-        link = event.metadata.get("link") or event.metadata.get("url")
-        payload = await self._download(link) if link else None
+        payload = await self._download(image_url)
 
         if payload is None:
-            # Fall back to hot-linking rather than dropping the post.
+            self.logger.warning(
+                "Image unavailable for %s; sending text-only.",
+                event.event_type.value,
+            )
             await channel.send(embed=embed)
             return
 
-        filename = "house_status.png"
+        filename = (
+            "house_status.png"
+            if event.event_type == EventType.IMAGE_CHANGED
+            else f"live_feed_image{_image_extension(payload)}"
+        )
         embed.set_image(url=f"attachment://{filename}")
 
         await channel.send(
@@ -164,16 +224,57 @@ class DiscordOutputRouter:
             file=discord.File(io.BytesIO(payload), filename=filename),
         )
 
-    async def _download(self, url: str) -> bytes | None:
-        """Downloads image bytes, returning None on any failure."""
+    @staticmethod
+    def _attachment_image_url(event: ProductionEvent) -> str | None:
+        """Returns the URL to attempt downloading as a Discord
+        attachment for this event, or None if this event type has no
+        image to attach."""
 
-        def _get() -> bytes:
+        if event.event_type == EventType.IMAGE_CHANGED:
+            return event.metadata.get("link") or event.metadata.get("url") or None
+
+        if event.event_type == EventType.RSS_UPDATE:
+            return event.metadata.get("image_url") or None
+
+        return None
+
+    async def _download(
+        self, url: str, *, max_bytes: int = _MAX_IMAGE_BYTES
+    ) -> bytes | None:
+        """Downloads image bytes, returning None on any failure.
+
+        Rejects (returns None for) a response larger than max_bytes --
+        read is capped at max_bytes + 1 so a server that lies about or
+        omits Content-Length can't still exhaust memory -- and a
+        response whose leading bytes don't match a known image
+        format's magic number, so an HTML error page or similar
+        accidental non-image response is never handed to Discord as
+        an attachment.
+        """
+
+        def _get() -> bytes | None:
             request = Request(
                 url,
                 headers={"User-Agent": "JulieChenBot/1.0"},
             )
             with urlopen(request, timeout=20) as response:
-                return response.read()
+                payload = response.read(max_bytes + 1)
+
+            if len(payload) > max_bytes:
+                self.logger.warning(
+                    "Image at %s exceeds %d byte(s); rejecting.", url, max_bytes
+                )
+                return None
+
+            if not _looks_like_image(payload):
+                self.logger.warning(
+                    "Response from %s does not look like a supported "
+                    "image format; rejecting.",
+                    url,
+                )
+                return None
+
+            return payload
 
         try:
             return await asyncio.to_thread(_get)

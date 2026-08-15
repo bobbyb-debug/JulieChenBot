@@ -48,6 +48,19 @@ class DiscordService:
 
         self._ai_cooldowns: dict[int, float] = {}
 
+        # on_ready() is not guaranteed to fire only once per process
+        # (Discord's own documented behavior: a full reconnect can
+        # trigger it again, not just on_resumed()). load_commands()
+        # registers every command onto self.bot.tree, and re-running
+        # it would hit CommandAlreadyRegistered for every single
+        # command on a second pass (verified directly against
+        # discord.py: re-registering an existing name/Group raises,
+        # it does not silently duplicate) -- harmless but noisy. This
+        # flag makes load_commands() a no-op after the first
+        # successful pass, whichever on_ready() call that ends up
+        # being.
+        self._commands_loaded = False
+
         intents = discord.Intents.default()
         intents.guilds = True
         intents.guild_messages = True
@@ -162,55 +175,7 @@ class DiscordService:
 
             self.load_commands()
 
-            # Global commands can take time to propagate. Sync directly to
-            # the configured live-feed channel's guild during development so
-            # new commands such as /posttest appear immediately. The guild
-            # command copy is local to that server and does not affect the
-            # eventual global command deployment.
-            try:
-                live_channel = self.bot.get_channel(LIVE_UPDATES_CHANNEL)
-                guild = (
-                    live_channel.guild
-                    if live_channel is not None
-                    else None
-                )
-
-                if guild is not None:
-                    self.bot.tree.copy_global_to(guild=guild)
-                    guild_synced = await self.bot.tree.sync(guild=guild)
-                    self.logger.info(
-                        "Synced %s slash command(s) to guild %s.",
-                        len(guild_synced),
-                        guild.id,
-                    )
-                else:
-                    self.logger.warning(
-                        (
-                            "Could not resolve LIVE_UPDATES_CHANNEL=%s "
-                            "for guild command sync."
-                        ),
-                        LIVE_UPDATES_CHANNEL,
-                    )
-
-            except Exception:
-                self.logger.exception(
-                    "Failed syncing guild slash commands."
-                )
-
-            try:
-
-                synced = await self.bot.tree.sync()
-
-                self.logger.info(
-                    "Synced %s global slash command(s).",
-                    len(synced),
-                )
-
-            except Exception:
-
-                self.logger.exception(
-                    "Failed syncing global slash commands."
-                )
+            await self.sync_commands()
 
             if ENABLE_SCHEDULER:
                 asyncio.create_task(
@@ -301,6 +266,13 @@ class DiscordService:
 
     def load_commands(self) -> None:
 
+        if self._commands_loaded:
+            self.logger.info(
+                "Commands already loaded this process; skipping "
+                "reload (on_ready() fired again)."
+            )
+            return
+
         import commands
 
         loaded = 0
@@ -338,6 +310,84 @@ class DiscordService:
             "Loaded %s command module(s).",
             loaded,
         )
+
+        self._commands_loaded = True
+
+    # ==========================================================
+    # Command Sync
+    # ==========================================================
+
+    async def sync_commands(self) -> None:
+        """Pushes the loaded command tree to Discord: guild-scoped
+        only, and actively clears any stale global registrations.
+
+        Julie serves exactly one Discord server (see config.py:
+        GUILD_ID, LIVE_UPDATES_CHANNEL, and HOUSE_STATUS_CHANNEL are
+        all fixed to that one guild) -- global commands provide no
+        benefit here, and previously caused every command to appear
+        TWICE in that guild's slash-command picker: this method used
+        to sync the command set to the guild AND separately sync it
+        globally, and Discord shows both a guild-scoped and a
+        global-scoped registration side by side in any guild where the
+        bot has both. Guild-scoped sync alone is both correct (nothing
+        left to duplicate against) and strictly better for a
+        single-guild bot: it propagates instantly, instead of up to an
+        hour for global commands.
+
+        The global clear runs second, deliberately: it needs the
+        tree's global command set still populated so copy_global_to()
+        (above) has something to copy from, so global commands can
+        only be cleared after the guild copy is already done. Clearing
+        the tree's global scope and syncing that empty set is the
+        correct, idiomatic discord.py way to un-register whatever
+        Discord still has cached globally from every earlier deploy
+        (all of which also synced globally) -- not a manual Discord-
+        side deletion, and safe/cheap to repeat on every startup (a
+        no-op once Discord's global set is already empty).
+        """
+
+        try:
+            live_channel = self.bot.get_channel(LIVE_UPDATES_CHANNEL)
+            guild = (
+                live_channel.guild
+                if live_channel is not None
+                else None
+            )
+
+            if guild is not None:
+                self.bot.tree.copy_global_to(guild=guild)
+                guild_synced = await self.bot.tree.sync(guild=guild)
+                self.logger.info(
+                    "Synced %s slash command(s) to guild %s.",
+                    len(guild_synced),
+                    guild.id,
+                )
+            else:
+                self.logger.warning(
+                    (
+                        "Could not resolve LIVE_UPDATES_CHANNEL=%s "
+                        "for guild command sync."
+                    ),
+                    LIVE_UPDATES_CHANNEL,
+                )
+
+        except Exception:
+            self.logger.exception(
+                "Failed syncing guild slash commands."
+            )
+
+        try:
+            self.bot.tree.clear_commands(guild=None)
+            cleared = await self.bot.tree.sync()
+            self.logger.info(
+                "Cleared global slash commands (%s remaining).",
+                len(cleared),
+            )
+
+        except Exception:
+            self.logger.exception(
+                "Failed clearing global slash commands."
+            )
 
     # ==========================================================
     # Run

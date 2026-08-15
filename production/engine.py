@@ -246,7 +246,17 @@ class ProductionEngine:
 
     @staticmethod
     def _rss_event(update: FeedUpdate) -> ProductionEvent:
-        """Converts one Joker's Updates item into a publishable event."""
+        """Converts one Joker's Updates item into a publishable event.
+
+        image_url is carried through unchanged from FeedUpdate (see
+        production/rss.py _extract_image_url()) -- "" when the feed
+        provided no direct image for this item, which is the normal
+        case for an (IMG)-tagged item today (Joker's embeds those via
+        an Imgur widget this pipeline deliberately does not resolve).
+        DiscordOutputRouter treats an empty/missing image_url exactly
+        like an event with no image at all -- see services/
+        discord_output.py.
+        """
 
         detail = update.title.strip()
         if update.description and update.description.strip():
@@ -263,6 +273,7 @@ class ProductionEngine:
                 "link": update.link,
                 "published": update.published,
                 "rss_title": update.title,
+                "image_url": update.image_url,
             },
         )
 
