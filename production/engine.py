@@ -19,7 +19,10 @@ from typing import Optional
 from config import BOT_NAME, BUILD, PHASE, VERSION
 from database.storage import Storage
 from production.announcer import ProductionAnnouncer
+from production.competition import CompetitionState
 from production.events import EventSeverity, EventType, ProductionEvent
+from production.house_status import HouseStatus
+from production.knowledge import KnowledgeStore
 from production.monitors import MonitorResult, MonitorStatus
 from production.parser import ProductionParser
 from production.rss import FeedUpdate, JokersRSS
@@ -33,6 +36,7 @@ class ProductionEngine:
     RECAP_KEY = "recap_buffer"
     RECAP_LIMIT = 100
     PENDING_EVENTS_KEY = "pending_events"
+    GAME_STATE_KEY = "game_state"
 
     def __init__(self, storage: Optional[Storage] = None) -> None:
         self.logger = ProductionLogger.get("Engine")
@@ -42,6 +46,26 @@ class ProductionEngine:
         self.parser = ProductionParser()
         self.watcher = ProductionWatcher(storage=self.storage)
         self.announcer = ProductionAnnouncer()
+
+        # Administrator-taught knowledge (see production/knowledge.py
+        # and commands/teach.py). Unlike RSS-derived game state, this
+        # is never touched by tick() -- it changes only when a Discord
+        # command mutates it, and KnowledgeStore persists immediately
+        # on every mutation rather than waiting for a production cycle.
+        self.knowledge = KnowledgeStore(storage=self.storage)
+
+        # ProductionParser and HouseStatusMonitor/CompetitionMonitor all
+        # start with blank in-memory state and have no persistence of
+        # their own -- a restart otherwise silently forgets HOH,
+        # nominees, veto, have-nots, feeds, and competition state until
+        # an RSS item happens to re-state the same fact, which Big
+        # Brother's live feed rarely does once something's already been
+        # announced. Restoring here, right after both are constructed,
+        # means every consumer of watcher.house_status.current /
+        # watcher.competition.current (commands/hoh.py, nominees.py,
+        # veto.py, recap.py, services/discord.py's /chat path) sees the
+        # restored state immediately, with no separate restoration path.
+        self._load_game_state()
 
         self.started_at = datetime.now(UTC)
         self.running = False
@@ -114,6 +138,81 @@ class ProductionEngine:
         self.storage.set(
             self.PENDING_EVENTS_KEY,
             [event.to_dict() for event in self.pending_events],
+        )
+
+    def _load_game_state(self) -> None:
+        """Restores the authoritative house-status/competition state
+        left by a previous process instance.
+
+        Restores the SAME values into both places that need to agree:
+        ProductionParser's own cumulative baseline (so a later partial
+        update -- e.g. a new nominees line -- doesn't get merged
+        against a blank parser baseline and wipe out fields the parser
+        doesn't yet know about, such as an already-known HOH) and the
+        watcher monitors' .current (what every command and
+        format_game_state() actually reads). This is the one
+        authoritative restoration path -- nothing else assigns to
+        these attributes at startup.
+
+        Restoring directly into .current, rather than through
+        update()/check(), produces no MonitorResult and no events:
+        restoring state on startup is not the same as re-announcing
+        it, so no Discord message is generated merely because the
+        process restarted.
+
+        A missing key (storage.json predates this feature) or
+        malformed persisted data (a corrupted/hand-edited file) both
+        fall through to a logged warning and leave the already-blank
+        defaults in place -- either way, this must never prevent
+        Julie from starting.
+        """
+
+        data = self.storage.get(self.GAME_STATE_KEY, None)
+
+        if not data:
+            return
+
+        try:
+            house_status = HouseStatus.from_dict(data.get("house_status", {}))
+            competition = CompetitionState.from_dict(data.get("competition", {}))
+        except Exception:
+            self.logger.warning(
+                "Discarding malformed persisted game state: %r", data
+            )
+            return
+
+        self.parser.house_status = house_status
+        self.parser.competition = competition
+        self.watcher.house_status.current = house_status
+        self.watcher.competition.current = competition
+
+        self.logger.info(
+            "Restored game state from previous run: hoh=%r, nominees=%r, "
+            "veto_holder=%r, competition=%r, winner=%r",
+            house_status.hoh,
+            house_status.nominees,
+            house_status.veto_holder,
+            competition.competition.value,
+            competition.winner,
+        )
+
+    def _persist_game_state(self) -> None:
+        """Durably persists the current authoritative house-status/
+        competition state.
+
+        Called only when tick() observes that watcher.run() actually
+        promoted a new value into .current this cycle -- not on every
+        tick regardless of change, since most ticks have nothing new
+        to persist (an RSS item that doesn't change tracked state
+        must not trigger a write here).
+        """
+
+        self.storage.set(
+            self.GAME_STATE_KEY,
+            {
+                "house_status": self.watcher.house_status.current.to_dict(),
+                "competition": self.watcher.competition.current.to_dict(),
+            },
         )
 
     @property
@@ -232,9 +331,28 @@ class ProductionEngine:
                         "RSS item contained no recognized production state."
                     )
 
+            house_status_before = self.watcher.house_status.current
+            competition_before = self.watcher.competition.current
+
             results, events = await self.watcher.run()
             self.last_results = results
             self.pending_events.extend(events)
+
+            # Persist only when watcher.run() actually promoted a new
+            # value into .current this cycle -- comparing before/after
+            # here (rather than relying on MonitorResult.changed) is
+            # what correctly covers the "first observation" case too:
+            # HouseStatusMonitor/CompetitionMonitor both report
+            # changed=False for their very first captured state (see
+            # production/house_status.py, production/competition.py),
+            # even though .current just went from blank to populated --
+            # exactly the case that must be persisted so a restart
+            # right after the season's first HOH reveal doesn't lose it.
+            if (
+                self.watcher.house_status.current != house_status_before
+                or self.watcher.competition.current != competition_before
+            ):
+                self._persist_game_state()
 
             await self.process_events()
             await self.announce()

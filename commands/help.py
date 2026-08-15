@@ -96,6 +96,29 @@ def register(discord_service) -> None:
             inline=False,
         )
 
+        teach_lines = [
+            "`/teach list` — shows what I've been explicitly taught."
+        ]
+        if is_admin:
+            teach_lines.extend(
+                [
+                    "`/teach fact <text>` — teach me a fact I should "
+                    "treat as ground truth. *(Admin only)*",
+                    "`/teach rule <text>` — teach me a behavioral "
+                    "rule/source-of-truth instruction. *(Admin only)*",
+                    "`/teach correction <text>` — correct something "
+                    "I previously believed. *(Admin only)*",
+                    "`/teach forget <id>` — deactivates a taught "
+                    "item. *(Admin only)*",
+                ]
+            )
+
+        embed.add_field(
+            name="🧠 Teach me",
+            value="\n".join(teach_lines),
+            inline=False,
+        )
+
         if is_admin:
             embed.add_field(
                 name="🔧 Diagnostics *(Admin only)*",

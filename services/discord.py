@@ -29,7 +29,11 @@ from config import (
 )
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
-from services.ai_service import format_game_state, generate_julie_response
+from services.ai_service import (
+    format_game_state,
+    format_learned_knowledge,
+    generate_julie_response,
+)
 
 AI_COOLDOWN_SECONDS = 8
 
@@ -105,11 +109,15 @@ class DiscordService:
         competition = self.scheduler.engine.watcher.competition.current
 
         game_state = format_game_state(house_status, competition)
+        knowledge = format_learned_knowledge(
+            self.scheduler.engine.knowledge.active_items()
+        )
 
         return await generate_julie_response(
             channel_id,
             user_text,
             game_state=game_state,
+            knowledge=knowledge,
         )
 
     # ==========================================================

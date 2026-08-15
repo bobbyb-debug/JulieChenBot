@@ -10,6 +10,20 @@ Summarizes recent live-feed updates in Julie's voice, combining:
     - a small, targeted slice of Hamsterwatch history relevant to
       who's actually in the game right now — never the whole
       archive
+    - active administrator-taught RULEs only (see production/
+      knowledge.py) -- not FACTs/CORRECTIONs. Rules are standing
+      instructions ("the house-status image is authoritative for
+      Have-Nots") that are relevant to every recap regardless of what
+      it's about, the same way Hamsterwatch retrieval already avoids
+      dumping the whole archive: FACTs/CORRECTIONs are about specific,
+      possibly unrelated game facts (e.g. "Yash is HoH"), and recap
+      has no cheap, reliable way to tell whether any given one is
+      actually relevant to this particular summary without building a
+      real relevance-matching system just for this -- so rather than
+      risk pulling in stale, unrelated facts, they're left out of
+      recap entirely. /chat and mentions/DMs still get the full active
+      set via services/discord.py generate_ai_reply(), where a human
+      is asking a specific question and can judge relevance themselves.
 
 Retrieval (which Hamsterwatch articles are relevant) and generation
 (the actual AI call) stay separate: this command decides what's
@@ -25,7 +39,8 @@ import discord
 
 from database.hamsterwatch_archive import ArchivedArticle, HamsterwatchArchive
 from production.house_status import HouseStatus
-from services.ai_service import format_game_state, generate_recap
+from production.knowledge import KnowledgeType
+from services.ai_service import format_game_state, format_learned_knowledge, generate_recap
 from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("Recap")
@@ -90,6 +105,14 @@ def register(discord_service) -> None:
         house_status = engine.watcher.house_status.current
         competition = engine.watcher.competition.current
         game_state = format_game_state(house_status, competition)
+        # RULE-only: see the module docstring for why FACT/CORRECTION
+        # knowledge is deliberately excluded from /recap specifically.
+        active_rules = [
+            item
+            for item in engine.knowledge.active_items()
+            if item.type == KnowledgeType.RULE
+        ]
+        knowledge = format_learned_knowledge(active_rules)
 
         archive = HamsterwatchArchive()
         hamsterwatch_articles = archive.find_relevant(
@@ -103,6 +126,7 @@ def register(discord_service) -> None:
             entries,
             game_state=game_state,
             hamsterwatch_entries=hamsterwatch_entries,
+            knowledge=knowledge,
         )
 
         embed = discord.Embed(

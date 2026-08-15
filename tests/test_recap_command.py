@@ -9,6 +9,7 @@ all to services.ai_service.generate_recap with clear provenance.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import discord
@@ -18,6 +19,7 @@ import commands.recap as recap_module
 from database.hamsterwatch_archive import HamsterwatchArchive
 from production.competition import CompetitionState
 from production.house_status import HouseStatus
+from production.knowledge import KnowledgeItem, KnowledgeType
 
 
 class FakeResponse:
@@ -60,10 +62,31 @@ class FakeWatcher:
         self.competition = FakeCompetitionMonitor(competition)
 
 
+class FakeKnowledgeStore:
+    """/recap now also pulls active learned RULE knowledge only (see
+    production/knowledge.py, commands/recap.py's RULE-only filtering,
+    services/ai_service.py format_learned_knowledge()). Defaults to
+    empty for tests that aren't about this feature; tests that are can
+    pass their own items."""
+
+    def __init__(self, items: list | None = None) -> None:
+        self._items = items or []
+
+    def active_items(self) -> list:
+        return list(self._items)
+
+
 class FakeEngine:
-    def __init__(self, entries: list[str], house_status: HouseStatus, competition: CompetitionState) -> None:
+    def __init__(
+        self,
+        entries: list[str],
+        house_status: HouseStatus,
+        competition: CompetitionState,
+        knowledge_items: list | None = None,
+    ) -> None:
         self._entries = entries
         self.watcher = FakeWatcher(house_status, competition)
+        self.knowledge = FakeKnowledgeStore(knowledge_items)
 
     def recent_updates(self, limit: int = 20) -> list[str]:
         return self._entries[-limit:]
@@ -113,7 +136,7 @@ def test_recap_gathers_game_state_entries_and_relevant_hamsterwatch(monkeypatch,
 
     captured: dict = {}
 
-    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None):
+    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None, knowledge=""):
         captured["entries"] = entries
         captured["game_state"] = game_state
         captured["hamsterwatch_entries"] = hamsterwatch_entries
@@ -168,7 +191,7 @@ def test_recap_hamsterwatch_entries_are_bounded_not_the_whole_archive(monkeypatc
 
     captured: dict = {}
 
-    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None):
+    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None, knowledge=""):
         captured["hamsterwatch_entries"] = hamsterwatch_entries
         return "recap"
 
@@ -189,7 +212,7 @@ def test_recap_works_when_no_hamsterwatch_history_exists(monkeypatch, tmp_path):
 
     captured: dict = {}
 
-    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None):
+    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None, knowledge=""):
         captured["hamsterwatch_entries"] = hamsterwatch_entries
         return "recap"
 
@@ -204,3 +227,61 @@ def test_recap_works_when_no_hamsterwatch_history_exists(monkeypatch, tmp_path):
     assert captured["hamsterwatch_entries"] == []
     embed = interaction.followup.sent[0]["embed"]
     assert "Hamsterwatch" not in (embed.footer.text or "")
+
+
+def test_recap_includes_rules_but_excludes_facts_and_corrections(monkeypatch, tmp_path):
+    """RULEs are standing instructions relevant to every recap; FACTs/
+    CORRECTIONs are about specific, possibly unrelated game facts and
+    are deliberately left out of /recap (see commands/recap.py's
+    module docstring for why) -- /chat still gets the full active set."""
+
+    archive = HamsterwatchArchive(db_path=tmp_path / "archive.db")
+    monkeypatch.setattr(recap_module, "HamsterwatchArchive", lambda: archive)
+
+    captured: dict = {}
+
+    async def fake_generate_recap(entries, *, game_state="", hamsterwatch_entries=None, knowledge=""):
+        captured["knowledge"] = knowledge
+        return "recap"
+
+    monkeypatch.setattr(recap_module, "generate_recap", fake_generate_recap)
+
+    now = datetime.now(UTC)
+    rule = KnowledgeItem(
+        id=1,
+        type=KnowledgeType.RULE,
+        content="The house-status image is authoritative for Have-Nots.",
+        author_id=1,
+        created_at=now,
+        updated_at=now,
+    )
+    fact = KnowledgeItem(
+        id=2,
+        type=KnowledgeType.FACT,
+        content="Yash is HoH.",
+        author_id=1,
+        created_at=now,
+        updated_at=now,
+    )
+    correction = KnowledgeItem(
+        id=3,
+        type=KnowledgeType.CORRECTION,
+        content="Yash is HoH, not Barrett.",
+        author_id=1,
+        created_at=now,
+        updated_at=now,
+    )
+
+    engine = FakeEngine(
+        ["An update."],
+        HouseStatus(),
+        CompetitionState(),
+        knowledge_items=[rule, fact, correction],
+    )
+    cmd = _register(engine)
+
+    asyncio.run(cmd.callback(FakeInteraction()))
+
+    assert "authoritative for Have-Nots" in captured["knowledge"]
+    assert "Yash is HoH." not in captured["knowledge"]
+    assert "Yash is HoH, not Barrett." not in captured["knowledge"]

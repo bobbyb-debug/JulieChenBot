@@ -68,6 +68,35 @@ class HouseStatus:
 
     feeds: str = ""
 
+    # ======================================================
+    # Serialization
+    # ======================================================
+
+    def to_dict(self) -> dict:
+        """Converts to a JSON-safe dictionary for durable persistence."""
+
+        return {
+            "hoh": self.hoh,
+            "nominees": list(self.nominees),
+            "veto_holder": self.veto_holder,
+            "veto_used": self.veto_used,
+            "have_nots": list(self.have_nots),
+            "feeds": self.feeds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HouseStatus":
+        """Restores a HouseStatus from a previously persisted dictionary."""
+
+        return cls(
+            hoh=data.get("hoh", ""),
+            nominees=tuple(data.get("nominees", ())),
+            veto_holder=data.get("veto_holder", ""),
+            veto_used=bool(data.get("veto_used", False)),
+            have_nots=tuple(data.get("have_nots", ())),
+            feeds=data.get("feeds", ""),
+        )
+
 
 # ==========================================================
 # House Status Monitor
@@ -253,27 +282,15 @@ class HouseStatusMonitor(Monitor):
 
             )
 
-        #
-        # Have Nots
-        #
-
-        if new.have_nots != self.current.have_nots:
-
-            events.append(
-
-                ProductionEvent(
-
-                    source=self.name,
-
-                    event_type=EventType.HAVE_NOTS_CHANGED,
-
-                    title="Have-Not List Updated",
-
-                    detail=", ".join(new.have_nots),
-
-                )
-
-            )
+        # Have-Nots are deliberately NOT compared/announced here. The
+        # Joker's Updates house-status image (see production/
+        # house_image.py) is the sole authoritative source for the
+        # current Have-Not list -- Julie no longer infers it from
+        # RSS/live-feed text or posts a "Have-Not List Updated" card.
+        # HouseStatus.have_nots still exists as a field (nothing sets
+        # it anymore, but existing persisted game state -- see
+        # ProductionEngine._load_game_state() -- must still round-trip
+        # cleanly), it is just never diffed/announced by this monitor.
 
         #
         # Feed Status

@@ -1,6 +1,7 @@
 """Tests for JokersUpdates RSS production parsing."""
 
 from production.competition import CompetitionType
+from production.house_status import HouseStatus
 from production.parser import ProductionParser
 from production.rss import FeedUpdate
 
@@ -42,21 +43,19 @@ def test_parser_extracts_pov_and_preserves_hoh() -> None:
     assert parsed.competition.winner == "Taylor"
 
 
-def test_parser_extracts_nominations_have_nots_and_feed_state() -> None:
+def test_parser_extracts_nominations_and_feed_state() -> None:
     parser = ProductionParser()
 
     parsed = parser.parse(
         make_update(
             "Nominees are Alex and Jordan. "
-            "Have-Nots are Casey and Drew. "
             "Live feeds are down."
         )
     )
 
     assert parsed.house_status.nominees == ("Alex", "Jordan")
-    assert parsed.house_status.have_nots == ("Casey", "Drew")
     assert parsed.house_status.feeds == "down"
-    assert set(("nominees", "have_nots", "feeds")).issubset(parsed.fields)
+    assert set(("nominees", "feeds")).issubset(parsed.fields)
 
 
 def test_parser_extracts_veto_usage() -> None:
@@ -181,20 +180,19 @@ def test_parser_still_extracts_genuine_hoh_after_fix() -> None:
 
 
 # ==========================================================
-# False-positive regression: "have" + word starting with "not"
+# Have-Not text detection has been removed entirely (product decision):
+# the Joker's Updates house-status image is the sole authoritative
+# source for Have-Nots -- see production/house_image.py. The parser
+# must never derive have_nots from RSS/live-feed text again, no matter
+# how the text is phrased -- neither a direct, unambiguous announcement
+# nor the previously-fixed false-positive shape ("I have nothing
+# against you") may populate it.
 # ==========================================================
-#
-# Observed in production: an RSS item containing ordinary conversational
-# text like "I have nothing against you" was parsed as a Have-Not
-# announcement and produced the corrupted entry "hing against you" in
-# Discord. _HAVE_NOT_PATTERN's "nots?" had no trailing word boundary,
-# so it matched the first three letters of ANY word starting with
-# "not" ("nothing", "noticed", "notified", ...) as long as it followed
-# "have ". A trailing \b now requires "not"/"nots" to be a whole word.
 
 
-def test_parser_still_extracts_genuine_have_not_announcement() -> None:
-    """The word-boundary fix must not break legitimate announcements."""
+def test_parser_never_extracts_have_nots_from_a_direct_announcement() -> None:
+    """Even an unambiguous, correctly-phrased Have-Not announcement
+    must be ignored -- text is no longer a Have-Not source at all."""
 
     parser = ProductionParser()
 
@@ -202,24 +200,15 @@ def test_parser_still_extracts_genuine_have_not_announcement() -> None:
         make_update("The Have-Nots are Chuk, Lyric, Jason and Rome")
     )
 
-    assert parsed.house_status.have_nots == ("Chuk", "Lyric", "Jason", "Rome")
-    assert "have_nots" in parsed.fields
+    assert parsed.house_status.have_nots == ()
+    assert "have_nots" not in parsed.fields
+    assert parsed.recognized is False
 
 
-def test_parser_extracts_singular_have_not_announcement() -> None:
-    """The singular form ('Have-Not is', no trailing 's') must still work."""
-
-    parser = ProductionParser()
-
-    parsed = parser.parse(
-        make_update("Have-Not is Jason.")
-    )
-
-    assert parsed.house_status.have_nots == ("Jason",)
-
-
-def test_parser_ignores_have_nothing_against_you() -> None:
-    """The exact shape of the real production false positive."""
+def test_parser_never_extracts_have_nots_from_the_former_false_positive_shape() -> None:
+    """The previously-fixed false-positive shape ("I have nothing
+    against you") must also stay inert now that the whole mechanism
+    is gone, not merely correctly-rejected by a regex fix."""
 
     parser = ProductionParser()
 
@@ -227,27 +216,20 @@ def test_parser_ignores_have_nothing_against_you() -> None:
         make_update("Rome says I have nothing against you, just game talk.")
     )
 
-    assert "have_nots" not in parsed.fields
     assert parsed.house_status.have_nots == ()
+    assert "have_nots" not in parsed.fields
 
 
-def test_parser_ignores_have_noticed() -> None:
+def test_parser_preserves_existing_have_nots_across_unrelated_updates() -> None:
+    """have_nots is no longer a parser-writable field, but an existing
+    value (e.g. restored from persisted game state -- see
+    ProductionEngine._load_game_state()) must still be carried forward
+    unchanged by unrelated parser updates, not silently wiped."""
+
     parser = ProductionParser()
+    parser.house_status = HouseStatus(have_nots=("Chuk", "Lyric", "Jason", "Rome"))
 
-    parsed = parser.parse(
-        make_update("Chuk says he and Lyric have noticed some shady conversations.")
-    )
+    parsed = parser.parse(make_update("Yash won HOH"))
 
-    assert "have_nots" not in parsed.fields
-    assert parsed.house_status.have_nots == ()
-
-
-def test_parser_ignores_have_notified() -> None:
-    parser = ProductionParser()
-
-    parsed = parser.parse(
-        make_update("Production says they have notified the houseguests of the twist.")
-    )
-
-    assert "have_nots" not in parsed.fields
-    assert parsed.house_status.have_nots == ()
+    assert parsed.house_status.have_nots == ("Chuk", "Lyric", "Jason", "Rome")
+    assert parsed.house_status.hoh == "Yash"

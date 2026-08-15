@@ -19,10 +19,13 @@ failure at the exact point ProductionWatcher would encounter one.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import production.watcher as watcher_module
 from database.storage import Storage
+from production.competition import CompetitionState
 from production.engine import ProductionEngine
+from production.house_status import HouseStatus
 from production.watcher import ProductionWatcher
 
 
@@ -51,7 +54,17 @@ class NullWatcher:
     compatibility test, so no real monitor network I/O happens --
     that test is about ProductionEngine construction succeeding
     despite a failed monitor and tick() still completing, not about
-    exercising real monitor checks."""
+    exercising real monitor checks.
+
+    house_status/competition are minimal stand-ins (blank .current,
+    matching ProductionWatcher's real attributes) because tick() reads
+    them unconditionally, before run(), to decide whether to persist
+    game state -- see production/engine.py.
+    """
+
+    def __init__(self) -> None:
+        self.house_status = SimpleNamespace(current=HouseStatus())
+        self.competition = SimpleNamespace(current=CompetitionState())
 
     async def run(self):
         return [], []

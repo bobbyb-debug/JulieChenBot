@@ -77,11 +77,6 @@ class ProductionParser:
         ),
     )
 
-    _HAVE_NOT_PATTERN = re.compile(
-        r"\b(?:have[- ]?nots?)\b\s*(?:are|is|:)?\s*(?P<names>[^.!?]+)",
-        re.IGNORECASE,
-    )
-
     _FEEDS_DOWN = (
         "feeds are down",
         "feeds down",
@@ -181,11 +176,6 @@ class ProductionParser:
             self.house_status = self._replace_house_status(nominees=nominees)
             fields.append("nominees")
 
-        have_nots = self._extract_names(text, (self._HAVE_NOT_PATTERN,))
-        if have_nots:
-            self.house_status = self._replace_house_status(have_nots=have_nots)
-            fields.append("have_nots")
-
         feed_state = self._extract_feed_state(text)
         if feed_state is not None:
             self.house_status = self._replace_house_status(feeds=feed_state)
@@ -218,16 +208,25 @@ class ProductionParser:
         nominees: Optional[tuple[str, ...]] = None,
         veto_holder: Optional[str] = None,
         veto_used: Optional[bool] = None,
-        have_nots: Optional[tuple[str, ...]] = None,
         feeds: Optional[str] = None,
     ) -> HouseStatus:
+        """Returns a new HouseStatus with only the given fields replaced.
+
+        have_nots is deliberately not a parameter here: the parser no
+        longer derives it from RSS/live-feed text at all (the Joker's
+        Updates house-status image is the sole authoritative source --
+        see production/house_image.py), so it is always carried over
+        unchanged from the current state rather than ever being set by
+        this method.
+        """
+
         current = self.house_status
         return HouseStatus(
             hoh=current.hoh if hoh is None else hoh,
             nominees=current.nominees if nominees is None else nominees,
             veto_holder=current.veto_holder if veto_holder is None else veto_holder,
             veto_used=current.veto_used if veto_used is None else veto_used,
-            have_nots=current.have_nots if have_nots is None else have_nots,
+            have_nots=current.have_nots,
             feeds=current.feeds if feeds is None else feeds,
         )
 

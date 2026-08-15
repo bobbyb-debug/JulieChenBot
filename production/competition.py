@@ -85,6 +85,42 @@ class CompetitionState:
 
     ended_at: Optional[datetime] = None
 
+    # ======================================================
+    # Serialization
+    # ======================================================
+
+    def to_dict(self) -> dict:
+        """Converts to a JSON-safe dictionary for durable persistence."""
+
+        return {
+            "competition": self.competition.value,
+            "active": self.active,
+            "winner": self.winner,
+            "started_at": (
+                self.started_at.isoformat() if self.started_at else None
+            ),
+            "ended_at": (
+                self.ended_at.isoformat() if self.ended_at else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CompetitionState":
+        """Restores a CompetitionState from a previously persisted dictionary."""
+
+        started_at = data.get("started_at")
+        ended_at = data.get("ended_at")
+
+        return cls(
+            competition=CompetitionType(
+                data.get("competition", CompetitionType.NONE.value)
+            ),
+            active=bool(data.get("active", False)),
+            winner=data.get("winner", ""),
+            started_at=datetime.fromisoformat(started_at) if started_at else None,
+            ended_at=datetime.fromisoformat(ended_at) if ended_at else None,
+        )
+
 
 # ==========================================================
 # Competition Monitor

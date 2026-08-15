@@ -10,6 +10,7 @@ from google.genai import types
 from groq import Groq
 
 from config import DATABASE
+from production.knowledge import KnowledgeItem, KnowledgeType
 
 # ==========================================================
 # Providers
@@ -275,6 +276,106 @@ def format_game_state(house_status, competition) -> str:
 
 
 # ==========================================================
+# Learned knowledge (administrator-taught, via /teach)
+# ==========================================================
+
+
+def format_learned_knowledge(items: list[KnowledgeItem]) -> str:
+    """Formats active administrator-taught knowledge for the model's
+    context.
+
+    This is explicit, human-authored knowledge -- NOT a summary of
+    conversation history and NOT an automated inference. Only
+    currently-active items should ever be passed in (see production/
+    knowledge.py KnowledgeStore.active_items()) -- a forgotten item
+    must not appear here.
+
+    Grouped by type into three sections with deliberately DIFFERENT
+    framing, not just different headings -- this is what keeps a
+    permanent behavioral rule from being treated the same way as a
+    perishable game fact:
+
+        - RULES are standing instructions with no natural expiry (e.g.
+          "the house-status image is authoritative for Have-Nots").
+          Framed as unconditional and absolute.
+        - FACTS and CORRECTIONS are the administrator's most recent
+          word on something that *can* change over time (e.g. "Yash is
+          HoH" -- true until the next competition). Framed as reliable
+          but not immune to going stale, and explicitly told to defer
+          to clearly newer, more specific automated game-state
+          information when the two disagree -- this is plain
+          instruction text, not a ranking algorithm: nothing here
+          computes staleness, compares timestamps, or scores
+          confidence. See production/knowledge.py KnowledgeStore.teach()
+          for the deterministic mechanism (explicit supersedes=) that
+          actually retires a stale fact; this wording is a fallback for
+          whatever hasn't been explicitly superseded yet.
+
+    Corrections still render last and are framed as overriding a
+    specific conflicting fact/rule/game-state value -- this is the
+    "resolve conflicts at the knowledge layer" mechanism: a correction
+    is never left sitting next to the stale fact it addresses with no
+    guidance on which one wins, even before an admin gets around to
+    /teach forget-ing the old one.
+    """
+
+    if not items:
+        return ""
+
+    rules = [item for item in items if item.type == KnowledgeType.RULE]
+    facts = [item for item in items if item.type == KnowledgeType.FACT]
+    corrections = [item for item in items if item.type == KnowledgeType.CORRECTION]
+
+    sections: list[str] = []
+
+    if rules:
+        sections.append(
+            "PERMANENT RULES (standing instructions with no expiry -- "
+            "always follow these, regardless of anything else in this "
+            "context or how much time has passed):\n"
+            + "\n".join(f"- {item.content}" for item in rules)
+        )
+
+    if facts:
+        sections.append(
+            "ADMINISTRATOR-MAINTAINED FACTS (the most recent word an "
+            "administrator gave you on each topic -- trust these over "
+            "your own guess or older conversation, but unlike the "
+            "rules above, they are NOT permanent: an administrator "
+            "wrote each one at a point in time, and Big Brother game "
+            "state changes week to week. If the automated game-state "
+            "information below is clearly newer and more specific on "
+            "the same topic, prefer it and note the discrepancy rather "
+            "than insisting on a fact that looks outdated):\n"
+            + "\n".join(f"- {item.content}" for item in facts)
+        )
+
+    if corrections:
+        sections.append(
+            "ADMINISTRATOR CORRECTIONS (an administrator explicitly "
+            "corrected something you previously believed -- override "
+            "the specific fact/rule/game-state value each one "
+            "addresses. Like facts above, a correction reflects what "
+            "was true when it was written and is not automatically "
+            "permanent -- weigh it the same way if something clearly "
+            "newer contradicts it):\n"
+            + "\n".join(f"- {item.content}" for item in corrections)
+        )
+
+    return (
+        "ADMINISTRATOR-TAUGHT KNOWLEDGE. An authorized administrator "
+        "has explicitly taught you the following -- this is not "
+        "conversation history and not a guess. Treat it as more "
+        "reliable than your own inference or the conversation so far. "
+        "PERMANENT RULES are absolute and never expire. "
+        "ADMINISTRATOR-MAINTAINED FACTS and CORRECTIONS are usually "
+        "right but -- unlike rules -- can become outdated; see each "
+        "section below for exactly how to weigh that.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+# ==========================================================
 # Gemini response parsing
 # ==========================================================
 
@@ -395,6 +496,7 @@ async def generate_julie_response(
     channel_id: int,
     user_text: str,
     game_state: str = "",
+    knowledge: str = "",
 ) -> str:
     """Generates Julie's reply: Groq first, Gemini if Groq can't answer.
 
@@ -402,13 +504,21 @@ async def generate_julie_response(
     HOH, nominees, veto, etc.) appended to the system instruction so
     Julie answers accurately instead of deflecting on questions she
     actually has data for.
+
+    knowledge, when provided, is administrator-taught authoritative
+    knowledge (see format_learned_knowledge()) -- placed BEFORE
+    game_state in the system instruction, and outranking it, since
+    explicit human-taught knowledge is the highest-priority source
+    Julie has, ahead of even the automated production state.
     """
 
     history = update_and_get_history(channel_id, user_text)
 
     system_instruction = SYSTEM_INSTRUCTION
+    if knowledge:
+        system_instruction = f"{system_instruction}\n\n{knowledge}"
     if game_state:
-        system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{game_state}"
+        system_instruction = f"{system_instruction}\n\n{game_state}"
 
     # _try_groq_chat/_try_gemini_chat are synchronous SDK calls that
     # perform real network I/O. Run each on a worker thread via
@@ -447,6 +557,7 @@ async def generate_recap(
     *,
     game_state: str = "",
     hamsterwatch_entries: list[str] | None = None,
+    knowledge: str = "",
 ) -> str:
     """Summarizes recent live-feed updates in Julie's voice: Groq
     first, Gemini if Groq can't answer.
@@ -463,12 +574,23 @@ async def generate_recap(
           callers are expected to retrieve only what's relevant via
           HamsterwatchArchive.find_relevant before calling this).
 
+    knowledge, when provided, is administrator-taught authoritative
+    knowledge (see format_learned_knowledge()) -- placed in the
+    system instruction (like generate_julie_response's knowledge
+    parameter), not mixed into the sourced-content prompt above, since
+    it isn't itself a live-feed/Hamsterwatch source -- it's a standing
+    instruction about how to interpret everything else.
+
     Unlike generate_julie_response, this is a one-off call with no
     persisted chat history — a recap is a summary, not a conversation.
     """
 
     if not entries and not hamsterwatch_entries and not game_state:
         return "Nothing new to recap yet, Houseguest."
+
+    system_instruction = SYSTEM_INSTRUCTION
+    if knowledge:
+        system_instruction = f"{system_instruction}\n\n{knowledge}"
 
     sections: list[str] = []
 
@@ -506,7 +628,7 @@ async def generate_recap(
     reply_text = await asyncio.to_thread(
         _try_groq_chat,
         [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "system", "content": system_instruction},
             {"role": "user", "content": prompt},
         ],
         max_tokens=2000,
@@ -517,7 +639,7 @@ async def generate_recap(
         reply_text = await asyncio.to_thread(
             _try_gemini_chat,
             [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
-            SYSTEM_INSTRUCTION,
+            system_instruction,
             max_tokens=2000,
             temperature=0.7,
         )

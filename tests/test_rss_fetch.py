@@ -26,11 +26,14 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 from urllib.error import URLError
 
 import production.rss as rss_module
 from database.storage import Storage
+from production.competition import CompetitionState
 from production.engine import ProductionEngine
+from production.house_status import HouseStatus
 from production.rss import JokersRSS
 
 
@@ -190,7 +193,17 @@ def test_download_still_parses_a_successful_fetch_correctly(monkeypatch):
 class NullWatcher:
     """Stands in for ProductionWatcher so tick() never touches real
     monitors (network, Hamsterwatch archive, etc.) -- only the RSS
-    call sites under test are exercised."""
+    call sites under test are exercised.
+
+    house_status/competition are minimal stand-ins (blank .current,
+    matching ProductionWatcher's real attributes) because tick() reads
+    them unconditionally, before run(), to decide whether to persist
+    game state -- see production/engine.py.
+    """
+
+    def __init__(self) -> None:
+        self.house_status = SimpleNamespace(current=HouseStatus())
+        self.competition = SimpleNamespace(current=CompetitionState())
 
     async def run(self):
         return [], []
