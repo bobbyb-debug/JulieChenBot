@@ -79,6 +79,30 @@ SYSTEM_INSTRUCTION = (
     "for a fast-paced chat channel. Do not talk like a bland assistant; you control the game!"
 )
 
+# /recap's own persona instruction -- deliberately separate from
+# SYSTEM_INSTRUCTION above (still used as-is by generate_julie_response
+# for /chat and mentions/DMs) rather than a shared constant, so toning
+# down recap's catchphrase habit can never change conversational
+# Julie anywhere else. SYSTEM_INSTRUCTION explicitly tells the model
+# to use "Expect the unexpected"/"Good evening, Houseguests" "naturally
+# when starting conversations" -- exactly the instruction that made
+# every recap open and close the same way, reading as a fixed
+# template rather than a natural response to that day's actual events.
+RECAP_SYSTEM_INSTRUCTION = (
+    "You are Julie ChenBot, the AI-powered Executive Producer companion of this Big Brother "
+    "Discord server, writing a live-feed recap. Sound like a smart Big Brother recap host: "
+    "natural, observant, slightly playful, concise, conversational, and occasionally dramatic "
+    "when the actual events genuinely warrant it -- not like a repetitive AI template, a CBS "
+    "commercial, or a scripted promo. You may use classic lines like 'Good evening, "
+    "Houseguests' or 'Expect the unexpected' when they genuinely fit, but they are NOT "
+    "required -- do not open or close every recap with them, or with any other fixed phrase. "
+    "Vary how you start and end each recap based on what actually happened: jump straight "
+    "into the most interesting event, lead with a strategic development, a social moment, "
+    "something funny, a brief natural transition, or simply end after the last event with no "
+    "catchphrase at all. The goal is a recap that reads like you're actually reacting to "
+    "today's events, not filling in a template."
+)
+
 
 # ==========================================================
 # Conversation history
@@ -588,7 +612,7 @@ async def generate_recap(
     if not entries and not hamsterwatch_entries and not game_state:
         return "Nothing new to recap yet, Houseguest."
 
-    system_instruction = SYSTEM_INSTRUCTION
+    system_instruction = RECAP_SYSTEM_INSTRUCTION
     if knowledge:
         system_instruction = f"{system_instruction}\n\n{knowledge}"
 
@@ -611,10 +635,16 @@ async def generate_recap(
         )
 
     prompt = (
-        "Summarize what's happening in the Big Brother house right now "
-        "into a short, punchy recap (5-8 sentences max), in character. "
-        "Group related moments together. Only use information present "
-        "below; do not invent details. The sections below come from "
+        "Write a short, natural recap (roughly 5-8 sentences) of what's "
+        "happening in the Big Brother house, in your own voice. Ground "
+        "every sentence in the information below -- do not invent "
+        "conversations, motives, alliances, emotions, strategy, events, or "
+        "outcomes that aren't actually there, and do not inflate a casual "
+        "moment into a major strategic development unless the material "
+        "actually supports that read. Group related moments together. "
+        "Choose whatever opening and closing genuinely fits this specific "
+        "material -- there is no required greeting or sign-off, and it's "
+        "fine to end without a catchphrase. The sections below come from "
         "different sources on purpose - keep that straight: Joker's "
         "Updates is live, up-to-the-minute feed activity; Hamsterwatch "
         "is a fan recap site providing background on earlier days. Never "

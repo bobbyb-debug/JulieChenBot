@@ -173,7 +173,57 @@ def test_generate_recap_places_knowledge_in_system_instruction_gemini_path(
     assert KNOWLEDGE_TEXT in recorder["system_instruction"]
 
 
-def test_generate_recap_without_knowledge_uses_bare_system_instruction(
+def test_generate_recap_without_knowledge_uses_bare_recap_system_instruction(
+    monkeypatch, tmp_path
+) -> None:
+    """generate_recap() uses its own RECAP_SYSTEM_INSTRUCTION, not the
+    shared SYSTEM_INSTRUCTION /chat uses -- toning down recap's
+    catchphrase habit must never change conversational Julie
+    elsewhere (see services/ai_service.py's comment on
+    RECAP_SYSTEM_INSTRUCTION)."""
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder, content="Recap text")
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(svc.generate_recap(["update one"]))
+
+    assert recorder["messages"][0]["content"] == ai_service.RECAP_SYSTEM_INSTRUCTION
+    assert ai_service.RECAP_SYSTEM_INSTRUCTION != ai_service.SYSTEM_INSTRUCTION
+
+
+def test_recap_system_instruction_does_not_mandate_catchphrases() -> None:
+    """Content check, not exact-wording match: the instruction that
+    made every recap open/close identically told the model to use
+    'Expect the unexpected'/'Good evening, Houseguests' "naturally
+    when starting conversations" (see SYSTEM_INSTRUCTION). The
+    recap-specific instruction must explicitly say those lines are
+    optional, not required, and must not tell the model to reach for
+    them at the start of every recap the way SYSTEM_INSTRUCTION does."""
+
+    instruction = ai_service.RECAP_SYSTEM_INSTRUCTION.lower()
+
+    assert "not required" in instruction
+    assert "naturally when starting conversations" not in instruction
+
+
+def test_recap_prompt_still_instructs_source_grounding(monkeypatch, tmp_path) -> None:
+    """The style refinement must not loosen factual grounding -- the
+    user-role prompt (not just the system instruction) must still
+    tell the model not to invent details."""
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder, content="Recap text")
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(svc.generate_recap(["update one"]))
+
+    user_prompt = recorder["messages"][1]["content"].lower()
+    assert "do not invent" in user_prompt
+    assert "ground" in user_prompt
+
+
+def test_recap_prompt_does_not_require_a_fixed_opening_or_closing(
     monkeypatch, tmp_path
 ) -> None:
     recorder: dict = {}
@@ -182,7 +232,8 @@ def test_generate_recap_without_knowledge_uses_bare_system_instruction(
 
     asyncio.run(svc.generate_recap(["update one"]))
 
-    assert recorder["messages"][0]["content"] == ai_service.SYSTEM_INSTRUCTION
+    user_prompt = recorder["messages"][1]["content"].lower()
+    assert "no required greeting" in user_prompt or "without a catchphrase" in user_prompt
 
 
 # ==========================================================
