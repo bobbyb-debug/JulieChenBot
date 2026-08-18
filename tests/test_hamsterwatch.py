@@ -452,3 +452,100 @@ def test_hamsterwatch_event_flows_through_watcher(tmp_path):
 
     assert len(hamster_events) == 1
     assert hamster_events[0].event_type == EventType.TIMELINE
+
+
+# ==========================================================
+# NEW vs UPDATED presentation (metadata["is_new"])
+# ==========================================================
+
+
+def test_new_section_after_bootstrap_marks_event_is_new(tmp_path):
+    """A genuinely new day-section discovered after the initial silent
+    backfill must produce an event flagged is_new=True."""
+
+    pages = {
+        URL_A: page_html(40, "Saturday", "August 15, 2026", "Day 40 kicks off quietly."),
+    }
+    monitor, archive = make_monitor(tmp_path, seed_urls=(URL_A,), pages=pages)
+
+    bootstrap_result = asyncio.run(monitor.check())
+    assert bootstrap_result.changed is False  # silent backfill, no event yet
+
+    pages[URL_B] = page_html(41, "Sunday", "August 16, 2026", "Day 41 begins.")
+    monitor.SEED_URLS = (URL_A, URL_B)
+
+    result = asyncio.run(monitor.check())
+
+    assert result.changed is True
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.metadata["is_new"] is True
+    assert event.metadata["bb_day"] == 41
+
+
+def test_substantial_edit_to_existing_section_marks_event_not_new(tmp_path):
+    """The real-world case behind the "duplicate Day 42" report: the
+    SAME section, substantially expanded on a later tick, must still
+    be announced (the archive's significant-change detection is
+    correct and must not be disabled) but flagged is_new=False so
+    Discord can render it distinguishably from a first announcement."""
+
+    pages = {
+        URL_A: page_html(
+            42, "Monday", "August 17, 2026",
+            "Angela's birthday arrived quietly.",
+        ),
+    }
+    monitor, archive = make_monitor(tmp_path, seed_urls=(URL_A,), pages=pages)
+
+    asyncio.run(monitor.check())  # bootstrap, silent
+
+    pages[URL_A] = page_html(
+        42, "Monday", "August 17, 2026",
+        "Angela's birthday arrived quietly. Later, the house exploded "
+        "into chaos when the blindside was revealed and everyone "
+        "scrambled to figure out who had flipped on the plan.",
+    )
+
+    result = asyncio.run(monitor.check())
+
+    assert result.changed is True
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.metadata["is_new"] is False
+    assert event.metadata["bb_day"] == 42
+
+
+def test_unchanged_content_is_not_reannounced(tmp_path):
+    pages = {
+        URL_A: page_html(42, "Monday", "August 17, 2026", "Angela's birthday arrived quietly."),
+    }
+    monitor, archive = make_monitor(tmp_path, seed_urls=(URL_A,), pages=pages)
+
+    asyncio.run(monitor.check())  # bootstrap
+
+    result = asyncio.run(monitor.check())  # identical content, second tick
+
+    assert result.changed is False
+    assert result.events == []
+
+
+def test_trivial_edit_does_not_trigger_reannouncement(tmp_path):
+    """A cosmetic edit below the significant-change threshold (see
+    SIGNIFICANT_LENGTH_DELTA/SIGNIFICANT_RELATIVE_DELTA in
+    database/hamsterwatch_archive.py) must not be announced -- the
+    content is still stored, just not treated as Discord-worthy."""
+
+    pages = {
+        URL_A: page_html(42, "Monday", "August 17, 2026", "Angela's birthday arrived quietly."),
+    }
+    monitor, archive = make_monitor(tmp_path, seed_urls=(URL_A,), pages=pages)
+
+    asyncio.run(monitor.check())  # bootstrap
+
+    pages[URL_A] = page_html(42, "Monday", "August 17, 2026", "Angela's birthday arrived quietly!")
+
+    result = asyncio.run(monitor.check())
+
+    assert result.changed is False
+    assert result.events == []

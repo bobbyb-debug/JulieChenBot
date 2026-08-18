@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -93,13 +94,17 @@ def test_finished_competition_shows_winner():
 # ==========================================================
 
 
-def make_rss_event(detail: str) -> ProductionEvent:
+def make_rss_event(detail: str, created_at: datetime | None = None) -> ProductionEvent:
+    kwargs = {}
+    if created_at is not None:
+        kwargs["created_at"] = created_at
     return ProductionEvent(
         source="Joker's Updates",
         event_type=EventType.RSS_UPDATE,
         title="LIVE FEED UPDATE",
         detail=detail,
         severity=EventSeverity.INFO,
+        **kwargs,
     )
 
 
@@ -143,22 +148,98 @@ def test_recap_buffer_is_capped():
     for i in range(10):
         engine._record_recap(make_rss_event(f"update {i}"))
 
-    buffer = engine.recent_updates(limit=100)
+    buffer = engine.recent_updates()
     assert len(buffer) == 5
     # oldest entries dropped, most recent kept
     assert buffer[0] == "update 5"
     assert buffer[-1] == "update 9"
 
 
-def test_recent_updates_respects_limit_param():
+def test_recent_updates_excludes_events_older_than_the_window():
     engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
 
-    for i in range(10):
-        engine._record_recap(make_rss_event(f"update {i}"))
+    engine._record_recap(make_rss_event("too old", created_at=now - timedelta(hours=30)))
+    engine._record_recap(make_rss_event("within window", created_at=now - timedelta(hours=2)))
 
-    assert engine.recent_updates(limit=3) == [
-        "update 7", "update 8", "update 9",
-    ]
+    assert engine.recent_updates(hours=24) == ["within window"]
+
+
+def test_recent_updates_respects_custom_hours_param():
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    engine._record_recap(make_rss_event("two hours ago", created_at=now - timedelta(hours=2)))
+    engine._record_recap(make_rss_event("thirty minutes ago", created_at=now - timedelta(minutes=30)))
+
+    assert engine.recent_updates(hours=1) == ["thirty minutes ago"]
+
+
+def test_recent_updates_preserves_chronological_order():
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    # Recorded out of order; must come back oldest-first (buffer
+    # append order, which _record_recap always preserves).
+    engine._record_recap(make_rss_event("first", created_at=now - timedelta(hours=3)))
+    engine._record_recap(make_rss_event("second", created_at=now - timedelta(hours=2)))
+    engine._record_recap(make_rss_event("third", created_at=now - timedelta(hours=1)))
+
+    assert engine.recent_updates(hours=24) == ["first", "second", "third"]
+
+
+def test_recent_updates_deduplicates_identical_detail_text():
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    engine._record_recap(make_rss_event("same text", created_at=now - timedelta(hours=2)))
+    engine._record_recap(make_rss_event("same text", created_at=now - timedelta(hours=1)))
+    engine._record_recap(make_rss_event("different text", created_at=now))
+
+    assert engine.recent_updates(hours=24) == ["same text", "different text"]
+
+
+def test_recent_updates_excludes_future_timestamped_entries():
+    """Defensive: a corrupted/clock-skewed entry timestamped in the
+    future must never be treated as recent."""
+
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    engine._record_recap(make_rss_event("from the future", created_at=now + timedelta(hours=5)))
+    engine._record_recap(make_rss_event("normal", created_at=now))
+
+    assert engine.recent_updates(hours=24) == ["normal"]
+
+
+def test_recent_updates_ignores_legacy_bare_string_entries_without_crashing():
+    """Backward compatibility: entries persisted before per-entry
+    timestamps existed are bare strings, not {"created_at", "detail"}
+    dicts. They must never crash recent_updates() -- they simply
+    can't be time-windowed, so they're excluded rather than guessed
+    at."""
+
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    legacy_buffer = ["a legacy update with no timestamp"]
+    engine.storage.set(engine.RECAP_KEY, legacy_buffer)
+    engine._record_recap(make_rss_event("current update", created_at=now))
+
+    assert engine.recent_updates(hours=24) == ["current update"]
+
+
+def test_recap_buffer_defaults_to_recap_window_hours_constant():
+    engine = ProductionEngine(storage=FakeStorage())
+    now = datetime.now(UTC)
+
+    engine._record_recap(
+        make_rss_event("just outside default window", created_at=now - timedelta(hours=25))
+    )
+    engine._record_recap(make_rss_event("inside", created_at=now - timedelta(hours=1)))
+
+    assert engine.RECAP_WINDOW_HOURS == 24
+    assert engine.recent_updates() == ["inside"]
 
 
 # ==========================================================

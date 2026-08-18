@@ -114,6 +114,17 @@ PRODUCTION_CHANNEL = env_int("PRODUCTION_CHANNEL")
 HOUSE_STATUS_CHANNEL = env_int("HOUSE_STATUS_CHANNEL", 1534566047611617371)
 PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 
+# A Discord role ID trusted to run /teach batch and /teach update
+# (see commands/teach.py _is_trusted_moderator()) without needing full
+# server administrator. Unset means those two commands are effectively
+# admin-only in practice (a full administrator always qualifies
+# regardless of this setting) -- there is no unsafe default here, only
+# a missing opt-in. /teach fact, /teach rule, /teach correction, and
+# /teach forget are unaffected by this setting: they stay restricted
+# to full administrators via Discord's own default_permissions gate,
+# exactly as before.
+TRUSTED_MODERATOR_ROLE_ID = env_int("TRUSTED_MODERATOR_ROLE_ID")
+
 # ==========================================================
 # JokersUpdates
 # ==========================================================

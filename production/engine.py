@@ -35,7 +35,13 @@ class ProductionEngine:
     """Coordinates Julie ChenBot's production systems."""
 
     RECAP_KEY = "recap_buffer"
-    RECAP_LIMIT = 100
+    # Sized well above what a single very active 24-hour period of
+    # live-feed items could produce -- recent_updates() below filters
+    # by time, not count, so this cap only bounds retained raw
+    # history and must comfortably outlast the actual recap window.
+    RECAP_LIMIT = 500
+    # /recap's default lookback window (see recent_updates() below).
+    RECAP_WINDOW_HOURS = 24
     PENDING_EVENTS_KEY = "pending_events"
     GAME_STATE_KEY = "game_state"
 
@@ -461,26 +467,79 @@ class ProductionEngine:
         """Appends an announced RSS update to the rolling recap buffer.
 
         Only real live-feed updates are recorded; monitor-generated
-        events (image changes, competition state) are not, since /recap
-        is specifically "what happened on the feeds."
+        events (image changes, competition state, Hamsterwatch) are
+        not, since /recap is specifically "what happened on the raw
+        Joker's Updates feed." Each entry retains its original event
+        timestamp (not just append order) so recent_updates() can
+        filter by an actual elapsed-time window rather than a fixed
+        count -- see recent_updates() below for why that matters.
         """
 
         if event.event_type != EventType.RSS_UPDATE:
             return
 
         buffer = list(self.storage.get(self.RECAP_KEY, []))
-        buffer.append(event.detail)
+        buffer.append(
+            {"created_at": event.created_at.isoformat(), "detail": event.detail}
+        )
 
         if len(buffer) > self.RECAP_LIMIT:
             buffer = buffer[-self.RECAP_LIMIT:]
 
         self.storage.set(self.RECAP_KEY, buffer)
 
-    def recent_updates(self, limit: int = 20) -> list[str]:
-        """Returns the most recent announced live-feed updates."""
+    def recent_updates(self, hours: float | None = None) -> list[str]:
+        """Returns live-feed update text from roughly the last `hours`
+        hours (default RECAP_WINDOW_HOURS), oldest first.
+
+        Buffer entries are the {"created_at", "detail"} shape written
+        by _record_recap() above, or -- from before per-entry
+        timestamps existed -- a bare string. A legacy bare string has
+        no recoverable timestamp, so rather than guess or assume it's
+        still recent, it is simply excluded here; this never crashes
+        loading, it just means a legacy entry can no longer be
+        time-windowed and ages out of relevance on its own as new
+        entries are recorded. An entry timestamped in the future
+        (clock skew, corrupted data) is excluded the same way, so it
+        can never be miscounted as "recent."
+
+        Duplicate detail text within the window is collapsed (first
+        occurrence kept, order preserved) as a defensive safety net --
+        RSS's own GUID-based dedup (see production/rss.py
+        JokersRSS.check_all()) already prevents the same live-feed
+        item from being recorded twice in the normal case.
+        """
+
+        window_hours = self.RECAP_WINDOW_HOURS if hours is None else hours
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(hours=window_hours)
 
         buffer = list(self.storage.get(self.RECAP_KEY, []))
-        return buffer[-limit:]
+
+        recent: list[str] = []
+        for entry in buffer:
+            if not isinstance(entry, dict):
+                continue  # legacy bare-string entry -- no timestamp
+
+            detail = entry.get("detail")
+            created_at_raw = entry.get("created_at")
+            if not detail or not created_at_raw:
+                continue
+
+            try:
+                created_at = datetime.fromisoformat(created_at_raw)
+            except (ValueError, TypeError):
+                continue
+
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+
+            if created_at < cutoff or created_at > now:
+                continue
+
+            recent.append(detail)
+
+        return list(dict.fromkeys(recent))
 
     async def save_state(self) -> None:
         """Persists the storage state used by monitors."""

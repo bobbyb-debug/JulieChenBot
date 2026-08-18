@@ -348,3 +348,154 @@ def test_page_with_no_imgur_embed_returns_empty_list(monkeypatch) -> None:
     monkeypatch.setattr(imgur_module, "urlopen", fake_urlopen)
 
     assert resolver.resolve_images_for_update(update) == []
+
+
+# ==========================================================
+# Diagnostic logging: visible in logs, secrets never leaked
+#
+# Part 3 of the architecture session requires clear, secret-free
+# breadcrumbs for: embed detected, ID extracted, resolution attempted,
+# resolution succeeded, resolution failed, missing Client ID -- and an
+# explicit guarantee the Client-ID value/Authorization header is never
+# logged, in any branch, success or failure.
+# ==========================================================
+
+
+def _collect_log_calls(monkeypatch):
+    """Patches every logger.<level>() call to record (level, args) so
+    tests can assert on what was actually logged without depending on
+    exact wording."""
+
+    calls: list[tuple[str, tuple]] = []
+
+    for level in ("info", "warning", "error", "exception"):
+        def make_recorder(level_name):
+            def _recorder(*args, **kwargs):
+                calls.append((level_name, args))
+            return _recorder
+
+        monkeypatch.setattr(imgur_module.logger, level, make_recorder(level))
+
+    return calls
+
+
+def test_missing_embed_after_successful_fetch_is_logged(monkeypatch) -> None:
+    resolver = ImgurResolver(client_id="test-client-id")
+    update = _update()
+    calls = _collect_log_calls(monkeypatch)
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(b"<html><body>no embed here</body></html>")
+
+    monkeypatch.setattr(imgur_module, "urlopen", fake_urlopen)
+
+    resolver.resolve_images_for_update(update)
+
+    warnings = [args for level, args in calls if level == "warning"]
+    assert any("no Imgur embed" in args[0] for args in warnings)
+
+
+def test_successful_resolution_logs_embed_detected_attempt_and_success(monkeypatch) -> None:
+    resolver = ImgurResolver(client_id="test-client-id")
+    update = _update()
+    calls = _collect_log_calls(monkeypatch)
+
+    page_html = '<blockquote class="imgur-embed-pub" data-id="Q1n6TNW"></blockquote>'
+
+    def fake_urlopen(request, timeout=None):
+        if "api.imgur.com" in request.full_url:
+            return FakeResponse(_imgur_api_success("https://i.imgur.com/Q1n6TNW.jpg"))
+        return FakeResponse(page_html.encode("utf-8"))
+
+    monkeypatch.setattr(imgur_module, "urlopen", fake_urlopen)
+
+    resolver.resolve_images_for_update(update)
+
+    info_messages = [args[0] for level, args in calls if level == "info"]
+    assert any("detected" in msg.lower() for msg in info_messages)
+    assert any("attempting" in msg.lower() for msg in info_messages)
+    assert any("succeeded" in msg.lower() for msg in info_messages)
+
+
+def test_failed_resolution_logs_failure(monkeypatch) -> None:
+    resolver = ImgurResolver(client_id="test-client-id")
+    update = _update()
+    calls = _collect_log_calls(monkeypatch)
+
+    page_html = '<blockquote class="imgur-embed-pub" data-id="badid99"></blockquote>'
+
+    def fake_urlopen(request, timeout=None):
+        if "api.imgur.com" in request.full_url:
+            return FakeResponse(
+                json.dumps({"data": {}, "success": False, "status": 404}).encode("utf-8")
+            )
+        return FakeResponse(page_html.encode("utf-8"))
+
+    monkeypatch.setattr(imgur_module, "urlopen", fake_urlopen)
+
+    resolver.resolve_images_for_update(update)
+
+    warnings = [args[0] for level, args in calls if level == "warning"]
+    assert any("resolution failed" in msg.lower() for msg in warnings)
+
+
+def test_client_id_value_never_appears_in_any_log_call(monkeypatch) -> None:
+    """Regression guard: across every branch (success, API failure,
+    malformed JSON, missing embed, page-fetch failure), the actual
+    Client-ID value must never appear as a logged argument."""
+
+    secret_client_id = "super-secret-client-id-do-not-log-me"
+    resolver = ImgurResolver(client_id=secret_client_id)
+    calls = _collect_log_calls(monkeypatch)
+    observed_auth_headers: list[str | None] = []
+
+    page_html = (
+        '<blockquote class="imgur-embed-pub" data-id="goodid1"></blockquote>'
+        '<blockquote class="imgur-embed-pub" data-id="badid99"></blockquote>'
+    )
+
+    def fake_urlopen(request, timeout=None):
+        # Recorded, not asserted here -- an assertion failure inside
+        # this callable would itself be caught and logged by the
+        # code's own try/except, which would make the test fail for
+        # the wrong reason (it did, the first time this was written).
+        observed_auth_headers.append(request.headers.get("Authorization"))
+
+        if "api.imgur.com/3/image/goodid1" in request.full_url:
+            return FakeResponse(_imgur_api_success("https://i.imgur.com/goodid1.jpg"))
+        if "api.imgur.com/3/image/badid99" in request.full_url:
+            return FakeResponse(b"not valid json{{{")
+        return FakeResponse(page_html.encode("utf-8"))
+
+    monkeypatch.setattr(imgur_module, "urlopen", fake_urlopen)
+
+    resolver.resolve_images_for_update(_update())
+
+    # Sanity: the header really was sent for the two Imgur API calls
+    # (proves this test would actually catch a leak if one existed).
+    assert observed_auth_headers.count(f"Client-ID {secret_client_id}") == 2
+
+    for _level, args in calls:
+        for arg in args:
+            assert secret_client_id not in str(arg)
+
+
+def test_missing_client_id_log_never_contains_a_client_id_value(monkeypatch) -> None:
+    resolver = ImgurResolver(client_id="")
+    calls = _collect_log_calls(monkeypatch)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not make a network request")
+
+    monkeypatch.setattr(imgur_module, "urlopen", fail_if_called)
+
+    resolver.resolve_images_for_update(_update())
+
+    warnings = [args[0] for level, args in calls if level == "warning"]
+    assert any("IMGUR_CLIENT_ID is not configured" in msg for msg in warnings)
+    for _level, args in calls:
+        for arg in args:
+            # There is no real credential in this scenario, but the
+            # message itself must reference the *variable name* only,
+            # never claim to show a value.
+            assert "Client-ID " not in str(arg) or "IMGUR_CLIENT_ID" in str(arg)

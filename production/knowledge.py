@@ -42,13 +42,26 @@ logger = ProductionLogger.get("Knowledge")
 
 
 class KnowledgeType(str, Enum):
-    """The three knowledge shapes /teach supports."""
+    """The knowledge shapes /teach supports.
+
+    FACT/RULE accumulate (general, stable knowledge). CORRECTION
+    explicitly supersedes something specific via the supersedes
+    mechanism below, at the teacher's discretion. STATE is
+    fundamentally different from all three: it represents one current
+    game value for a given topic (see KnowledgeItem.topic /
+    KnowledgeStore.active_state()) and a new STATE write for the same
+    topic ALWAYS automatically supersedes the previous active STATE
+    for that topic -- there is never more than one active STATE item
+    per topic, by construction, not by teacher discipline.
+    """
 
     FACT = "fact"
 
     RULE = "rule"
 
     CORRECTION = "correction"
+
+    STATE = "state"
 
 
 # ==========================================================
@@ -81,6 +94,21 @@ class KnowledgeItem:
     # older item.
     supersedes: Optional[int] = None
 
+    # Only meaningful for type == STATE: the game-state field this
+    # item is the current value of (e.g. "HOH", "NOMINEES"), always
+    # normalized upper-case by KnowledgeStore.teach(). None for every
+    # other type. This is the key active_state() looks up by, and
+    # what lets a new STATE write for the same topic find and
+    # supersede the previous one automatically.
+    topic: Optional[str] = None
+
+    # Optional free-text source/reason a moderator supplied when
+    # teaching this item (see commands/teach.py's /teach update
+    # `reason` parameter) -- part of this item's audit trail, kept
+    # separate from `content` so content stays exactly the taught
+    # value (e.g. "Yash") rather than a value+rationale blob.
+    note: Optional[str] = None
+
     # ======================================================
     # Serialization
     # ======================================================
@@ -97,6 +125,8 @@ class KnowledgeItem:
             "updated_at": self.updated_at.isoformat(),
             "active": self.active,
             "supersedes": self.supersedes,
+            "topic": self.topic,
+            "note": self.note,
         }
 
     @classmethod
@@ -108,6 +138,10 @@ class KnowledgeItem:
         callers (see KnowledgeStore._load()) are expected to catch
         this per-record and skip it rather than let one bad record
         block every other one, or startup itself.
+
+        topic defaults to None for records persisted before STATE
+        existed, matching the same backward-compatible-default pattern
+        already used for `active` above.
         """
 
         supersedes = data.get("supersedes")
@@ -121,6 +155,8 @@ class KnowledgeItem:
             updated_at=datetime.fromisoformat(data["updated_at"]),
             active=bool(data.get("active", True)),
             supersedes=int(supersedes) if supersedes is not None else None,
+            topic=data.get("topic"),
+            note=data.get("note"),
         )
 
 
@@ -184,6 +220,8 @@ class KnowledgeStore:
         content: str,
         author_id: int,
         supersedes: Optional[int] = None,
+        topic: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> KnowledgeItem:
         """Records one new piece of authoritative knowledge.
 
@@ -205,7 +243,33 @@ class KnowledgeStore:
         new item exists but the item it was meant to replace is still
         active. If the target is already inactive, deactivating it
         again is simply a no-op (idempotent, matches forget()).
+
+        topic is required for KnowledgeType.STATE (raises ValueError
+        otherwise -- a STATE item with no topic could never be looked
+        up or correctly superseded later) and rejected for every other
+        type (raises ValueError -- topic only means something for
+        STATE). For a STATE write, when supersedes is not explicitly
+        given, this method automatically looks up the current
+        active_state() for the same topic and supersedes it -- this is
+        the whole mechanism behind "a new STATE: HOH = Barrett
+        automatically replaces STATE: HOH = Yash" without the caller
+        needing to already know the old item's ID. An explicit
+        supersedes always takes precedence over the automatic lookup.
         """
+
+        if knowledge_type == KnowledgeType.STATE:
+            normalized_topic = (topic or "").strip().upper()
+            if not normalized_topic:
+                raise ValueError(
+                    "A STATE item requires a topic (e.g. HOH, NOMINEES)."
+                )
+            topic = normalized_topic
+            if supersedes is None:
+                current = self.active_state(topic)
+                if current is not None:
+                    supersedes = current.id
+        elif topic is not None:
+            raise ValueError("topic is only valid for KnowledgeType.STATE.")
 
         superseded_item: Optional[KnowledgeItem] = None
 
@@ -228,6 +292,8 @@ class KnowledgeStore:
             updated_at=now,
             active=True,
             supersedes=supersedes,
+            topic=topic,
+            note=note,
         )
 
         self._items.append(item)
@@ -283,3 +349,25 @@ class KnowledgeStore:
 
     def all_items(self) -> list[KnowledgeItem]:
         return list(self._items)
+
+    def active_state(self, topic: str) -> Optional[KnowledgeItem]:
+        """Returns the currently active STATE item for one topic (e.g.
+        "HOH", "NOMINEES"), or None if nothing has been taught for it.
+
+        There is never more than one active STATE item per topic --
+        teach() automatically supersedes the previous one on every new
+        STATE write for the same topic -- so the first match found is
+        the only one there should ever be.
+        """
+
+        normalized = topic.strip().upper()
+        return next(
+            (
+                item
+                for item in self._items
+                if item.active
+                and item.type == KnowledgeType.STATE
+                and item.topic == normalized
+            ),
+            None,
+        )

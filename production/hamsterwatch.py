@@ -361,6 +361,16 @@ class HamsterwatchMonitor(Monitor):
         """Builds one consolidated ProductionEvent from newly-significant
         outcomes, so a burst of new content (e.g. after downtime) posts
         as a single Discord message rather than one per day-section.
+
+        metadata["is_new"] distinguishes a section's first appearance
+        from a later substantial edit to a section Julie already
+        archived (see UpsertOutcome.is_new in database/
+        hamsterwatch_archive.py) -- this is what lets
+        DiscordOutputRouter._hamsterwatch_title() render "HAMSTERWATCH
+        UPDATE" vs "HAMSTERWATCH UPDATED" instead of an identical
+        title either way. True if at least one outcome in this batch
+        is a brand-new section; a batch of purely re-edited sections
+        (no new ones at all) is the only case marked False.
         """
 
         ordered = sorted(
@@ -371,6 +381,7 @@ class HamsterwatchMonitor(Monitor):
             ),
         )
         primary = ordered[-1].article
+        is_new = any(outcome.is_new for outcome in ordered)
 
         if len(ordered) == 1:
             detail_lines = [primary.heading]
@@ -389,6 +400,7 @@ class HamsterwatchMonitor(Monitor):
             "published": primary.article_date or "",
             "summary": primary.summary,
             "count": len(ordered),
+            "is_new": is_new,
         }
 
         return ProductionEvent(

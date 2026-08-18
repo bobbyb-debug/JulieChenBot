@@ -409,3 +409,206 @@ def test_supersedes_defaults_to_none_for_records_predating_the_field() -> None:
     restored = KnowledgeItem.from_dict(data)
 
     assert restored.supersedes is None
+
+
+# ==========================================================
+# STATE: topic-keyed, auto-superseding current game values
+# ==========================================================
+
+
+def test_state_requires_a_topic(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    try:
+        store.teach(KnowledgeType.STATE, "Yash", author_id=1)
+        assert False, "expected ValueError for a STATE item with no topic"
+    except ValueError:
+        pass
+
+    assert store.all_items() == []
+
+
+def test_topic_is_rejected_for_non_state_types(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    try:
+        store.teach(KnowledgeType.FACT, "Yash won 3 comps.", author_id=1, topic="HOH")
+        assert False, "expected ValueError: topic is STATE-only"
+    except ValueError:
+        pass
+
+    assert store.all_items() == []
+
+
+def test_state_creation_stores_normalized_topic(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="hoh")
+
+    assert item.type == KnowledgeType.STATE
+    assert item.topic == "HOH"  # normalized upper-case
+    assert item in store.active_items()
+    assert store.active_state("HOH") == item
+    assert store.active_state("hoh") == item  # lookup also normalizes
+
+
+def test_same_topic_state_auto_supersedes_previous_state(tmp_path: Path, monkeypatch) -> None:
+    """The core requirement: a new STATE write for a topic that
+    already has an active STATE value must automatically supersede
+    it -- no competing active fact, no explicit supersedes needed."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    first = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    second = store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    assert second.supersedes == first.id
+    assert store.get(first.id).active is False
+    assert store.active_state("HOH") == second
+
+    active_states = [i for i in store.active_items() if i.type == KnowledgeType.STATE]
+    assert active_states == [second]  # never two competing active STATEs
+
+
+def test_different_topics_coexist_independently(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    hoh = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    noms = store.teach(KnowledgeType.STATE, "Angela, Dee", author_id=1, topic="NOMINEES")
+
+    # A later HOH update must not touch the unrelated NOMINEES state.
+    store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    assert store.active_state("NOMINEES") == noms
+    assert store.get(noms.id).active is True
+    assert store.active_state("HOH").content == "Barrett"
+
+
+def test_state_history_is_preserved_not_deleted(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    first = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    second = store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    all_ids = [item.id for item in store.all_items()]
+    assert first.id in all_ids
+    assert second.id in all_ids
+    assert store.get(first.id).content == "Yash"  # old value still readable
+
+
+def test_state_ids_remain_unique_and_not_reused(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    a = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    b = store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+    c = store.teach(KnowledgeType.FACT, "Yash won 3 comps.", author_id=1)
+
+    assert len({a.id, b.id, c.id}) == 3
+    assert c.id == max(a.id, b.id) + 1
+
+
+def test_explicit_supersedes_overrides_automatic_topic_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An explicitly-given supersedes always wins over the automatic
+    same-topic lookup."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    unrelated = store.teach(KnowledgeType.FACT, "some other fact", author_id=1)
+    current_hoh = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+
+    new_hoh = store.teach(
+        KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH", supersedes=unrelated.id
+    )
+
+    assert new_hoh.supersedes == unrelated.id
+    assert store.get(unrelated.id).active is False
+    # The automatic same-topic candidate was NOT touched, since an
+    # explicit target was given instead.
+    assert store.get(current_hoh.id).active is True
+
+
+def test_state_does_not_affect_fact_or_rule_behavior(tmp_path: Path, monkeypatch) -> None:
+    """Adding STATE must not change FACT/RULE's own accumulating
+    behavior -- both remain simultaneously active regardless of topic
+    or STATE activity."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    fact1 = store.teach(KnowledgeType.FACT, "Yash has won several comps.", author_id=1)
+    fact2 = store.teach(KnowledgeType.FACT, "Angela is strategic.", author_id=1)
+    rule1 = store.teach(KnowledgeType.RULE, "Never invent live-feed info.", author_id=1)
+    store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    active = store.active_items()
+    assert fact1 in active
+    assert fact2 in active
+    assert rule1 in active
+
+
+def test_active_state_returns_none_when_nothing_taught(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    assert store.active_state("HOH") is None
+
+
+def test_state_topic_round_trips_through_serialization() -> None:
+    original = KnowledgeItem(
+        id=1,
+        type=KnowledgeType.STATE,
+        content="Yash",
+        author_id=1,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        topic="HOH",
+    )
+
+    restored = KnowledgeItem.from_dict(original.to_dict())
+
+    assert restored.topic == "HOH"
+    assert restored == original
+
+
+def test_topic_defaults_to_none_for_records_predating_the_field() -> None:
+    """Backward compatibility: knowledge records persisted before
+    STATE/topic existed have no such key at all."""
+
+    data = KnowledgeItem(
+        id=1,
+        type=KnowledgeType.FACT,
+        content="x",
+        author_id=1,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    ).to_dict()
+    del data["topic"]
+
+    restored = KnowledgeItem.from_dict(data)
+
+    assert restored.topic is None
+
+
+def test_state_supersession_survives_restart(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    storage = Storage()
+
+    store_a = KnowledgeStore(storage=storage)
+    store_a.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    second = store_a.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    store_b = KnowledgeStore(storage=Storage())
+
+    assert store_b.active_state("HOH").content == "Barrett"
+    assert store_b.active_state("HOH").id == second.id

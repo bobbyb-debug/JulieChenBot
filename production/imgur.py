@@ -156,16 +156,32 @@ class ImgurResolver:
 
         image_ids = extract_imgur_ids(html)[:_MAX_IMAGES_PER_POST]
         if not image_ids:
+            logger.warning(
+                "Post %s carries the (IMG) marker but no Imgur embed was "
+                "found on its Joker's Updates page; posting text-only.",
+                update.link,
+            )
             return []
+
+        logger.info(
+            "Imgur embed(s) detected on %s: %d image ID(s) found (%s).",
+            update.link,
+            len(image_ids),
+            ", ".join(image_ids),
+        )
 
         resolved: list[str] = []
         for image_id in image_ids:
+            logger.info("Attempting Imgur resolution for image %s.", image_id)
             url = self._resolve_image(image_id)
             if url:
+                logger.info(
+                    "Imgur resolution succeeded for image %s: %s", image_id, url
+                )
                 resolved.append(url)
             else:
                 logger.warning(
-                    "Could not resolve Imgur image %s (post %s).",
+                    "Imgur resolution failed for image %s (post %s).",
                     image_id,
                     update.link,
                 )
@@ -191,6 +207,14 @@ class ImgurResolver:
         no OAuth required for a public read. Returns "" on any
         failure; the actual direct URL is read from the API's own
         JSON response (data.link), never constructed here.
+
+        Every log call in this method logs only the image_id, the
+        exception text, or Imgur's own response body -- never the
+        Request object, the Authorization header, or self.client_id
+        itself. urllib's HTTPError/URLError string representations
+        contain the URL and HTTP status/reason, not the headers that
+        were sent, and Imgur's error JSON echoes the request path
+        (e.g. "/3/image/<id>"), not the credentials used to make it.
         """
 
         request = Request(

@@ -308,6 +308,73 @@ def test_hamsterwatch_event_without_bb_day_uses_plain_title(monkeypatch) -> None
 
 
 # ==========================================================
+# Hamsterwatch NEW vs UPDATED presentation (metadata["is_new"], see
+# production/hamsterwatch.py HamsterwatchMonitor._build_event())
+# ==========================================================
+
+
+def test_hamsterwatch_first_announcement_uses_update_title(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event(is_new=True)))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATE — Day 37"
+
+
+def test_hamsterwatch_substantial_edit_uses_updated_title(monkeypatch) -> None:
+    """A re-announcement of a section Julie already archived (a real
+    content edit, not a duplicate) must render distinguishably from a
+    first-time announcement -- see production/hamsterwatch.py's
+    UpsertOutcome.is_new."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event(is_new=False)))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATED — Day 37"
+
+
+def test_hamsterwatch_missing_is_new_metadata_defaults_to_update_title(monkeypatch) -> None:
+    """Backward compatibility: an event persisted before metadata["is_new"]
+    existed (e.g. recovered from A3 pending-event durability) must not
+    crash and must render exactly as it did before this feature --
+    the original "UPDATE" wording, not "UPDATED"."""
+
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    event = _hamsterwatch_event()
+    assert "is_new" not in event.metadata
+
+    asyncio.run(router.publish(event))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATE — Day 37"
+
+
+def test_hamsterwatch_multi_day_updated_batch_uses_updated_recaps_wording(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    channel = FakeChannel(1, "live-updates")
+    router = DiscordOutputRouter(FakeBot([channel]))
+
+    asyncio.run(router.publish(_hamsterwatch_event(count=2, is_new=False)))
+
+    embed = channel.messages[0]["embed"]
+    assert embed.title == "🐹 HAMSTERWATCH UPDATED — 2 updated recaps"
+
+
+# ==========================================================
 # Per-destination delivery tracking (partial multi-destination
 # failure must not duplicate successful destinations or silently
 # drop failed ones)

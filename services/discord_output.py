@@ -62,19 +62,34 @@ def _image_extension(data: bytes) -> str:
 def _hamsterwatch_title(event: ProductionEvent) -> str:
     """Builds the Hamsterwatch embed title from event metadata.
 
-    Surfaces the BB day (or the count of new recaps, for a multi-day
+    Surfaces the BB day (or the count of recaps, for a multi-day
     catch-up) directly in the title so it's visible without opening
     the embed body.
+
+    metadata["is_new"] (see production/hamsterwatch.py
+    HamsterwatchMonitor._build_event()) distinguishes a section's
+    first appearance ("HAMSTERWATCH UPDATE") from a later substantial
+    edit to a section already archived ("HAMSTERWATCH UPDATED") --
+    otherwise identical-looking posts for the same Day N heading are
+    what made a legitimate re-announcement read as a duplicate.
+    Defaults to True (the "UPDATE"/new wording) for any event that
+    predates this field, matching how every other metadata addition
+    in this codebase stays backward-compatible with already-persisted
+    events (see production/engine.py _rss_event()'s image_url/
+    image_urls precedent).
     """
 
     count = event.metadata.get("count", 1)
     bb_day = event.metadata.get("bb_day")
+    is_new = event.metadata.get("is_new", True)
+    label = "HAMSTERWATCH UPDATE" if is_new else "HAMSTERWATCH UPDATED"
 
     if count and count > 1:
-        return f"🐹 HAMSTERWATCH UPDATE — {count} new recaps"
+        recaps = "new recaps" if is_new else "updated recaps"
+        return f"🐹 {label} — {count} {recaps}"
     if bb_day:
-        return f"🐹 HAMSTERWATCH UPDATE — Day {bb_day}"
-    return "🐹 HAMSTERWATCH UPDATE"
+        return f"🐹 {label} — Day {bb_day}"
+    return f"🐹 {label}"
 
 
 class DiscordOutputRouter:
