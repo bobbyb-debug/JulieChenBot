@@ -48,6 +48,17 @@ class DiscordService:
 
         self.scheduler = Scheduler()
 
+        # Owns the admin API's background task for this instance's
+        # entire lifetime (see _start_admin_api()/_stop_admin_api()
+        # below) -- deliberately an instance attribute, not a
+        # fire-and-forget asyncio.create_task() call with the return
+        # value discarded, which risks the task being garbage
+        # collected mid-run since nothing else would hold a
+        # reference to it. None until/unless _start_admin_api()
+        # actually starts it (ENABLE_ADMIN_API=false leaves this
+        # None forever).
+        self.admin_api_task: asyncio.Task | None = None
+
         self._ai_cooldowns: dict[int, float] = {}
 
         # on_ready() is not guaranteed to fire only once per process
@@ -191,17 +202,7 @@ class DiscordService:
                     "Production Scheduler disabled (ENABLE_SCHEDULER=false)."
                 )
 
-            if ENABLE_ADMIN_API:
-                asyncio.create_task(
-                    run_admin_api(self.scheduler.engine)
-                )
-                self.logger.info(
-                    "Admin API starting (ENABLE_ADMIN_API=true)."
-                )
-            else:
-                self.logger.info(
-                    "Admin API disabled (ENABLE_ADMIN_API=false)."
-                )
+            self._start_admin_api()
 
             print()
             print("=" * 60)
@@ -404,6 +405,130 @@ class DiscordService:
             )
 
     # ==========================================================
+    # Admin API lifecycle
+    # ==========================================================
+
+    def _start_admin_api(self) -> None:
+        """Starts the admin API as a task owned by self.admin_api_task
+        for this instance's entire lifetime -- see shutdown() for the
+        matching cancellation. A no-op, leaving admin_api_task None,
+        when ENABLE_ADMIN_API is false: the admin API stays completely
+        disabled, exactly as before.
+
+        Idempotent: on_ready() is not guaranteed to fire only once
+        per process (Discord's own documented behavior -- see the
+        note on _commands_loaded above), so a reconnect calling this
+        again must never spin up a second task/server on top of one
+        that's still alive, which would just fail to bind the
+        already-taken port. Three states, handled explicitly:
+
+          - never started (admin_api_task is None): start it.
+          - already running (task exists and not done()): leave it
+            alone -- do not create a second task or server.
+          - previously started but no longer running (task exists
+            and done() -- cancelled, crashed, or returned early e.g.
+            a missing ADMIN_API_KEY): safe, and desirable, to start a
+            fresh one, so a task that died unexpectedly can recover
+            on the next reconnect rather than leaving the admin API
+            dark for the rest of the process's life. Any exception
+            from the finished task was already retrieved and logged
+            by _on_admin_api_task_done() when it completed -- nothing
+            is hidden by restarting here.
+        """
+
+        if not ENABLE_ADMIN_API:
+            self.logger.info(
+                "Admin API disabled (ENABLE_ADMIN_API=false)."
+            )
+            return
+
+        if self.admin_api_task is not None:
+            if not self.admin_api_task.done():
+                self.logger.info(
+                    "Admin API already running; not starting a "
+                    "second instance."
+                )
+                return
+
+            self.logger.info(
+                "Previous admin API task is no longer running (%s); "
+                "starting a new one.",
+                self._describe_admin_api_task_outcome(self.admin_api_task),
+            )
+
+        self.admin_api_task = asyncio.create_task(
+            run_admin_api(self.scheduler.engine)
+        )
+        self.admin_api_task.add_done_callback(
+            self._on_admin_api_task_done
+        )
+        self.logger.info(
+            "Admin API starting (ENABLE_ADMIN_API=true)."
+        )
+
+    @staticmethod
+    def _describe_admin_api_task_outcome(task: asyncio.Task) -> str:
+        """One-line description of a finished task's outcome, purely
+        for the restart log message in _start_admin_api() -- never
+        raises, and never the sole place an exception is retrieved
+        (see _on_admin_api_task_done(), which already called
+        task.exception() once; calling it again here is a safe,
+        repeatable read of already-stored state, not a second
+        retrieval with different effects).
+        """
+
+        if task.cancelled():
+            return "cancelled"
+
+        exc = task.exception()
+        if exc is not None:
+            return f"raised {exc!r}"
+
+        return "returned"
+
+    def _on_admin_api_task_done(self, task: asyncio.Task) -> None:
+        """Surfaces an unexpected admin API crash instead of losing it
+        silently. Without this, an exception raised inside
+        run_admin_api() (anything other than a deliberate cancel from
+        _stop_admin_api()) would only ever be visible via Python's
+        default "Task exception was never retrieved" warning at
+        garbage-collection time, if at all -- easy to miss, and gives
+        no indication the dashboard's admin API has gone dark while
+        the rest of the bot keeps running normally.
+        """
+
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(
+                "Admin API task terminated unexpectedly.",
+                exc_info=exc,
+            )
+
+    async def _stop_admin_api(self) -> None:
+        """Cancels the admin API task and waits for its own cleanup
+        (admin_api/server.py's run_admin_api() closes the listening
+        socket in a finally block) to finish -- a no-op if the admin
+        API was never started (ENABLE_ADMIN_API=false).
+        """
+
+        if self.admin_api_task is None:
+            return
+
+        self.admin_api_task.cancel()
+
+        try:
+            await self.admin_api_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Already surfaced by _on_admin_api_task_done(); avoid a
+            # second, redundant traceback during shutdown.
+            pass
+
+    # ==========================================================
     # Run
     # ==========================================================
 
@@ -422,11 +547,14 @@ class DiscordService:
         self.bot.run(DISCORD_TOKEN)
 
     async def shutdown(self) -> None:
-        """Gracefully stop scheduler and close the bot connection."""
+        """Gracefully stop the scheduler, admin API, and Discord connection."""
 
         try:
             # Stop the scheduler loop
             self.scheduler.stop()
+
+            # Stop the admin API, if it was started.
+            await self._stop_admin_api()
 
             # Close the Discord connection
             await self.bot.close()

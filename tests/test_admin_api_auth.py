@@ -92,3 +92,94 @@ def test_unset_admin_api_key_rejects_every_request(
             assert resp.status == 401
 
     asyncio.run(run())
+
+
+# ==========================================================
+# D.4/D.5/D.6/D.7 -- GET /health: the one deliberate, narrow exception
+# ==========================================================
+
+
+def test_health_returns_200_with_no_authorization_header_at_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _build_app(monkeypatch, tmp_path, api_key="test-secret")
+
+    async def run() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body == {"status": "ok"}
+
+    asyncio.run(run())
+
+
+def test_health_returns_200_even_when_admin_api_key_is_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Railway's liveness check must see the process as up even in a
+    misconfigured deploy (ADMIN_API_KEY forgotten) -- only the
+    authenticated surface should be locked out in that case, not the
+    liveness endpoint itself."""
+
+    app = _build_app(monkeypatch, tmp_path, api_key="")
+
+    async def run() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            assert resp.status == 200
+
+    asyncio.run(run())
+
+
+def test_health_bypass_is_get_only_post_health_still_requires_auth(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _build_app(monkeypatch, tmp_path, api_key="test-secret")
+
+    async def run() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/health")
+            assert resp.status == 401
+
+    asyncio.run(run())
+
+
+def test_authenticated_health_endpoint_still_requires_a_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The /health bypass must not leak onto /api/v1/health -- exact
+    path match only, never a prefix match."""
+
+    app = _build_app(monkeypatch, tmp_path, api_key="test-secret")
+
+    async def run() -> None:
+        async with TestClient(TestServer(app)) as client:
+            unauthenticated = await client.get("/api/v1/health")
+            assert unauthenticated.status == 401
+
+            authenticated = await client.get(
+                "/api/v1/health", headers={"Authorization": "Bearer test-secret"}
+            )
+            assert authenticated.status == 200
+            body = await authenticated.json()
+            assert "engine" in body and "info" in body
+
+    asyncio.run(run())
+
+
+def test_a_different_protected_endpoint_remains_protected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The /health exemption is scoped to that one path -- spot-check
+    an unrelated route to prove nothing else was accidentally
+    widened."""
+
+    app = _build_app(monkeypatch, tmp_path, api_key="test-secret")
+
+    async def run() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/knowledge")
+            assert resp.status == 401
+
+    asyncio.run(run())
