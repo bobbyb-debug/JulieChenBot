@@ -320,7 +320,7 @@ class HouseImageMonitor(Monitor):
                 source="HouseImage",
                 event_type=EventType.IMAGE_CHANGED,
                 title="HOUSE STATUS IMAGE UPDATED",
-                detail="JokersUpdates house-status image changed after episode air.",
+                detail="The latest House Status is in.",
                 severity=EventSeverity.NOTICE,
                 metadata=metadata,
             )
