@@ -14,7 +14,9 @@ command.
 
 Auth is handled entirely by admin_api/auth.py's middleware, applied to
 the whole application in admin_api/server.py -- no route here checks
-authorization itself.
+authorization itself. The one exception is GET /health just below,
+which the middleware explicitly exempts (see admin_api/auth.py) --
+everything else on this router requires a valid bearer token.
 """
 
 from __future__ import annotations
@@ -102,6 +104,26 @@ def _validate_line_numbers(body: dict) -> tuple[set[int] | None, str | None]:
     ):
         return None, "'line_numbers' must be a list of integers"
     return set(line_numbers), None
+
+
+# ==========================================================
+# Public liveness endpoint (Railway health check)
+# ==========================================================
+
+
+@routes.get("/health")
+async def liveness(request: web.Request) -> web.Response:
+    """Unauthenticated liveness check: "is the admin API process up
+    and serving requests." Deliberately returns nothing beyond a
+    static status -- no engine state, no game data, no knowledge, no
+    diagnostics, no secrets -- so it's safe to leave unauthenticated
+    (see the explicit, exact-path exemption in admin_api/auth.py).
+
+    The detailed, authenticated engine health lives at the existing
+    GET /api/v1/health below; this route is not a replacement for it.
+    """
+
+    return web.json_response({"status": "ok"})
 
 
 # ==========================================================
