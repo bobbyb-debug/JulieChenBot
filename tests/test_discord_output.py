@@ -89,7 +89,14 @@ def test_rss_update_routes_to_live_updates_by_channel_name(monkeypatch) -> None:
     assert "Joker's Updates" in embed.footer.text
 
 
-def test_house_event_routes_to_house_status_and_live_updates(monkeypatch) -> None:
+def test_house_state_event_routes_to_live_updates_only(monkeypatch) -> None:
+    """Structured game-state change events (HouseStatusMonitor,
+    CompetitionMonitor) are not House Status image events -- they must
+    reach #live-updates only, never #house-status. See _destinations()
+    in services/discord_output.py for the routing-regression fix this
+    guards against (HOH_CHANGED/COMPETITION_WINNER were previously
+    also posted to #house-status)."""
+
     monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
     monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
 
@@ -106,8 +113,107 @@ def test_house_event_routes_to_house_status_and_live_updates(monkeypatch) -> Non
         )
     )
 
-    assert len(house.messages) == 1
+    assert len(house.messages) == 0
     assert len(live.messages) == 1
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.HOUSE_STATUS_CHANGED,
+        EventType.HOH_CHANGED,
+        EventType.NOMINATIONS_CHANGED,
+        EventType.POV_CHANGED,
+        EventType.HAVE_NOTS_CHANGED,
+        EventType.FEEDS_UP,
+        EventType.FEEDS_DOWN,
+    ],
+)
+def test_every_structured_state_event_type_excludes_house_status(
+    event_type, monkeypatch
+) -> None:
+    """Every structured game-state change type -- not just HOH_CHANGED
+    -- must route to live-updates only. Direct assertion on the
+    routing table so a newly-added event type can't silently regress
+    back into #house-status."""
+
+    router = DiscordOutputRouter(bot=None)
+
+    destinations = router._destinations(make_event(event_type=event_type))
+    names = {name for _, name in destinations}
+
+    assert "house-status" not in names
+    assert names == {"live-updates"}
+
+
+def test_only_image_changed_still_routes_to_house_status() -> None:
+    """Direct assertion on the routing table: IMAGE_CHANGED is the
+    only event type that still targets #house-status."""
+
+    router = DiscordOutputRouter(bot=None)
+
+    destinations = router._destinations(
+        ProductionEvent(
+            source="HouseImage",
+            event_type=EventType.IMAGE_CHANGED,
+            title="HOUSE STATUS IMAGE UPDATED",
+            detail="changed",
+            severity=EventSeverity.NOTICE,
+        )
+    )
+    names = {name for _, name in destinations}
+
+    assert "house-status" in names
+
+
+def test_production_symptom_reproduction_hoh_and_competition_winner_never_reach_house_status(
+    monkeypatch,
+) -> None:
+    """Direct reproduction of the reported production symptom: a
+    'Head of Household Changed: Yash -> Kamu' event and a separate
+    'Competition Winner: Kamu' event must both reach #live-updates
+    only, never #house-status -- with a real IMAGE_CHANGED event
+    published in the same batch still correctly reaching
+    #house-status, proving the fix doesn't over-correct and starve
+    the channel entirely."""
+
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = FakeChannel(1, "house-status")
+    live = FakeChannel(2, "live-updates")
+    router = DiscordOutputRouter(FakeBot([house, live]))
+    monkeypatch.setattr(router, "_download", _stub_download)
+
+    hoh_event = ProductionEvent(
+        source="HouseStatus",
+        event_type=EventType.HOH_CHANGED,
+        title="Head of Household Changed",
+        detail="Yash → Kamu",
+        severity=EventSeverity.IMPORTANT,
+    )
+    competition_event = ProductionEvent(
+        source="Competition",
+        event_type=EventType.COMPETITION_WINNER,
+        title="Competition Winner",
+        detail="Kamu",
+    )
+    image_event = ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="JokersUpdates house-status image changed after episode air.",
+        severity=EventSeverity.NOTICE,
+        metadata={"url": "http://www.jokersupdates.com/x/house.png"},
+    )
+
+    asyncio.run(router.publish(hoh_event))
+    asyncio.run(router.publish(competition_event))
+    asyncio.run(router.publish(image_event))
+
+    assert len(house.messages) == 1  # only the image event
+    assert house.messages[0]["embed"].title == "🏠 HOUSE STATUS UPDATED"
+    assert len(live.messages) == 3  # all three events
 
 
 def test_duplicate_channel_configuration_only_sends_once(monkeypatch) -> None:
@@ -116,14 +222,9 @@ def test_duplicate_channel_configuration_only_sends_once(monkeypatch) -> None:
     that physical channel once, not twice -- and both destinations
     count as delivered, so the call succeeds without raising.
 
-    (This previously used HOUSE_STATUS_CHANNEL=0/LIVE_UPDATES_CHANNEL=0
-    with only a "live-updates"-named fake channel present, which
-    doesn't actually set up a shared-channel scenario at all -- house-
-    status was simply never resolvable. That incidentally relied on
-    the pre-fix bug this test file now guards against: an unresolvable
-    destination alongside a successful one used to be silently treated
-    as a full success. Fixed here to a real shared-ID scenario, which
-    is what "duplicate channel configuration" actually means.)
+    IMAGE_CHANGED is the only remaining event type routed to both
+    house-status and live-updates (see _destinations()), so it's the
+    one used here to exercise a genuine shared-channel scenario.
     """
 
     monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 42)
@@ -132,11 +233,21 @@ def test_duplicate_channel_configuration_only_sends_once(monkeypatch) -> None:
     channel = FakeChannel(42, "shared-channel")
     router = DiscordOutputRouter(FakeBot([channel]))
 
-    asyncio.run(
-        router.publish(
-            make_event(event_type=EventType.HOH_CHANGED)
-        )
+    event = ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="changed",
+        severity=EventSeverity.NOTICE,
+        metadata={"url": "http://www.jokersupdates.com/x/house.png"},
     )
+
+    async def failed_download(url):
+        return None
+
+    monkeypatch.setattr(router, "_download", failed_download)
+
+    asyncio.run(router.publish(event))
 
     assert len(channel.messages) == 1
 
@@ -383,9 +494,30 @@ def test_hamsterwatch_multi_day_updated_batch_uses_updated_recaps_wording(monkey
 
 def _multi_destination_event() -> ProductionEvent:
     """An event routed to two destinations (house-status,
-    live-updates) via HOH_CHANGED, matching real routing."""
+    live-updates). IMAGE_CHANGED is the only event type still routed
+    to both (see _destinations() in services/discord_output.py) --
+    structured game-state events like HOH_CHANGED route to
+    live-updates only, so they no longer exercise multi-destination
+    delivery tracking."""
 
-    return make_event(event_type=EventType.HOH_CHANGED, severity=EventSeverity.IMPORTANT)
+    return ProductionEvent(
+        source="HouseImage",
+        event_type=EventType.IMAGE_CHANGED,
+        title="HOUSE STATUS IMAGE UPDATED",
+        detail="changed",
+        severity=EventSeverity.NOTICE,
+        metadata={"url": "http://www.jokersupdates.com/x/house.png"},
+    )
+
+
+async def _stub_download(url: str) -> None:
+    """Deterministic no-network stand-in for these delivery-tracking
+    tests -- they exercise destination routing/retry semantics, not
+    image handling, so a real network call must never be involved.
+    Either outcome (hit or miss) still sends exactly one message per
+    destination attempt; returning None (a "miss") is simplest."""
+
+    return None
 
 
 def test_success_then_failure_retry_does_not_resend_succeeded_destination(monkeypatch) -> None:
@@ -399,6 +531,7 @@ def test_success_then_failure_retry_does_not_resend_succeeded_destination(monkey
     house = FakeChannel(1, "house-status")
     live = FlakyChannel(2, "live-updates", fail_times=1)
     router = DiscordOutputRouter(FakeBot([house, live]))
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -430,6 +563,7 @@ def test_failure_then_success_retry_does_not_resend_succeeded_destination(monkey
     house = FlakyChannel(1, "house-status", fail_times=1)
     live = FakeChannel(2, "live-updates")
     router = DiscordOutputRouter(FakeBot([house, live]))
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -460,6 +594,7 @@ def test_unresolvable_channel_stays_retryable_without_resending_successful_one(m
     house = FakeChannel(1, "house-status")
     # No "live-updates"-named channel exists yet -> unresolvable.
     router = DiscordOutputRouter(FakeBot([house]))
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -488,6 +623,7 @@ def test_all_destinations_fail_raises_and_marks_nothing_delivered(monkeypatch) -
     monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
 
     router = DiscordOutputRouter(FakeBot([]))  # nothing resolvable at all
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -507,6 +643,7 @@ def test_all_destinations_succeed_marks_all_delivered_without_raising(monkeypatc
     house = FakeChannel(1, "house-status")
     live = FakeChannel(2, "live-updates")
     router = DiscordOutputRouter(FakeBot([house, live]))
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -528,6 +665,7 @@ def test_no_duplicate_send_to_successful_destination_across_retry(monkeypatch) -
     house = FakeChannel(1, "house-status")
     live = FlakyChannel(2, "live-updates", fail_times=1)
     router = DiscordOutputRouter(FakeBot([house, live]))
+    monkeypatch.setattr(router, "_download", _stub_download)
 
     event = _multi_destination_event()
 
@@ -567,12 +705,15 @@ def _competition_event(event_type: EventType) -> ProductionEvent:
         EventType.COMPETITION_WINNER,
     ],
 )
-def test_competition_events_route_to_house_status_and_live_updates(
+def test_competition_events_route_to_live_updates_only(
     event_type, monkeypatch
 ) -> None:
-    """Competition events must reach the two real, deployed channels
-    -- never a "production" destination, which has never existed in
-    the deployed Discord server."""
+    """Competition events must reach live-updates -- never a
+    "production" destination (never existed in the deployed Discord
+    server), and never #house-status either: that channel is reserved
+    for the actual House Status image (IMAGE_CHANGED). This is the
+    routing-regression fix -- competition results (e.g. "Competition
+    Winner") were previously also posted to #house-status."""
 
     monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
     monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
@@ -583,14 +724,15 @@ def test_competition_events_route_to_house_status_and_live_updates(
 
     asyncio.run(router.publish(_competition_event(event_type)))  # must not raise
 
-    assert len(house.messages) == 1
+    assert len(house.messages) == 0
     assert len(live.messages) == 1
 
 
-def test_competition_event_destinations_never_include_production() -> None:
+def test_competition_event_destinations_never_include_production_or_house_status() -> None:
     """Direct assertion on the routing table itself: no destination
-    named "production" is ever computed for a competition event,
-    regardless of what a bot happens to have channels for."""
+    named "production" or "house-status" is ever computed for a
+    competition event, regardless of what a bot happens to have
+    channels for."""
 
     router = DiscordOutputRouter(bot=None)
 
@@ -603,7 +745,8 @@ def test_competition_event_destinations_never_include_production() -> None:
         destinations = router._destinations(_competition_event(event_type))
         names = {name for _, name in destinations}
         assert "production" not in names
-        assert names == {"house-status", "live-updates"}
+        assert "house-status" not in names
+        assert names == {"live-updates"}
 
 
 def test_competition_event_no_longer_permanently_blocks_the_announcement_queue(
@@ -636,7 +779,7 @@ def test_competition_event_no_longer_permanently_blocks_the_announcement_queue(
     asyncio.run(router.publish(later_event))  # never reached before the fix
 
     assert len(live.messages) == 2  # both events reached live-updates
-    assert len(house.messages) == 1  # only the competition event targets house-status
+    assert len(house.messages) == 0  # competition events do not target house-status
 
 
 # ==========================================================

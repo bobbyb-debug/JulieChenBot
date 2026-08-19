@@ -373,50 +373,65 @@ class DiscordOutputRouter:
     def _destinations(self, event: ProductionEvent) -> list[tuple[int, str]]:
         destinations: list[tuple[int, str]] = []
 
-        if event.event_type in {EventType.RSS_UPDATE, EventType.TIMELINE}:
+        if event.event_type == EventType.IMAGE_CHANGED:
+            # #house-status exists for exactly one thing: the actual
+            # Joker's Updates House Status image (production/
+            # house_image.py IMAGE_CHANGED, emitted only when the
+            # image content itself changes -- an unchanged/rotated-
+            # filename image never reaches here at all). No other
+            # event type belongs in this destination set -- see the
+            # branch below, and the routing-regression incident it
+            # fixes (structured game-state events were being posted
+            # to #house-status alongside the image).
+            destinations.extend([
+                (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
+                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
+            ])
+        elif event.event_type in {EventType.RSS_UPDATE, EventType.TIMELINE}:
             destinations.append(
                 (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"])
             )
         elif event.event_type in {
             EventType.HOUSE_STATUS_CHANGED,
-            EventType.IMAGE_CHANGED,
             EventType.HOH_CHANGED,
             EventType.NOMINATIONS_CHANGED,
             EventType.POV_CHANGED,
             EventType.HAVE_NOTS_CHANGED,
             EventType.FEEDS_UP,
             EventType.FEEDS_DOWN,
-        }:
-            destinations.extend([
-                (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
-                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
-            ])
-        elif event.event_type in {
             EventType.COMPETITION_STARTED,
             EventType.COMPETITION_FINISHED,
             EventType.COMPETITION_CHANGED,
             EventType.COMPETITION_WINNER,
         }:
-            # PRODUCTION_CHANNEL has no configured/deployed real
+            # Structured game-state change events (HouseStatusMonitor,
+            # CompetitionMonitor) -- these update Julie's internal
+            # tracked state and are announced to #live-updates, but
+            # they are NOT House Status image events and must never be
+            # routed to #house-status (that channel previously also
+            # received these, which is exactly the routing regression
+            # this branch fixes: e.g. "Head of Household Changed" and
+            # "Competition Winner" showing up in #house-status next to
+            # unrelated House Status image posts).
+            #
+            # PRODUCTION_CHANNEL still has no configured/deployed real
             # channel (there has never been a #production channel in
             # the Discord server -- see config.py, which gives
             # LIVE_UPDATES_CHANNEL and HOUSE_STATUS_CHANNEL real
             # hardcoded default IDs but leaves PRODUCTION_CHANNEL
-            # unset). Routing competition results there made every
-            # COMPETITION_* event permanently undeliverable to that
-            # destination, and because engine.announce() requeues a
+            # unset). Routing these there would make them permanently
+            # undeliverable, and because engine.announce() requeues a
             # failed event at the front of the queue and stops for
-            # that tick (see production/engine.py), a competition
-            # event became a permanent head-of-line block on every
-            # later event once A3 started persisting that queue across
-            # restarts. House-status is the real, deployed destination
-            # every other house-state-changing event type above
-            # already uses -- competition results are that same kind
-            # of event.
-            destinations.extend([
-                (HOUSE_STATUS_CHANNEL, self._CHANNEL_NAMES["house_status"]),
-                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"]),
-            ])
+            # that tick (see production/engine.py), that becomes a
+            # permanent head-of-line block on every later event once
+            # A3 started persisting that queue across restarts (the
+            # original incident this destination avoided) --
+            # live-updates is the one real, always-deliverable
+            # destination for these, so this can never reintroduce
+            # that failure mode.
+            destinations.append(
+                (LIVE_UPDATES_CHANNEL, self._CHANNEL_NAMES["live_updates"])
+            )
         else:
             destinations.append(
                 (PRODUCTION_CHANNEL, self._CHANNEL_NAMES["production"])

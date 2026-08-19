@@ -88,13 +88,19 @@ class FakeBot:
 
 def make_event(
     title: str = "Durability test",
-    event_type: EventType = EventType.HOH_CHANGED,
+    event_type: EventType = EventType.IMAGE_CHANGED,
     severity: EventSeverity = EventSeverity.IMPORTANT,
 ) -> ProductionEvent:
-    """HOH_CHANGED routes to two destinations (house-status,
-    live-updates) via DiscordOutputRouter -- see
-    services/discord_output.py _destinations() -- which is what makes
-    partial-delivery scenarios possible."""
+    """IMAGE_CHANGED is the only event type that routes to two
+    destinations (house-status, live-updates) via DiscordOutputRouter
+    -- see services/discord_output.py _destinations() -- which is
+    what makes partial-delivery scenarios possible. (Structured
+    game-state events like HOH_CHANGED route to live-updates only as
+    of the house-status routing fix; they no longer exercise
+    multi-destination durability.) metadata["url"] is required for
+    IMAGE_CHANGED's embed building, but _download() is stubbed for
+    this whole file (see _route_to_fake_channels below), so its value
+    is never actually fetched."""
 
     return ProductionEvent(
         source="DurabilityTest",
@@ -102,6 +108,7 @@ def make_event(
         title=title,
         detail="A durability regression event.",
         severity=severity,
+        metadata={"url": "http://example.test/house.png"},
     )
 
 
@@ -116,10 +123,22 @@ def wire_engine(storage: Storage, house: FakeChannel, live: FakeChannel) -> Prod
     return engine
 
 
+async def _stub_download(self, url: str, **kwargs):
+    """No-network stand-in for every DiscordOutputRouter instance in
+    this file -- these tests exercise durability/delivery-tracking
+    semantics, not image handling, so a real network call must never
+    be involved. A miss (None) still results in exactly one
+    channel.send() per destination attempt via the hotlink fallback,
+    which is all these tests depend on."""
+
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _route_to_fake_channels(monkeypatch):
     monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
     monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+    monkeypatch.setattr(DiscordOutputRouter, "_download", _stub_download)
 
 
 # ==========================================================

@@ -507,7 +507,7 @@ def test_competition_event_does_not_permanently_block_later_events(
     assert later_event.announced is True
     assert list(engine.pending_events) == []
     assert len(live.messages) == 2
-    assert len(house.messages) == 1
+    assert len(house.messages) == 0  # competition events do not target house-status
 
 
 def test_scheduler_retries_after_error_and_runs_until_stopped(
