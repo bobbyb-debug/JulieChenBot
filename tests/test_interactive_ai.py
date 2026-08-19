@@ -49,7 +49,7 @@ def test_includes_only_known_facts():
     assert "Morgan" in text
     assert "Ava" in text and "Jax" in text
     assert "Veto" not in text  # not set, must not appear
-    assert "don't know yet rather than guessing" in text
+    assert "UNVERIFIED" in text  # must never read as confirmed fact
 
 
 def test_veto_used_state_is_reflected():
@@ -637,7 +637,7 @@ def _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=None):
 def test_groq_messages_map_model_role_to_assistant():
     from services.ai_service import _to_groq_messages
 
-    history = [("user", "hi"), ("model", "hello")]
+    history = [("user", "hi", None), ("model", "hello", None)]
     messages = _to_groq_messages(history, "system prompt")
 
     assert messages[0] == {"role": "system", "content": "system prompt"}
@@ -645,14 +645,34 @@ def test_groq_messages_map_model_role_to_assistant():
     assert messages[2] == {"role": "assistant", "content": "hello"}
 
 
+def test_groq_messages_prefix_user_turns_with_author_name():
+    from services.ai_service import _to_groq_messages
+
+    history = [("user", "hi", "Bobby"), ("model", "hello", None)]
+    messages = _to_groq_messages(history, "system prompt")
+
+    assert messages[1] == {"role": "user", "content": "Bobby: hi"}
+    # Julie's own prior replies are never prefixed.
+    assert messages[2] == {"role": "assistant", "content": "hello"}
+
+
 def test_gemini_contents_preserve_roles():
     from services.ai_service import _to_gemini_contents
 
-    history = [("user", "hi"), ("model", "hello")]
+    history = [("user", "hi", None), ("model", "hello", None)]
     contents = _to_gemini_contents(history)
 
     assert contents[0].role == "user"
     assert contents[1].role == "model"
+
+
+def test_gemini_contents_prefix_user_turns_with_author_name():
+    from services.ai_service import _to_gemini_contents
+
+    history = [("user", "hi", "Bobby")]
+    contents = _to_gemini_contents(history)
+
+    assert contents[0].parts[0].text == "Bobby: hi"
 
 
 def test_groq_tried_first_gemini_untouched(monkeypatch, tmp_path):
@@ -736,8 +756,27 @@ def test_history_round_trips_regardless_of_which_provider_answered(
 
     history = ai_service._recent_history(6)
 
-    assert history[-2] == ("user", "hi Julie")
-    assert history[-1] == ("model", "Groq reply")
+    assert history[-2] == ("user", "hi Julie", None)
+    assert history[-1] == ("model", "Groq reply", None)
+
+
+def test_history_round_trips_with_author_identity(monkeypatch, tmp_path):
+    ai_service = _reset_ai_service_clients(
+        monkeypatch, tmp_path,
+        groq=FakeGroqClientSuccess("Groq reply"),
+        gemini=FakeGeminiClientFailure(),
+    )
+
+    asyncio.run(
+        ai_service.generate_julie_response(
+            8, "hi Julie", author_id=42, author_name="Bobby"
+        )
+    )
+
+    history = ai_service._recent_history(8)
+
+    assert history[-2] == ("user", "hi Julie", "Bobby")
+    assert history[-1] == ("model", "Groq reply", None)
 
 
 def test_recap_also_tries_groq_first(monkeypatch, tmp_path):

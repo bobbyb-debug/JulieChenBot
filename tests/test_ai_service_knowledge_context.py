@@ -243,19 +243,18 @@ def test_recap_prompt_does_not_require_a_fixed_opening_or_closing(
 # ==========================================================
 
 
-def test_stale_taught_fact_and_fresh_game_state_are_both_present_and_distinctly_labeled(
+def test_stale_taught_fact_and_fresh_live_feed_are_both_present_and_distinctly_labeled(
     monkeypatch, tmp_path
 ) -> None:
-    """Simulates the exact scenario: an administrator taught 'Barrett
-    is HoH' three weeks ago; the automated monitors have since
-    correctly detected a new HoH. Both pieces of information reach the
-    model -- this test proves the composed prompt keeps them in
-    clearly distinguished sections with different framing, rather than
-    silently dropping one or presenting them as equally-weighted,
-    unresolved statements. It does NOT assert that any code computed
+    """Simulates the exact scenario the production bug was built on:
+    an administrator taught 'Barrett is HoH' three weeks ago; the
+    automated, RSS-driven live feed has since reported a different
+    (unverified) name. Both pieces of information reach the model in
+    clearly distinguished, differently-framed sections -- but unlike
+    the old behavior, the taught fact is never told to defer to the
+    automated live feed. It does NOT assert that any code computed
     which one is "right" -- no timestamp comparison, no ranking, no
-    resolution logic exists or is expected here; that judgment is
-    deliberately left to the model, guided by the wording alone.
+    resolution logic exists or is expected here.
     """
 
     stale_fact = KnowledgeItem(
@@ -277,7 +276,9 @@ def test_stale_taught_fact_and_fresh_game_state_are_both_present_and_distinctly_
 
     knowledge = ai_service.format_learned_knowledge([permanent_rule, stale_fact])
 
-    fresh_house_status = HouseStatus(hoh="Yash")  # automated monitor's current answer
+    # An unverified automated live-feed observation, deliberately
+    # disagreeing with the taught fact above.
+    fresh_house_status = HouseStatus(hoh="Yash")
     fresh_competition = CompetitionState(
         competition=CompetitionType.HOH, winner="Yash"
     )
@@ -300,17 +301,125 @@ def test_stale_taught_fact_and_fresh_game_state_are_both_present_and_distinctly_
     assert "Head of Household: Yash" in content
 
     # They are in distinctly labeled sections, not merged into one
-    # undifferentiated block.
+    # undifferentiated block. The system-prompt guardrail mentions
+    # "LIVE FEED OBSERVATION" by name earlier on (see SYSTEM_INSTRUCTION),
+    # ahead of the knowledge section -- rindex() finds the actual
+    # formatted live-feed block, not that earlier mention.
     rules_index = content.index("PERMANENT RULES")
     facts_index = content.index("ADMINISTRATOR-MAINTAINED FACTS")
-    game_state_index = content.index("Current known Big Brother house state")
+    game_state_index = content.rindex("LIVE FEED OBSERVATION")
     assert rules_index < facts_index < game_state_index
 
-    # The rule is framed as permanent; the fact section (which is
-    # where the stale "Barrett is HoH" lives) is explicitly framed as
-    # capable of going stale and defers to newer automated state --
-    # this is the actual distinction being tested, expressed as
-    # prompt wording, not as any staleness-computing code.
+    # The rule is framed as permanent; the fact section (where the
+    # stale "Barrett is HoH" lives) is framed as capable of going
+    # stale -- but, unlike the old behavior, it must NEVER instruct
+    # the model to defer to the automated live feed. This is the
+    # literal fix for the reported Taylor/Yash production bug's root
+    # cause: the prompt itself used to tell the model to trust
+    # automation over a taught fact.
     facts_section = content[facts_index:game_state_index]
-    assert "outdated" in facts_section.lower()
-    assert "newer" in facts_section.lower()
+    assert "prefer it" not in facts_section.lower()
+    assert "never the unverified automated live feed" in facts_section.lower()
+    live_feed_section = content[game_state_index:]
+    assert "unverified" in live_feed_section.lower()
+
+
+# ==========================================================
+# format_official_state()
+# ==========================================================
+
+
+def test_format_official_state_empty_when_nothing_taught() -> None:
+    class _EmptyKnowledge:
+        def active_items(self):
+            return []
+
+    assert ai_service.format_official_state(_EmptyKnowledge()) == ""
+
+
+def test_format_official_state_lists_every_active_state_topic() -> None:
+    hoh = KnowledgeItem(
+        id=1, type=KnowledgeType.STATE, content="Yash", author_id=1,
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 1, tzinfo=UTC), topic="HOH",
+    )
+    evicted = KnowledgeItem(
+        id=2, type=KnowledgeType.STATE, content="Angela", author_id=1,
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 1, tzinfo=UTC), topic="EVICTED",
+    )
+    # A non-STATE item must never leak into the official-facts block.
+    unrelated_fact = KnowledgeItem(
+        id=3, type=KnowledgeType.FACT, content="Yash is funny.", author_id=1,
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    class _Knowledge:
+        def active_items(self):
+            return [hoh, evicted, unrelated_fact]
+
+    text = ai_service.format_official_state(_Knowledge())
+
+    assert "OFFICIAL GAME FACTS" in text
+    assert "Yash" in text
+    assert "Angela" in text
+    assert "Yash is funny." not in text  # FACT items are not official state
+
+
+def test_official_state_outranks_taught_facts_and_live_feed_in_prompt_order(
+    monkeypatch, tmp_path
+) -> None:
+    """Regression test for the reported Taylor/Yash bug at the prompt-
+    assembly level: official_state must appear ahead of both taught
+    knowledge and the live-feed observation in the composed system
+    instruction."""
+
+    official = ai_service.format_official_state(
+        SimpleNamespace(active_items=lambda: [
+            KnowledgeItem(
+                id=1, type=KnowledgeType.STATE, content="Yash", author_id=1,
+                created_at=datetime(2026, 8, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 8, 1, tzinfo=UTC), topic="HOH",
+            )
+        ])
+    )
+    game_state = ai_service.format_game_state(HouseStatus(hoh="Taylor"), CompetitionState())
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(
+            9, "who is HoH?", official_state=official, game_state=game_state
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert content.index("OFFICIAL GAME FACTS") < content.rindex("LIVE FEED OBSERVATION")
+
+
+# ==========================================================
+# format_long_term_memory()
+# ==========================================================
+
+
+def test_format_long_term_memory_empty_when_nothing_remembered() -> None:
+    assert ai_service.format_long_term_memory([]) == ""
+
+
+def test_format_long_term_memory_is_labeled_and_not_official(monkeypatch, tmp_path) -> None:
+    from production.memory import MemoryItem
+
+    item = MemoryItem(
+        id=1, channel_id=1, author_id=1, author_name="Bobby",
+        content="we call the Have-Not room the Slop Dungeon",
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    text = ai_service.format_long_term_memory([item])
+
+    assert "REMEMBERED CONTEXT" in text
+    assert "Slop Dungeon" in text
+    assert "NOT an official game fact" in text

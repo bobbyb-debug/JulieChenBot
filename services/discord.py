@@ -34,6 +34,8 @@ from services.scheduler import Scheduler
 from services.ai_service import (
     format_game_state,
     format_learned_knowledge,
+    format_long_term_memory,
+    format_official_state,
     generate_julie_response,
 )
 
@@ -109,6 +111,7 @@ class DiscordService:
         user_id: int,
         channel_id: int,
         user_text: str,
+        author_name: str | None = None,
     ) -> str:
         """Generates Julie's AI reply, applying cooldown and real game
         state context.
@@ -131,19 +134,26 @@ class DiscordService:
 
         self._ai_cooldowns[user_id] = time.monotonic()
 
-        house_status = self.scheduler.engine.watcher.house_status.current
-        competition = self.scheduler.engine.watcher.competition.current
+        engine = self.scheduler.engine
+        house_status = engine.watcher.house_status.current
+        competition = engine.watcher.competition.current
 
+        official_state = format_official_state(engine.knowledge)
         game_state = format_game_state(house_status, competition)
-        knowledge = format_learned_knowledge(
-            self.scheduler.engine.knowledge.active_items()
+        knowledge = format_learned_knowledge(engine.knowledge.active_items())
+        memory = format_long_term_memory(
+            engine.memory.recall(channel_id, user_text)
         )
 
         return await generate_julie_response(
             channel_id,
             user_text,
+            author_id=user_id,
+            author_name=author_name,
+            official_state=official_state,
             game_state=game_state,
             knowledge=knowledge,
+            memory=memory,
         )
 
     # ==========================================================
@@ -258,6 +268,10 @@ class DiscordService:
                             message.author.id,
                             message.channel.id,
                             clean_text,
+                            author_name=getattr(
+                                message.author, "display_name", None
+                            )
+                            or str(message.author),
                         )
                         await message.channel.send(ai_reply)
                     except Exception:

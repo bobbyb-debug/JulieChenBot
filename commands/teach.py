@@ -11,10 +11,12 @@ See production/knowledge.py for the persistence model (KnowledgeStore,
 backed by the existing Storage abstraction) and services/ai_service.py's
 format_learned_knowledge() for how this reaches the AI. This command
 family is a human-authoritative knowledge system, not a replacement
-for the automated production monitors -- it does not touch
-HouseStatusMonitor, CompetitionMonitor, or HouseImageMonitor except
-through the one explicit, narrow bridge in /teach update (see
-production/state_sync.py).
+for the automated production monitors -- it never touches
+HouseStatusMonitor, CompetitionMonitor, or HouseImageMonitor. /teach
+update writes official-facts STATE items to KnowledgeStore only (see
+production/state_sync.py for which topics have a comparable automated
+field, used for conflict detection); it does not and must not mutate
+HouseStatus, which stays exclusively the RSS pipeline's to write.
 
 Permissions -- two tiers, deliberately different mechanisms:
 
@@ -55,7 +57,7 @@ from production.batch_teach import (
 )
 from config import TRUSTED_MODERATOR_ROLE_ID
 from production.knowledge import KnowledgeItem, KnowledgeType
-from production.state_sync import apply_state_topic, is_recognized_topic
+from production.state_sync import is_recognized_topic
 from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("Teach")
@@ -365,19 +367,26 @@ def _state_update_preview_embed(plan: BatchPlan) -> discord.Embed:
 
 
 class _StateUpdateConfirmView(_BatchConfirmView):
-    """Like _BatchConfirmView, but on confirm also applies each
-    recognized STATE topic (see production/state_sync.py) to the
-    live HouseStatus object /hoh, /noms, /nominees, and /veto already
-    read -- not just KnowledgeStore. This is what makes a manual
-    /teach update take effect immediately, reusing the exact same
-    HouseStatus object and persistence path
-    (ProductionEngine._persist_game_state()) the RSS-driven pipeline
-    already uses -- there is no second, competing game-state store.
+    """Like _BatchConfirmView, but on confirm writes each line as an
+    official-facts STATE item in KnowledgeStore -- the sole
+    authoritative source /hoh, /noms, /nominees, and /veto read (see
+    commands/hoh.py, nominees.py, veto.py). This is what makes a
+    manual /teach update take effect immediately.
 
-    A topic with no HouseStatus mapping (see production/state_sync.py
-    RECOGNIZED_TOPICS) is still written as knowledge/audit history --
-    it simply doesn't change what /hoh etc. report, and the preview
-    embed says so up front (see _state_update_preview_embed()).
+    Deliberately does NOT touch HouseStatus (production/
+    house_status.py): that object is the automated, live-feed-driven
+    observation layer, updated only by production/engine.py's RSS
+    pipeline. Keeping this write path from ever touching it is the
+    whole point -- an automated parse must never be able to silently
+    overwrite what a moderator just confirmed here, and a moderator's
+    confirmed update must never be silently overwritten by the next
+    automated parse either.
+
+    A topic with no comparable HouseStatus field (see production/
+    state_sync.py RECOGNIZED_TOPICS) is still written as an official
+    fact the same way -- it simply has nothing to be diffed against
+    for conflict detection, and the preview embed says so up front
+    (see _state_update_preview_embed()).
     """
 
     _NOUN = "Update"
@@ -396,22 +405,15 @@ class _StateUpdateConfirmView(_BatchConfirmView):
 
         written = apply_plan(self.plan, self.knowledge, self.author_id)
 
-        house_status_monitor = self.engine.watcher.house_status
-        applied_topics: list[str] = []
-
-        for item in written:
-            if item.topic and is_recognized_topic(item.topic):
-                house_status_monitor.current = apply_state_topic(
-                    item.topic, item.content, house_status_monitor.current
-                )
-                applied_topics.append(item.topic)
-
-        if applied_topics:
-            self.engine._persist_game_state()
+        applied_topics = [
+            item.topic
+            for item in written
+            if item.topic and is_recognized_topic(item.topic)
+        ]
 
         logger.info(
-            "/teach update confirmed by %s: %d item(s) written, live state "
-            "applied for: %s",
+            "/teach update confirmed by %s: %d item(s) written, official "
+            "state changed for: %s",
             self.requester_id,
             len(written),
             applied_topics,
@@ -419,7 +421,7 @@ class _StateUpdateConfirmView(_BatchConfirmView):
 
         summary = f"✅ Updated {len(written)} item(s)."
         if applied_topics:
-            summary += f" Live state changed: {', '.join(applied_topics)}."
+            summary += f" Official state changed: {', '.join(applied_topics)}."
 
         await self._finish(interaction, summary)
 

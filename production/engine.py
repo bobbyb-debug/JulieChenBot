@@ -24,6 +24,7 @@ from production.events import EventSeverity, EventType, ProductionEvent
 from production.house_status import HouseStatus
 from production.imgur import ImgurResolver
 from production.knowledge import KnowledgeStore
+from production.memory import MemoryStore
 from production.monitors import MonitorResult, MonitorStatus
 from production.parser import ProductionParser
 from production.rss import FeedUpdate, JokersRSS
@@ -83,6 +84,12 @@ class ProductionEngine:
         # command mutates it, and KnowledgeStore persists immediately
         # on every mutation rather than waiting for a production cycle.
         self.knowledge = KnowledgeStore(storage=self.storage)
+
+        # Explicit long-term conversational memory (see production/
+        # memory.py) -- deliberately separate from KnowledgeStore
+        # above: a /remember entry is never an official game fact and
+        # must never be conflated with one.
+        self.memory = MemoryStore(storage=self.storage)
 
         # ProductionParser and HouseStatusMonitor/CompetitionMonitor all
         # start with blank in-memory state and have no persistence of

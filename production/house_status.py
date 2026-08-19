@@ -228,9 +228,14 @@ class HouseStatusMonitor(Monitor):
 
                     event_type=EventType.HOH_CHANGED,
 
-                    title="Head of Household Changed",
+                    title="Live Feed: Possible HOH Change",
 
-                    detail=f"{self.current.hoh} → {new.hoh}",
+                    detail=(
+                        f"Live feed suggests HOH may now be {new.hoh} "
+                        f"(previously tracked: {self.current.hoh or 'none'}). "
+                        "Unconfirmed -- not yet reflected in official state; "
+                        "an admin can confirm via the dashboard."
+                    ),
 
                     severity=EventSeverity.IMPORTANT,
 
@@ -252,9 +257,14 @@ class HouseStatusMonitor(Monitor):
 
                     event_type=EventType.NOMINATIONS_CHANGED,
 
-                    title="Nominations Changed",
+                    title="Live Feed: Possible Nomination Change",
 
-                    detail=", ".join(new.nominees),
+                    detail=(
+                        "Live feed suggests nominees may now be: "
+                        f"{', '.join(new.nominees) or 'none'}. Unconfirmed "
+                        "-- not yet reflected in official state; an admin "
+                        "can confirm via the dashboard."
+                    ),
 
                 )
 
@@ -274,9 +284,14 @@ class HouseStatusMonitor(Monitor):
 
                     event_type=EventType.POV_CHANGED,
 
-                    title="Power of Veto Updated",
+                    title="Live Feed: Possible Veto Change",
 
-                    detail=new.veto_holder,
+                    detail=(
+                        f"Live feed suggests the Power of Veto may now be "
+                        f"held by {new.veto_holder or 'no one'}. Unconfirmed "
+                        "-- not yet reflected in official state; an admin "
+                        "can confirm via the dashboard."
+                    ),
 
                 )
 

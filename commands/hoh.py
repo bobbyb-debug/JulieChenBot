@@ -2,7 +2,12 @@
 Julie ChenBot HOH Command
 ==========================
 
-Shows the current Head of Household, from tracked house status.
+Shows the current Head of Household, from the official facts record
+(KnowledgeStore STATE topic "HOH" -- see production/knowledge.py),
+set only via /teach update or the admin dashboard. Deliberately does
+NOT read the automated, live-feed-driven HouseStatus (production/
+house_status.py) -- that value is an unverified observation, never
+treated as confirmed fact by any Discord command.
 """
 
 from __future__ import annotations
@@ -23,14 +28,14 @@ def register(discord_service) -> None:
     )
     async def hoh(interaction: discord.Interaction):
 
-        status = discord_service.scheduler.engine.watcher.house_status.current
+        official = discord_service.scheduler.engine.knowledge.active_state("HOH")
 
-        if not status.hoh:
+        if official is None or not official.content.strip():
             message = (
                 "👑 No Head of Household has been confirmed yet this cycle."
             )
         else:
-            message = f"👑 **{status.hoh}** is the current Head of Household."
+            message = f"👑 **{official.content}** is the current Head of Household."
 
         await interaction.response.send_message(message)
 
