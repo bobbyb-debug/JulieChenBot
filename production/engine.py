@@ -16,7 +16,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Optional
 
-from config import BOT_NAME, BUILD, PHASE, VERSION
+from config import BOT_NAME, BUILD, ENABLE_ADMIN_API, PHASE, VERSION
 from database.storage import Storage
 from production.announcer import ProductionAnnouncer
 from production.competition import CompetitionState
@@ -52,6 +52,14 @@ class ProductionEngine:
     # queued." Capped well above any realistic single-day volume so it
     # stays a bounded, cheap read/write against the same JSON Storage
     # every other durable key already uses -- no new database.
+    #
+    # _record_event_log() itself is only ever called when
+    # config.ENABLE_ADMIN_API is true (see announce() below) -- with
+    # the admin API off (the default), this key is never written and
+    # Julie's production behavior is byte-for-byte what it was before
+    # this feature existed: no extra storage.json write per delivered
+    # event, and no extra failure surface in announce()'s per-event
+    # try/except.
     EVENT_LOG_KEY = "event_log"
     EVENT_LOG_LIMIT = 200
 
@@ -458,7 +466,15 @@ class ProductionEngine:
                     await self.announcer.announce(event)
                     event.mark_announced()
                     self._record_recap(event)
-                    self._record_event_log(event)
+                    # Feature-gated: the admin dashboard is the only
+                    # consumer of this log (see admin_api/), and it
+                    # can only ever be reachable when the admin API
+                    # itself is enabled (see services/discord.py). No
+                    # storage write happens here at all otherwise --
+                    # production behavior is unchanged when this
+                    # feature is off.
+                    if ENABLE_ADMIN_API:
+                        self._record_event_log(event)
                 except Exception:
                     self.pending_events.appendleft(event)
                     self.logger.exception("Announcement failed.")
@@ -563,6 +579,10 @@ class ProductionEngine:
         called after announcer.announce() succeeds (see announce()
         above), so this is genuinely "what was delivered," not "what
         was attempted."
+
+        Only ever called when config.ENABLE_ADMIN_API is true -- see
+        the call site in announce(). Not re-checked here as a second
+        guard: announce() is this method's one and only caller.
         """
 
         log = list(self.storage.get(self.EVENT_LOG_KEY, []))
