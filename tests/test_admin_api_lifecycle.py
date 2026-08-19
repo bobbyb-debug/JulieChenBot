@@ -91,6 +91,19 @@ async def _let_task_run() -> None:
         await asyncio.sleep(0)
 
 
+async def _wait_until_done(task: asyncio.Task) -> None:
+    """Polls until `task` is done, then yields one more tick so any
+    add_done_callback() (scheduled via call_soon() when the task
+    completes, not invoked synchronously) actually gets to run before
+    the caller inspects its side effects."""
+
+    for _ in range(20):
+        if task.done():
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+
+
 # ==========================================================
 # D.1 / D.8 -- task reference retained, and only when enabled
 # ==========================================================
@@ -201,3 +214,182 @@ def test_a_deliberate_cancellation_is_not_logged_as_an_error(monkeypatch) -> Non
     asyncio.run(scenario())
 
     assert ds.logger.errors == []
+
+
+# ==========================================================
+# _start_admin_api() idempotency -- a Discord reconnect re-firing
+# on_ready() (documented as possible elsewhere in this file/module)
+# must never spin up a second admin API task/server on top of one
+# that's still alive, which would just fail to bind the already-taken
+# port.
+# ==========================================================
+
+
+def test_first_call_creates_exactly_one_task(monkeypatch) -> None:
+    fake = _FakeAdminApi()
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", True)
+    monkeypatch.setattr("services.discord.run_admin_api", fake.run)
+    ds = _bare_discord_service()
+
+    async def scenario() -> None:
+        ds._start_admin_api()
+        assert ds.admin_api_task is not None
+        assert not ds.admin_api_task.done()
+        await ds._stop_admin_api()
+
+    asyncio.run(scenario())
+
+
+def test_second_call_while_first_task_is_alive_creates_no_second_task(
+    monkeypatch,
+) -> None:
+    """The regression this whole section guards against: on_ready()
+    firing twice (a reconnect) while the admin API is already up
+    must not attempt to bind the port a second time."""
+
+    starts = []
+
+    class _CountingAdminApi(_FakeAdminApi):
+        async def run(self, engine, *, port: int | None = None) -> None:
+            starts.append(1)
+            await super().run(engine, port=port)
+
+    fake = _CountingAdminApi()
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", True)
+    monkeypatch.setattr("services.discord.run_admin_api", fake.run)
+    ds = _bare_discord_service()
+
+    async def scenario() -> None:
+        ds._start_admin_api()
+        await _let_task_run()
+        first_task = ds.admin_api_task
+        assert first_task is not None
+        assert not first_task.done()
+
+        # Simulate on_ready() firing again (a Discord reconnect).
+        ds._start_admin_api()
+        await _let_task_run()
+
+        # No second task/server: the original task is still exactly
+        # the one in use, and run_admin_api() was only ever entered
+        # once.
+        assert ds.admin_api_task is first_task
+        assert len(starts) == 1
+
+        await ds._stop_admin_api()
+
+    asyncio.run(scenario())
+
+
+def test_second_call_while_running_logs_info_and_does_not_touch_task(
+    monkeypatch,
+) -> None:
+    fake = _FakeAdminApi()
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", True)
+    monkeypatch.setattr("services.discord.run_admin_api", fake.run)
+    ds = _bare_discord_service()
+
+    async def scenario() -> None:
+        ds._start_admin_api()
+        await _let_task_run()
+        ds.logger.infos.clear()
+
+        ds._start_admin_api()
+
+        assert any(
+            "already running" in str(args[0])
+            for args, _kwargs in ds.logger.infos
+        )
+        await ds._stop_admin_api()
+
+    asyncio.run(scenario())
+
+
+def test_restart_after_unexpected_termination_creates_a_new_task(
+    monkeypatch,
+) -> None:
+    """A task that died unexpectedly must not permanently block the
+    admin API for the rest of the process's life -- the next
+    on_ready() (reconnect) should be able to bring it back up.
+    Nothing about the original crash is hidden: it was already
+    retrieved and logged by _on_admin_api_task_done() when the first
+    task finished."""
+
+    crashing = _FakeAdminApi(raise_after_start=RuntimeError("boom"))
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", True)
+    monkeypatch.setattr("services.discord.run_admin_api", crashing.run)
+    ds = _bare_discord_service()
+
+    async def scenario() -> None:
+        ds._start_admin_api()
+        await _wait_until_done(ds.admin_api_task)
+        assert ds.admin_api_task.done()
+        assert len(ds.logger.errors) == 1  # the original crash, logged once
+        dead_task = ds.admin_api_task
+
+        healthy = _FakeAdminApi()
+        monkeypatch.setattr("services.discord.run_admin_api", healthy.run)
+
+        ds._start_admin_api()
+        await _let_task_run()
+
+        assert ds.admin_api_task is not dead_task
+        assert not ds.admin_api_task.done()
+        assert healthy.started is True
+        # The original crash is still the only thing ever logged as
+        # an error -- restarting itself is not an error.
+        assert len(ds.logger.errors) == 1
+
+        await ds._stop_admin_api()
+
+    asyncio.run(scenario())
+
+
+def test_restart_after_clean_return_creates_a_new_task(monkeypatch) -> None:
+    """A task that simply returned early (e.g. the real
+    run_admin_api()'s missing-ADMIN_API_KEY guard) is done but never
+    raised -- restarting must work for this case too, not just the
+    exception case."""
+
+    class _ReturnsImmediately:
+        async def run(self, engine, *, port: int | None = None) -> None:
+            return
+
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", True)
+    monkeypatch.setattr(
+        "services.discord.run_admin_api", _ReturnsImmediately().run
+    )
+    ds = _bare_discord_service()
+
+    async def scenario() -> None:
+        ds._start_admin_api()
+        await _wait_until_done(ds.admin_api_task)
+        assert ds.admin_api_task.done()
+        assert ds.logger.errors == []  # a clean return is not a crash
+        first_task = ds.admin_api_task
+
+        healthy = _FakeAdminApi()
+        monkeypatch.setattr("services.discord.run_admin_api", healthy.run)
+
+        ds._start_admin_api()
+        await _let_task_run()
+
+        assert ds.admin_api_task is not first_task
+        assert not ds.admin_api_task.done()
+
+        await ds._stop_admin_api()
+
+    asyncio.run(scenario())
+
+
+def test_disabled_admin_api_creates_no_task_even_when_called_repeatedly(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("services.discord.ENABLE_ADMIN_API", False)
+    ds = _bare_discord_service()
+
+    ds._start_admin_api()
+    ds._start_admin_api()
+    ds._start_admin_api()
+
+    assert ds.admin_api_task is None

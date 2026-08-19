@@ -414,6 +414,26 @@ class DiscordService:
         matching cancellation. A no-op, leaving admin_api_task None,
         when ENABLE_ADMIN_API is false: the admin API stays completely
         disabled, exactly as before.
+
+        Idempotent: on_ready() is not guaranteed to fire only once
+        per process (Discord's own documented behavior -- see the
+        note on _commands_loaded above), so a reconnect calling this
+        again must never spin up a second task/server on top of one
+        that's still alive, which would just fail to bind the
+        already-taken port. Three states, handled explicitly:
+
+          - never started (admin_api_task is None): start it.
+          - already running (task exists and not done()): leave it
+            alone -- do not create a second task or server.
+          - previously started but no longer running (task exists
+            and done() -- cancelled, crashed, or returned early e.g.
+            a missing ADMIN_API_KEY): safe, and desirable, to start a
+            fresh one, so a task that died unexpectedly can recover
+            on the next reconnect rather than leaving the admin API
+            dark for the rest of the process's life. Any exception
+            from the finished task was already retrieved and logged
+            by _on_admin_api_task_done() when it completed -- nothing
+            is hidden by restarting here.
         """
 
         if not ENABLE_ADMIN_API:
@@ -421,6 +441,20 @@ class DiscordService:
                 "Admin API disabled (ENABLE_ADMIN_API=false)."
             )
             return
+
+        if self.admin_api_task is not None:
+            if not self.admin_api_task.done():
+                self.logger.info(
+                    "Admin API already running; not starting a "
+                    "second instance."
+                )
+                return
+
+            self.logger.info(
+                "Previous admin API task is no longer running (%s); "
+                "starting a new one.",
+                self._describe_admin_api_task_outcome(self.admin_api_task),
+            )
 
         self.admin_api_task = asyncio.create_task(
             run_admin_api(self.scheduler.engine)
@@ -431,6 +465,26 @@ class DiscordService:
         self.logger.info(
             "Admin API starting (ENABLE_ADMIN_API=true)."
         )
+
+    @staticmethod
+    def _describe_admin_api_task_outcome(task: asyncio.Task) -> str:
+        """One-line description of a finished task's outcome, purely
+        for the restart log message in _start_admin_api() -- never
+        raises, and never the sole place an exception is retrieved
+        (see _on_admin_api_task_done(), which already called
+        task.exception() once; calling it again here is a safe,
+        repeatable read of already-stored state, not a second
+        retrieval with different effects).
+        """
+
+        if task.cancelled():
+            return "cancelled"
+
+        exc = task.exception()
+        if exc is not None:
+            return f"raised {exc!r}"
+
+        return "returned"
 
     def _on_admin_api_task_done(self, task: asyncio.Task) -> None:
         """Surfaces an unexpected admin API crash instead of losing it
