@@ -21,9 +21,11 @@ import time
 import discord
 from discord.ext import commands
 
+from admin_api.server import run_admin_api
 from config import (
     BOT_NAME,
     DISCORD_TOKEN,
+    ENABLE_ADMIN_API,
     ENABLE_SCHEDULER,
     LIVE_UPDATES_CHANNEL,
 )
@@ -187,6 +189,18 @@ class DiscordService:
             else:
                 self.logger.info(
                     "Production Scheduler disabled (ENABLE_SCHEDULER=false)."
+                )
+
+            if ENABLE_ADMIN_API:
+                asyncio.create_task(
+                    run_admin_api(self.scheduler.engine)
+                )
+                self.logger.info(
+                    "Admin API starting (ENABLE_ADMIN_API=true)."
+                )
+            else:
+                self.logger.info(
+                    "Admin API disabled (ENABLE_ADMIN_API=false)."
                 )
 
             print()

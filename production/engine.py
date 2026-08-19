@@ -44,6 +44,16 @@ class ProductionEngine:
     RECAP_WINDOW_HOURS = 24
     PENDING_EVENTS_KEY = "pending_events"
     GAME_STATE_KEY = "game_state"
+    # Durable rolling log of *delivered* events (see _record_event_log()
+    # below) -- distinct from pending_events, which only ever holds
+    # events not yet (fully) delivered. Added for the admin dashboard's
+    # Activity/Diagnostics/Event Trace views (see admin_api/), which
+    # need "what actually happened recently," not just "what's still
+    # queued." Capped well above any realistic single-day volume so it
+    # stays a bounded, cheap read/write against the same JSON Storage
+    # every other durable key already uses -- no new database.
+    EVENT_LOG_KEY = "event_log"
+    EVENT_LOG_LIMIT = 200
 
     def __init__(self, storage: Optional[Storage] = None) -> None:
         self.logger = ProductionLogger.get("Engine")
@@ -448,6 +458,7 @@ class ProductionEngine:
                     await self.announcer.announce(event)
                     event.mark_announced()
                     self._record_recap(event)
+                    self._record_event_log(event)
                 except Exception:
                     self.pending_events.appendleft(event)
                     self.logger.exception("Announcement failed.")
@@ -540,6 +551,50 @@ class ProductionEngine:
             recent.append(detail)
 
         return list(dict.fromkeys(recent))
+
+    def _record_event_log(self, event: ProductionEvent) -> None:
+        """Appends one successfully-announced event to the durable
+        activity log (EVENT_LOG_KEY), for the admin dashboard's
+        Activity/Diagnostics/Event Trace views.
+
+        Unlike _record_recap() (RSS_UPDATE only, plain detail text),
+        every event type is recorded here with enough structure to
+        show source -> event type -> destination -> outcome. Only
+        called after announcer.announce() succeeds (see announce()
+        above), so this is genuinely "what was delivered," not "what
+        was attempted."
+        """
+
+        log = list(self.storage.get(self.EVENT_LOG_KEY, []))
+        log.append(
+            {
+                "event_type": event.event_type.value,
+                "source": event.source,
+                "title": event.title,
+                "detail": event.detail,
+                "severity": event.severity.value,
+                "created_at": event.created_at.isoformat(),
+                "delivered_to": sorted(event.delivered_to),
+            }
+        )
+
+        if len(log) > self.EVENT_LOG_LIMIT:
+            log = log[-self.EVENT_LOG_LIMIT:]
+
+        self.storage.set(self.EVENT_LOG_KEY, log)
+
+    def recent_events(self, limit: int = 50) -> list[dict]:
+        """Returns the most recent delivered events, newest first.
+
+        Read-only, defensive against a hand-edited/corrupted log entry
+        (skipped, never allowed to break the whole response) -- same
+        posture as every other _load()-style reader in this codebase.
+        """
+
+        log = list(self.storage.get(self.EVENT_LOG_KEY, []))
+
+        valid = [entry for entry in log if isinstance(entry, dict)]
+        return list(reversed(valid))[:limit]
 
     async def save_state(self) -> None:
         """Persists the storage state used by monitors."""

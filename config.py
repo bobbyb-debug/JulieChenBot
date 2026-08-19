@@ -126,6 +126,26 @@ PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 TRUSTED_MODERATOR_ROLE_ID = env_int("TRUSTED_MODERATOR_ROLE_ID")
 
 # ==========================================================
+# Admin API (dashboard integration)
+# ==========================================================
+
+# Narrow, authenticated HTTP surface consumed only by the separate
+# Julie ChenBot Admin Dashboard (bobbyb-debug/julie-chenbot-admin-
+# dashboard) -- never by end users, never by Discord itself. Off by
+# default, same posture as ENABLE_SCHEDULER: nothing about this
+# process's behavior changes unless a deployer opts in explicitly.
+# See admin_api/ for the implementation.
+ENABLE_ADMIN_API = env_flag("ENABLE_ADMIN_API", default=False)
+
+ADMIN_API_PORT = env_int("ADMIN_API_PORT", 8080)
+
+# Bearer token every admin API request must present (Authorization:
+# Bearer <token>). Required whenever ENABLE_ADMIN_API is on -- see
+# admin_api/auth.py, which refuses to start the server with this
+# unset. Never logged, never echoed back in any response.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# ==========================================================
 # JokersUpdates
 # ==========================================================
 
