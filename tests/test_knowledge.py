@@ -164,6 +164,149 @@ def test_forget_is_idempotent_and_safe_for_unknown_ids(
 
 
 # ==========================================================
+# Reactivation: reverses forget() IN PLACE, never a duplicate
+# ==========================================================
+
+
+def test_reactivate_restores_a_forgotten_item(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.FACT, "Yash is strong.", author_id=1)
+    store.forget(item.id)
+
+    restored = store.reactivate(item.id)
+
+    assert restored is True
+    assert store.get(item.id).active is True
+
+
+def test_reactivate_preserves_id_content_author_and_created_at(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The whole point: reactivation must never create a new item or
+    lose provenance -- same id, content, author, created_at."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.FACT, "Yash is strong.", author_id=42)
+    original_id = item.id
+    original_content = item.content
+    original_author = item.author_id
+    original_created_at = item.created_at
+
+    store.forget(original_id)
+    store.reactivate(original_id)
+
+    restored = store.get(original_id)
+    assert restored.id == original_id
+    assert restored.content == original_content
+    assert restored.author_id == original_author
+    assert restored.created_at == original_created_at
+    assert len(store.all_items()) == 1  # no duplicate was created
+
+
+def test_reactivate_advances_updated_at(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.FACT, "x", author_id=1)
+    store.forget(item.id)
+    forgotten_updated_at = store.get(item.id).updated_at
+
+    store.reactivate(item.id)
+
+    assert store.get(item.id).updated_at >= forgotten_updated_at
+
+
+def test_reactivate_is_idempotent_and_safe_for_unknown_ids(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.FACT, "x", author_id=1)
+
+    assert store.reactivate(item.id) is False  # already active
+    assert store.reactivate(99999) is False  # never existed
+
+    store.forget(item.id)
+    assert store.reactivate(item.id) is True
+    assert store.reactivate(item.id) is False  # already reactivated
+
+
+def test_reactivated_item_reappears_in_active_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.FACT, "x", author_id=1)
+    store.forget(item.id)
+    assert not any(i.id == item.id for i in store.active_items())
+
+    store.reactivate(item.id)
+    assert any(i.id == item.id for i in store.active_items())
+
+
+def test_reactivate_persists_immediately(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    storage = Storage()
+    store = KnowledgeStore(storage=storage)
+
+    item = store.teach(KnowledgeType.FACT, "x", author_id=1)
+    store.forget(item.id)
+    store.reactivate(item.id)
+
+    reloaded = KnowledgeStore(storage=storage)
+    assert reloaded.get(item.id).active is True
+
+
+def test_reactivating_a_state_item_supersedes_the_active_one_for_topic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Reactivating an old STATE item must never produce two active
+    STATE items for the same topic -- that would break active_state()'s
+    "there is never more than one" guarantee every command and the AI
+    chat context rely on."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    old = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    new = store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+    assert old.active is False  # auto-superseded by the new write
+    assert store.active_state("HOH").id == new.id
+
+    store.reactivate(old.id)
+
+    # Reactivating the old value must supersede the currently-active
+    # one, not create a second active STATE item for the same topic.
+    assert store.get(old.id).active is True
+    assert store.get(new.id).active is False
+    assert store.active_state("HOH").id == old.id
+    assert store.active_state("HOH").content == "Yash"
+
+
+def test_reactivating_a_state_item_with_no_current_active_state_is_simple(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    store = KnowledgeStore(storage=Storage())
+
+    item = store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+    store.forget(item.id)
+    assert store.active_state("HOH") is None
+
+    store.reactivate(item.id)
+
+    assert store.active_state("HOH").id == item.id
+
+
+# ==========================================================
 # Persistence: survives restart/reload
 # ==========================================================
 

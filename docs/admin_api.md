@@ -44,12 +44,22 @@ could already perform via `/teach`:
 - `production/batch_teach.py` `parse_batch()` / `parse_state_updates()`
   / `build_plan()` / `apply_plan()` — the exact plan-then-apply flow
   behind `/teach batch` and `/teach update`
-- `production/state_sync.py` `apply_state_topic()` — the same bridge
-  that keeps `/hoh`, `/noms`, `/veto` in sync with a manual update
 
 No route invents new business logic; `admin_api/routes.py` only
 parses the HTTP request, calls the existing function, and serializes
 the result.
+
+One exception: `POST /knowledge/{id}/reactivate` has no `/teach`
+equivalent on Discord today — it reverses a previous `/forget`,
+in place, for the dashboard's Knowledge Center. See
+`production/knowledge.py` `KnowledgeStore.reactivate()`, built the
+same soft/idempotent/in-place way `.forget()` already is.
+
+Since the official-facts architecture change (see
+`docs/official-facts-architecture.md`), `/teach update` and
+`POST /state/apply` write only to `KnowledgeStore` — neither touches
+the automated, RSS-driven `HouseStatus` object `/hoh`, `/nominees`,
+and `/veto` no longer read.
 
 ## Endpoints
 
@@ -64,11 +74,12 @@ All under `/api/v1`, all requiring the bearer token.
 | GET | `/knowledge/{id}` | one item |
 | POST | `/knowledge` | teach FACT/RULE/CORRECTION/STATE |
 | POST | `/knowledge/{id}/forget` | deactivate (soft delete) |
+| POST | `/knowledge/{id}/reactivate` | reverse a previous forget, in place (no `/teach` equivalent) |
 | GET | `/state/{topic}/why` | provenance: current value, taught history, related facts |
 | POST | `/batch/plan` | preview a `FACT:`/`RULE:`/`STATE:` batch — zero writes |
 | POST | `/batch/apply` | write selected lines from a previewed batch |
 | POST | `/state/plan` | preview a `TOPIC: value` state update — zero writes |
-| POST | `/state/apply` | write selected lines, syncing live HouseStatus |
+| POST | `/state/apply` | write selected STATE lines as official facts (KnowledgeStore only — never touches live HouseStatus) |
 | GET | `/sources` | RSS/House Image/Competition/Hamsterwatch status |
 | GET | `/events` | recent *delivered* events (`?limit=`) |
 | GET | `/events/pending` | events queued but not yet delivered |

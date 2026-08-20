@@ -3,14 +3,21 @@ Julie ChenBot Admin API Routes
 ================================
 
 Every route here mirrors an existing, already-tested operation --
-KnowledgeStore.teach()/forget() (production/knowledge.py), and the
-same batch/state-update plan-then-apply flow (production/batch_teach.py,
-production/state_sync.py) that already backs /teach batch and /teach
-update (commands/teach.py) -- rather than inventing new business
-logic. This module's job is strictly: parse the HTTP request, call the
-existing function, serialize the result. No route here writes anything
-a trusted moderator/administrator couldn't already write via a slash
-command.
+KnowledgeStore.teach()/forget()/reactivate() (production/knowledge.py),
+and the same batch/state-update plan-then-apply flow (production/
+batch_teach.py, production/state_sync.py) that already backs /teach
+batch and /teach update (commands/teach.py) -- rather than inventing
+new business logic. This module's job is strictly: parse the HTTP
+request, call the existing function, serialize the result.
+
+The one exception: POST /knowledge/{id}/reactivate has no Discord
+slash-command equivalent today (there is no /teach reactivate) -- it
+exists to support the dashboard's Knowledge Center reactivation
+control, added because reversing a /forget was previously impossible
+through any surface. It calls KnowledgeStore.reactivate(), which is
+built the same way forget() already is (soft, idempotent, in-place --
+see that method's docstring), so this is a small, symmetric addition,
+not new business logic.
 
 Auth is handled entirely by admin_api/auth.py's middleware, applied to
 the whole application in admin_api/server.py -- no route here checks
@@ -276,6 +283,23 @@ async def forget_knowledge(request: web.Request) -> web.Response:
 
     forgotten = engine.knowledge.forget(item_id)
     return web.json_response({"id": item_id, "forgotten": forgotten})
+
+
+@routes.post("/api/v1/knowledge/{item_id}/reactivate")
+async def reactivate_knowledge(request: web.Request) -> web.Response:
+    """Reverses a previous /forget for the SAME item -- see
+    KnowledgeStore.reactivate() (production/knowledge.py). Never
+    creates a new item; id/type/content/author_id/created_at/topic
+    are all preserved exactly as they were."""
+
+    engine = _engine(request)
+    try:
+        item_id = int(request.match_info["item_id"])
+    except ValueError:
+        return web.json_response({"error": "invalid knowledge id"}, status=400)
+
+    reactivated = engine.knowledge.reactivate(item_id)
+    return web.json_response({"id": item_id, "reactivated": reactivated})
 
 
 @routes.get("/api/v1/state/{topic}/why")
