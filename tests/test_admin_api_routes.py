@@ -69,6 +69,30 @@ def test_game_state_reflects_watcher_snapshots(tmp_path: Path, monkeypatch) -> N
     _run(scenario())
 
 
+def test_game_state_includes_official_state_keyed_by_topic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """official_state is the actual source of truth (KnowledgeStore
+    STATE items) -- separate from and never influenced by
+    house_status, the automated live-feed observation above."""
+
+    engine, app = _build(monkeypatch, tmp_path)
+    # Automated observation disagrees on purpose -- official_state
+    # must reflect only what's been taught, regardless.
+    engine.watcher.house_status.current = HouseStatus(hoh="Taylor")
+    engine.knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/game-state", headers=AUTH)
+            body = await resp.json()
+            assert body["official_state"]["HOH"]["content"] == "Yash"
+            assert body["official_state"]["HOH"]["author_id"] == 1
+            assert body["house_status"]["hoh"] == "Taylor"
+
+    _run(scenario())
+
+
 # ==========================================================
 # Knowledge CRUD
 # ==========================================================
@@ -222,7 +246,7 @@ def test_state_why_returns_provenance(tmp_path: Path, monkeypatch) -> None:
     _run(scenario())
 
 
-def test_state_apply_writes_knowledge_and_updates_live_house_status(
+def test_state_apply_writes_official_knowledge_never_house_status(
     tmp_path: Path, monkeypatch
 ) -> None:
     engine, app = _build(monkeypatch, tmp_path)
@@ -246,8 +270,10 @@ def test_state_apply_writes_knowledge_and_updates_live_house_status(
 
     _run(scenario())
 
-    assert engine.watcher.house_status.current.hoh == "Yash"
     assert engine.knowledge.active_state("HOH").content == "Yash"
+    # /state/apply must never touch the automated, RSS-driven
+    # HouseStatus object -- only KnowledgeStore official facts.
+    assert engine.watcher.house_status.current.hoh == ""
 
 
 def test_state_apply_respects_line_number_selection(
@@ -269,8 +295,8 @@ def test_state_apply_respects_line_number_selection(
 
     _run(scenario())
 
-    assert engine.watcher.house_status.current.hoh == "Yash"
-    assert engine.watcher.house_status.current.nominees == ()
+    assert engine.knowledge.active_state("HOH").content == "Yash"
+    assert engine.knowledge.active_state("NOMINEES") is None
 
 
 def test_batch_apply_writes_facts_and_rules(tmp_path: Path, monkeypatch) -> None:
@@ -404,5 +430,28 @@ def test_conflicts_endpoint_flags_disagreement(tmp_path: Path, monkeypatch) -> N
             body = await resp.json()
             topics = {c["topic"] for c in body["conflicts"]}
             assert "HOH" in topics
+
+    _run(scenario())
+
+
+def test_conflicts_endpoint_reason_does_not_imply_equal_authority(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The dashboard must not present house_status and taught STATE
+    as two equally-authoritative sources -- the reason text says the
+    live feed is not authoritative, explicitly."""
+
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.teach(KnowledgeType.STATE, "Yash", 1, topic="HOH")
+    engine.watcher.house_status.current = HouseStatus(hoh="Taylor")
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/conflicts", headers=AUTH)
+            body = await resp.json()
+            hoh_conflict = next(c for c in body["conflicts"] if c["topic"] == "HOH")
+            assert "not authoritative" in hoh_conflict["reason"].lower()
+            assert hoh_conflict["taught_value"] == "Yash"
+            assert hoh_conflict["house_status_value"] == "Taylor"
 
     _run(scenario())

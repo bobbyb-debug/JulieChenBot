@@ -6,6 +6,10 @@ directly: same data source, same output, same "no nominees yet"
 wording, same permissions, for both command names, and that both
 literally invoke the same shared function rather than two independent
 copies that merely happen to look alike today.
+
+Data source is the official facts record (KnowledgeStore STATE topic
+"NOMINEES"), never the automated HouseStatus -- see commands/
+nominees.py's module docstring.
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ import discord
 import discord.ext.commands as dc
 
 import commands.nominees as nominees_module
-from production.house_status import HouseStatus
 
 
 class FakeInteraction:
@@ -32,17 +35,38 @@ class FakeInteraction:
         self.response = SimpleNamespace(send_message=send_message)
 
 
-def _register(house_status: HouseStatus):
+class _FakeStateItem:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakeKnowledgeStore:
+    """Mutable stand-in for KnowledgeStore.active_state("NOMINEES") --
+    mutating .nominees_content and re-reading through active_state()
+    is what test_nominees_and_noms_use_the_same_data_source relies on
+    to prove both commands read the same live object."""
+
+    def __init__(self, nominees_content: str | None) -> None:
+        self.nominees_content = nominees_content
+
+    def active_state(self, topic: str):
+        assert topic == "NOMINEES"
+        if self.nominees_content is None:
+            return None
+        return _FakeStateItem(self.nominees_content)
+
+
+def _register(nominees_content: str | None):
     ds = SimpleNamespace()
     ds.bot = dc.Bot(command_prefix="!", intents=discord.Intents.default())
     ds.command = lambda *a, **kw: ds.bot.tree.command(*a, **kw)
 
-    watcher = SimpleNamespace(house_status=SimpleNamespace(current=house_status))
-    engine = SimpleNamespace(watcher=watcher)
+    knowledge = _FakeKnowledgeStore(nominees_content)
+    engine = SimpleNamespace(knowledge=knowledge)
     ds.scheduler = SimpleNamespace(engine=engine)
 
     nominees_module.register(ds)
-    return ds.bot.tree
+    return ds.bot.tree, knowledge
 
 
 # ==========================================================
@@ -51,13 +75,13 @@ def _register(house_status: HouseStatus):
 
 
 def test_nominees_command_registered_exactly_once() -> None:
-    tree = _register(HouseStatus())
+    tree, _ = _register(None)
     matches = [c for c in tree.get_commands() if c.name == "nominees"]
     assert len(matches) == 1
 
 
 def test_noms_command_registered_exactly_once() -> None:
-    tree = _register(HouseStatus())
+    tree, _ = _register(None)
     matches = [c for c in tree.get_commands() if c.name == "noms"]
     assert len(matches) == 1
 
@@ -68,7 +92,7 @@ def test_noms_command_registered_exactly_once() -> None:
 
 
 def test_nominees_and_noms_produce_equivalent_output_with_nominees() -> None:
-    tree = _register(HouseStatus(nominees=("Alex", "Jordan")))
+    tree, _ = _register("Alex, Jordan")
 
     nominees_interaction = FakeInteraction()
     asyncio.run(tree.get_command("nominees").callback(nominees_interaction))
@@ -82,7 +106,7 @@ def test_nominees_and_noms_produce_equivalent_output_with_nominees() -> None:
 
 
 def test_nominees_and_noms_produce_equivalent_output_with_no_nominees() -> None:
-    tree = _register(HouseStatus())
+    tree, _ = _register(None)
 
     nominees_interaction = FakeInteraction()
     asyncio.run(tree.get_command("nominees").callback(nominees_interaction))
@@ -106,7 +130,7 @@ def test_nominees_and_noms_invoke_the_same_shared_function(monkeypatch) -> None:
     command had its own copy-pasted logic instead, only one of the two
     calls below would show up in `calls`."""
 
-    tree = _register(HouseStatus())
+    tree, _ = _register(None)
 
     calls: list[str] = []
 
@@ -127,8 +151,7 @@ def test_nominees_and_noms_use_the_same_data_source() -> None:
     by both commands -- proving they read the same live object, not a
     snapshot or a second copy."""
 
-    house_status = HouseStatus(nominees=("Alex",))
-    tree = _register(house_status)
+    tree, knowledge = _register("Alex")
 
     first_nominees = FakeInteraction()
     asyncio.run(tree.get_command("nominees").callback(first_nominees))
@@ -137,7 +160,7 @@ def test_nominees_and_noms_use_the_same_data_source() -> None:
     assert first_nominees.sent == first_noms.sent
     assert "Alex" in first_nominees.sent[0]
 
-    house_status.nominees = ("Taylor", "Morgan")
+    knowledge.nominees_content = "Taylor, Morgan"
 
     second_nominees = FakeInteraction()
     asyncio.run(tree.get_command("nominees").callback(second_nominees))
@@ -154,7 +177,7 @@ def test_nominees_and_noms_use_the_same_data_source() -> None:
 
 
 def test_nominees_and_noms_have_equivalent_permissions() -> None:
-    tree = _register(HouseStatus())
+    tree, _ = _register(None)
 
     nominees_cmd = tree.get_command("nominees")
     noms_cmd = tree.get_command("noms")

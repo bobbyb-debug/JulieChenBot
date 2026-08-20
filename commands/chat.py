@@ -29,10 +29,15 @@ def register(discord_service) -> None:
 
         await interaction.response.defer()
 
+        author_name = getattr(interaction.user, "display_name", None) or str(
+            interaction.user
+        )
+
         reply = await discord_service.generate_ai_reply(
             interaction.user.id,
             interaction.channel_id,
             message,
+            author_name=author_name,
         )
 
         await interaction.followup.send(reply)

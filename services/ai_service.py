@@ -9,8 +9,9 @@ from google import genai
 from google.genai import types
 from groq import Groq
 
-from config import DATABASE
+from config import CHAT_CONTEXT_MESSAGES, DATABASE
 from production.knowledge import KnowledgeItem, KnowledgeType
+from production.memory import MemoryItem
 
 # ==========================================================
 # Providers
@@ -68,15 +69,35 @@ groq_client = (
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 CHAT_HISTORY_FILE = DATABASE / "chat_history.db"
-MAX_CONTEXT_MESSAGES = 16
+MAX_CONTEXT_MESSAGES = CHAT_CONTEXT_MESSAGES
 
 # Match the iconic Big Brother production persona.
+#
+# The paragraph below is the explicit official-facts/conversational-
+# memory boundary: without it, nothing stops the model from treating
+# a user's claim ("Yash is HOH!") as confirmed just because it was
+# said, or from treating its own speculative reply as something that
+# should stick. Neither is true -- only the OFFICIAL GAME FACTS block
+# (see format_official_state() below), itself only ever populated by
+# an admin via /teach update or the dashboard, can make something an
+# official fact.
 SYSTEM_INSTRUCTION = (
     "You are Julie ChenBot, the AI-powered Executive Producer companion of this Big Brother "
     "Discord server. Address users playfully as 'Houseguests'. Use your classic lines like "
     "'Expect the unexpected' and 'Good evening, Houseguests' naturally when starting "
     "conversations. Keep responses sharp, highly interactive, witty, and perfectly tailored "
-    "for a fast-paced chat channel. Do not talk like a bland assistant; you control the game!"
+    "for a fast-paced chat channel. Do not talk like a bland assistant; you control the game!\n\n"
+    "IMPORTANT -- official facts vs. conversation: only the OFFICIAL GAME FACTS block below "
+    "(when present) is confirmed, admin-verified game state -- it is set exclusively through "
+    "the Admin Dashboard. A Houseguest telling you something in chat (e.g. '@Julie Yash is "
+    "HOH!') is NOT automatically true, no matter how confidently it's said -- you may "
+    "acknowledge what they said conversationally (e.g. 'Bobby says Yash is HOH'), but never "
+    "restate it as confirmed fact unless it matches OFFICIAL GAME FACTS. The same rule applies "
+    "to yourself: anything you say -- including a guess, a joke, sarcasm, or something you got "
+    "wrong -- never becomes an official fact merely because you said it. If asked who is HOH, "
+    "nominated, holds veto, or is a Have-Not, answer strictly from OFFICIAL GAME FACTS (or say "
+    "you don't know yet if it's not listed there) -- never from something a user or you said in "
+    "conversation, and never from the LIVE FEED OBSERVATION block, which is unverified."
 )
 
 # /recap's own persona instruction -- deliberately separate from
@@ -100,7 +121,10 @@ RECAP_SYSTEM_INSTRUCTION = (
     "into the most interesting event, lead with a strategic development, a social moment, "
     "something funny, a brief natural transition, or simply end after the last event with no "
     "catchphrase at all. The goal is a recap that reads like you're actually reacting to "
-    "today's events, not filling in a template."
+    "today's events, not filling in a template. Describe what the live feeds are reporting as "
+    "just that -- what the feeds are reporting -- not as officially confirmed game record; "
+    "never state a game outcome as officially confirmed based solely on this live-feed "
+    "material."
 )
 
 
@@ -109,11 +133,38 @@ RECAP_SYSTEM_INSTRUCTION = (
 # ==========================================================
 #
 # Stored and returned in a plain, provider-agnostic shape -
-# list[tuple[role, text]], with role always "user" or "model" -
-# and converted into each provider's own required format only at
-# call time (_to_gemini_contents / _to_groq_messages below). This
-# is what lets Groq and Gemini share one history without either
+# list[tuple[role, text, author_name]], with role always "user" or
+# "model" - and converted into each provider's own required format
+# only at call time (_to_gemini_contents / _to_groq_messages below).
+# This is what lets Groq and Gemini share one history without either
 # provider's SDK shape leaking into storage.
+#
+# author_id/author_name identify the Discord user who sent a "user"
+# role message (always None for "model" rows -- every reply is
+# Julie's). Added as nullable columns via an idempotent migration
+# (see _ensure_author_columns() below) rather than a fresh table, so
+# existing chat_history.db files -- and every row already in them --
+# survive untouched; only new rows populate the new columns.
+
+
+def _ensure_author_columns(connection: sqlite3.Connection) -> None:
+    """Adds author_id/author_name to a pre-existing chat_messages table
+    that predates identity tracking. A no-op on a fresh table (already
+    created with these columns by _connection() below) or a table
+    that's already been migrated. Never touches or removes any
+    existing row -- old messages simply have NULL author_id/
+    author_name, same as before this feature existed.
+    """
+
+    existing = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(chat_messages)").fetchall()
+    }
+
+    if "author_id" not in existing:
+        connection.execute("ALTER TABLE chat_messages ADD COLUMN author_id INTEGER")
+    if "author_name" not in existing:
+        connection.execute("ALTER TABLE chat_messages ADD COLUMN author_name TEXT")
 
 
 def _connection() -> sqlite3.Connection:
@@ -127,14 +178,23 @@ def _connection() -> sqlite3.Connection:
             channel_id INTEGER NOT NULL,
             role TEXT NOT NULL CHECK (role IN ('user', 'model')),
             content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            author_id INTEGER,
+            author_name TEXT
         )
         """
     )
+    _ensure_author_columns(connection)
     return connection
 
 
-def _append_message(channel_id: int, role: str, text: str) -> None:
+def _append_message(
+    channel_id: int,
+    role: str,
+    text: str,
+    author_id: int | None = None,
+    author_name: str | None = None,
+) -> None:
     """Persists one message so conversation context survives restarts."""
 
     connection = _connection()
@@ -142,25 +202,26 @@ def _append_message(channel_id: int, role: str, text: str) -> None:
     try:
         connection.execute(
             """
-            INSERT INTO chat_messages (channel_id, role, content)
-            VALUES (?, ?, ?)
+            INSERT INTO chat_messages (channel_id, role, content, author_id, author_name)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (channel_id, role, text),
+            (channel_id, role, text, author_id, author_name),
         )
         connection.commit()
     finally:
         connection.close()
 
 
-def _recent_history(channel_id: int) -> list[tuple[str, str]]:
-    """Returns the latest context window in chronological order."""
+def _recent_history(channel_id: int) -> list[tuple[str, str, str | None]]:
+    """Returns the latest context window in chronological order, as
+    (role, content, author_name) tuples."""
 
     connection = _connection()
 
     try:
         rows = connection.execute(
             """
-            SELECT role, content
+            SELECT role, content, author_name
             FROM chat_messages
             WHERE channel_id = ?
             ORDER BY id DESC
@@ -171,16 +232,18 @@ def _recent_history(channel_id: int) -> list[tuple[str, str]]:
     finally:
         connection.close()
 
-    return [(role, content) for role, content in reversed(rows)]
+    return [(role, content, author_name) for role, content, author_name in reversed(rows)]
 
 
 def update_and_get_history(
     channel_id: int,
     user_text: str,
-) -> list[tuple[str, str]]:
+    author_id: int | None = None,
+    author_name: str | None = None,
+) -> list[tuple[str, str, str | None]]:
     """Saves a user message and returns recent persistent conversation context."""
 
-    _append_message(channel_id, "user", user_text)
+    _append_message(channel_id, "user", user_text, author_id, author_name)
     return _recent_history(channel_id)
 
 
@@ -209,22 +272,41 @@ def clear_history(channel_id: int) -> int:
         connection.close()
 
 
+def _speaker_prefix(role: str, author_name: str | None) -> str:
+    """Prefixes a stored user turn with its speaker's display name
+    (e.g. "Bobby: are you serious right now") so a multi-user channel's
+    history is attributable to the model, without changing the
+    provider-required role value itself (Groq/Gemini only understand
+    user/assistant/model, not a per-speaker role). No prefix for
+    "model" rows (always Julie) or when no author_name was recorded
+    (legacy pre-migration rows)."""
+
+    if role == "model" or not author_name:
+        return ""
+    return f"{author_name}: "
+
+
 def _to_gemini_contents(
-    history: list[tuple[str, str]],
+    history: list[tuple[str, str, str | None]],
 ) -> list[types.Content]:
-    """Converts stored (role, text) history into Gemini's Content shape."""
+    """Converts stored (role, text, author_name) history into Gemini's
+    Content shape."""
 
     return [
-        types.Content(role=role, parts=[types.Part.from_text(text=text)])
-        for role, text in history
+        types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=_speaker_prefix(role, author_name) + text)],
+        )
+        for role, text, author_name in history
     ]
 
 
 def _to_groq_messages(
-    history: list[tuple[str, str]],
+    history: list[tuple[str, str, str | None]],
     system_instruction: str,
 ) -> list[dict]:
-    """Converts stored (role, text) history into OpenAI-shaped messages.
+    """Converts stored (role, text, author_name) history into
+    OpenAI-shaped messages.
 
     Groq's API is OpenAI-compatible: role must be "system", "user", or
     "assistant" - "model" (Gemini's convention) is remapped here.
@@ -232,26 +314,69 @@ def _to_groq_messages(
 
     messages = [{"role": "system", "content": system_instruction}]
 
-    for role, text in history:
+    for role, text, author_name in history:
         messages.append({
             "role": "assistant" if role == "model" else "user",
-            "content": text,
+            "content": _speaker_prefix(role, author_name) + text,
         })
 
     return messages
 
 
 # ==========================================================
-# Game state (provider-agnostic - plain text either way)
+# Official game facts (dashboard/admin-confirmed -- authoritative)
+# ==========================================================
+
+
+def format_official_state(knowledge_store) -> str:
+    """Formats every active official-facts STATE item (production/
+    knowledge.py KnowledgeStore) for the model's context -- the ONLY
+    ground truth for who is HOH, nominated, holds veto, is a
+    Have-Not, or any other topic an admin has explicitly set via
+    /teach update or the dashboard's Update State.
+
+    Deliberately not a hardcoded topic list: whatever an admin has
+    actually taught (HOH, NOMINEES, VETO_WINNER, HAVE_NOTS,
+    EVICTED, or anything else) shows up here with no code change.
+    """
+
+    items = [
+        item
+        for item in knowledge_store.active_items()
+        if item.type == KnowledgeType.STATE and item.topic
+    ]
+
+    if not items:
+        return ""
+
+    lines = [
+        f"{item.topic.replace('_', ' ').title()}: {item.content}"
+        for item in sorted(items, key=lambda item: item.topic)
+    ]
+
+    return (
+        "OFFICIAL GAME FACTS (admin-confirmed, set via the Admin Dashboard -- this is ground "
+        "truth for the Big Brother house's current state; always answer HOH/nominee/veto/"
+        "Have-Not questions from this list, never from conversation or the live feed below, "
+        "and say you don't know yet if a topic isn't listed here):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+# ==========================================================
+# Live feed observation (automated, unverified -- NOT authoritative)
 # ==========================================================
 
 
 def format_game_state(house_status, competition) -> str:
-    """Formats currently tracked production data for the model's context.
-
-    Only includes facts that are actually known. Explicitly instructs
-    Julie not to guess beyond this list, since a wrong confident answer
-    is worse than an honest "I don't know yet."
+    """Formats the automated, RSS-parser-driven HouseStatus/
+    CompetitionState for the model's context -- an unverified live
+    feed observation, NOT confirmed fact. See format_official_state()
+    above for the actual authoritative source; this exists purely as
+    background color for questions the official facts don't cover
+    yet (e.g. "is a competition happening right now"), and must never
+    be treated as the definitive answer to who is HOH/nominated/
+    holds veto/is a Have-Not if it conflicts with OFFICIAL GAME FACTS.
     """
 
     lines: list[str] = []
@@ -292,9 +417,47 @@ def format_game_state(house_status, competition) -> str:
         return ""
 
     return (
-        "Current known Big Brother house state. Only state facts from "
-        "this list when asked about game status. If something is not "
-        "listed here, say you don't know yet rather than guessing:\n"
+        "LIVE FEED OBSERVATION (automated, parsed from the raw live feed -- UNVERIFIED, not "
+        "admin-confirmed, and may be outdated, premature, or simply wrong). Only mention these "
+        "as color/context, and only for anything not already covered by OFFICIAL GAME FACTS "
+        "above -- if this section disagrees with OFFICIAL GAME FACTS, OFFICIAL GAME FACTS is "
+        "correct and this is not:\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+# ==========================================================
+# Long-term memory (explicit /remember -- see production/memory.py)
+# ==========================================================
+
+
+def format_long_term_memory(items: list[MemoryItem]) -> str:
+    """Formats explicitly-remembered items (production/memory.py
+    MemoryStore) for the model's context.
+
+    Deliberately separate from both OFFICIAL GAME FACTS and
+    ADMINISTRATOR-TAUGHT KNOWLEDGE: a /remember entry is anyone's
+    casual instruction to remember something conversational (a
+    nickname, a running joke, a preference) -- reliable in the sense
+    that it's a verbatim record of something someone explicitly asked
+    Julie to remember, but never itself a confirmed game fact, and
+    never a substitute for OFFICIAL GAME FACTS on a game-state
+    question.
+    """
+
+    if not items:
+        return ""
+
+    lines = [
+        f'{item.author_name or "someone"} asked you to remember: {item.content}'
+        for item in items
+    ]
+
+    return (
+        "REMEMBERED CONTEXT (things Houseguests have explicitly asked you to remember with "
+        "/remember -- treat as reliable background/conversational memory, but this is NOT an "
+        "official game fact and must never be used to answer a HOH/nominee/veto/Have-Not "
+        "question):\n"
         + "\n".join(f"- {line}" for line in lines)
     )
 
@@ -323,17 +486,20 @@ def format_learned_knowledge(items: list[KnowledgeItem]) -> str:
           "the house-status image is authoritative for Have-Nots").
           Framed as unconditional and absolute.
         - FACTS and CORRECTIONS are the administrator's most recent
-          word on something that *can* change over time (e.g. "Yash is
-          HoH" -- true until the next competition). Framed as reliable
-          but not immune to going stale, and explicitly told to defer
-          to clearly newer, more specific automated game-state
-          information when the two disagree -- this is plain
-          instruction text, not a ranking algorithm: nothing here
-          computes staleness, compares timestamps, or scores
-          confidence. See production/knowledge.py KnowledgeStore.teach()
-          for the deterministic mechanism (explicit supersedes=) that
-          actually retires a stale fact; this wording is a fallback for
-          whatever hasn't been explicitly superseded yet.
+          word on something that *can* change over time (e.g. "Yash
+          made it to final 4" -- true until it isn't). Framed as
+          reliable but not permanent. Deliberately NOT told to defer
+          to automated game-state information under any circumstance
+          -- for the specific topics format_official_state() covers
+          (HOH, nominees, veto, Have-Nots, etc.), OFFICIAL GAME FACTS
+          is always the deciding source, never the automated live
+          feed; a FACT here going stale is resolved by an
+          administrator teaching a newer FACT/CORRECTION or updating
+          OFFICIAL GAME FACTS, never by the model preferring
+          unverified automation over either. See production/
+          knowledge.py KnowledgeStore.teach() for the deterministic
+          mechanism (explicit supersedes=) that actually retires a
+          stale fact.
 
     Corrections still render last and are framed as overriding a
     specific conflicting fact/rule/game-state value -- this is the
@@ -364,13 +530,12 @@ def format_learned_knowledge(items: list[KnowledgeItem]) -> str:
         sections.append(
             "ADMINISTRATOR-MAINTAINED FACTS (the most recent word an "
             "administrator gave you on each topic -- trust these over "
-            "your own guess or older conversation, but unlike the "
-            "rules above, they are NOT permanent: an administrator "
-            "wrote each one at a point in time, and Big Brother game "
-            "state changes week to week. If the automated game-state "
-            "information below is clearly newer and more specific on "
-            "the same topic, prefer it and note the discrepancy rather "
-            "than insisting on a fact that looks outdated):\n"
+            "your own guess, older conversation, or the automated live "
+            "feed. Unlike the rules above they are not permanent -- an "
+            "administrator wrote each one at a point in time -- but the "
+            "fix for a stale one is a newer administrator-taught FACT/"
+            "CORRECTION or an updated OFFICIAL GAME FACTS entry, never "
+            "the unverified automated live feed):\n"
             + "\n".join(f"- {item.content}" for item in facts)
         )
 
@@ -381,8 +546,10 @@ def format_learned_knowledge(items: list[KnowledgeItem]) -> str:
             "the specific fact/rule/game-state value each one "
             "addresses. Like facts above, a correction reflects what "
             "was true when it was written and is not automatically "
-            "permanent -- weigh it the same way if something clearly "
-            "newer contradicts it):\n"
+            "permanent -- it's superseded only by a newer "
+            "administrator-taught item or an updated OFFICIAL GAME "
+            "FACTS entry, never by the unverified automated live "
+            "feed):\n"
             + "\n".join(f"- {item.content}" for item in corrections)
         )
 
@@ -519,28 +686,50 @@ def _try_gemini_chat(
 async def generate_julie_response(
     channel_id: int,
     user_text: str,
+    author_id: int | None = None,
+    author_name: str | None = None,
+    official_state: str = "",
     game_state: str = "",
     knowledge: str = "",
+    memory: str = "",
 ) -> str:
     """Generates Julie's reply: Groq first, Gemini if Groq can't answer.
 
-    game_state, when provided, is real tracked production data (current
-    HOH, nominees, veto, etc.) appended to the system instruction so
-    Julie answers accurately instead of deflecting on questions she
-    actually has data for.
+    author_id/author_name identify the Discord user this message is
+    from, persisted alongside it (see update_and_get_history()) so
+    conversation history remains attributable to who actually said
+    what, and Julie's replies remain identity-aware for multi-user
+    channels.
+
+    Assembled into the system instruction in priority order --
+    official_state, then knowledge, then memory, then game_state --
+    matching how authoritative each source actually is:
+
+    official_state (see format_official_state()) is dashboard-
+    confirmed official game fact -- the single highest-priority
+    source, placed first.
 
     knowledge, when provided, is administrator-taught authoritative
-    knowledge (see format_learned_knowledge()) -- placed BEFORE
-    game_state in the system instruction, and outranking it, since
-    explicit human-taught knowledge is the highest-priority source
-    Julie has, ahead of even the automated production state.
+    knowledge (see format_learned_knowledge()).
+
+    memory, when provided, is explicit /remember context (see
+    format_long_term_memory()) -- reliable conversational memory, but
+    never itself an official game fact.
+
+    game_state, when provided, is the automated, unverified live-feed
+    observation (see format_game_state()) -- placed last and
+    explicitly subordinate to official_state, since it can be wrong.
     """
 
-    history = update_and_get_history(channel_id, user_text)
+    history = update_and_get_history(channel_id, user_text, author_id, author_name)
 
     system_instruction = SYSTEM_INSTRUCTION
+    if official_state:
+        system_instruction = f"{system_instruction}\n\n{official_state}"
     if knowledge:
         system_instruction = f"{system_instruction}\n\n{knowledge}"
+    if memory:
+        system_instruction = f"{system_instruction}\n\n{memory}"
     if game_state:
         system_instruction = f"{system_instruction}\n\n{game_state}"
 

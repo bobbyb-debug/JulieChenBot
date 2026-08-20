@@ -1,8 +1,9 @@
 """Tests for /teach update -- manual current-state updates that write
-through the SAME HouseStatus object /hoh, /noms, /nominees, and /veto
-already read (see production/state_sync.py), with provenance recorded
-in KnowledgeStore and a later automated update able to supersede the
-manual one.
+official-facts STATE items to KnowledgeStore, the sole source of truth
+/hoh, /noms, /nominees, and /veto read (see production/state_sync.py).
+Deliberately never touches HouseStatus (the automated, RSS-driven
+observation layer) -- an automated parse must never be able to
+silently overwrite a manually confirmed fact, and vice versa.
 """
 
 from __future__ import annotations
@@ -204,7 +205,8 @@ def test_update_with_no_lines_sends_plain_message(tmp_path: Path, monkeypatch) -
 
 
 # ==========================================================
-# Confirm applies HouseStatus immediately, structured commands see it
+# Confirm writes official facts (KnowledgeStore), never HouseStatus;
+# structured commands read the official facts, not HouseStatus.
 # ==========================================================
 
 
@@ -214,7 +216,10 @@ def test_confirm_applies_hoh_and_hoh_command_reflects_it(
     engine = _engine(tmp_path, monkeypatch)
     asyncio.run(_run_update_and_confirm(engine, "HOH: Yash"))
 
-    assert engine.watcher.house_status.current.hoh == "Yash"
+    assert engine.knowledge.active_state("HOH").content == "Yash"
+    # Confirming a manual update must never touch the automated,
+    # RSS-driven HouseStatus object -- that's the whole point.
+    assert engine.watcher.house_status.current.hoh == ""
 
     ds = _discord_service(engine)
     hoh_module.register(ds)
@@ -231,7 +236,8 @@ def test_confirm_applies_nominees_and_both_nominee_commands_reflect_it(
     engine = _engine(tmp_path, monkeypatch)
     asyncio.run(_run_update_and_confirm(engine, "Nominees: Angela, Dee"))
 
-    assert engine.watcher.house_status.current.nominees == ("Angela", "Dee")
+    assert engine.knowledge.active_state("NOMINEES").content == "Angela, Dee"
+    assert engine.watcher.house_status.current.nominees == ()
 
     ds = _discord_service(engine)
     nominees_module.register(ds)
@@ -250,8 +256,8 @@ def test_confirm_applies_veto_winner_and_veto_command_reflects_it(
     engine = _engine(tmp_path, monkeypatch)
     asyncio.run(_run_update_and_confirm(engine, "VETO_WINNER: Barrett"))
 
-    assert engine.watcher.house_status.current.veto_holder == "Barrett"
-    assert engine.watcher.house_status.current.veto_used is False
+    assert engine.knowledge.active_state("VETO_WINNER").content == "Barrett"
+    assert engine.watcher.house_status.current.veto_holder == ""
 
     ds = _discord_service(engine)
     veto_module.register(ds)
@@ -262,13 +268,19 @@ def test_confirm_applies_veto_winner_and_veto_command_reflects_it(
     assert "Barrett" in _reply_text(interaction)
 
 
-def test_confirm_persists_game_state(tmp_path: Path, monkeypatch) -> None:
+def test_confirm_persists_official_state(tmp_path: Path, monkeypatch) -> None:
     engine = _engine(tmp_path, monkeypatch)
     asyncio.run(_run_update_and_confirm(engine, "HOH: Yash"))
 
-    persisted = engine.storage.get(engine.GAME_STATE_KEY)
+    persisted = engine.storage.get(engine.knowledge.STORAGE_KEY)
     assert persisted is not None
-    assert persisted["house_status"]["hoh"] == "Yash"
+    assert any(
+        item["topic"] == "HOH" and item["content"] == "Yash" for item in persisted
+    )
+    # Confirming a manual update must not write anything under the
+    # game-state key either -- that key belongs solely to the
+    # automated pipeline (ProductionEngine._persist_game_state()).
+    assert engine.storage.get(engine.GAME_STATE_KEY) is None
 
 
 def test_confirm_survives_simulated_restart(tmp_path: Path, monkeypatch) -> None:
@@ -277,28 +289,54 @@ def test_confirm_survives_simulated_restart(tmp_path: Path, monkeypatch) -> None
 
     engine_b = ProductionEngine(storage=Storage())
 
-    assert engine_b.watcher.house_status.current.hoh == "Yash"
+    assert engine_b.knowledge.active_state("HOH").content == "Yash"
+    assert engine_b.watcher.house_status.current.hoh == ""
 
 
 # ==========================================================
-# Automated update supersedes manual state
+# Automated live-feed updates never overwrite official state
+# (regression test for the reported Taylor/Yash production bug)
 # ==========================================================
 
 
-def test_automated_update_supersedes_manual_state(tmp_path: Path, monkeypatch) -> None:
+def test_automated_update_never_overwrites_official_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     engine = _engine(tmp_path, monkeypatch)
     asyncio.run(_run_update_and_confirm(engine, "HOH: Yash"))
-    assert engine.watcher.house_status.current.hoh == "Yash"
+    assert engine.knowledge.active_state("HOH").content == "Yash"
 
     # A real automated RSS-parsed update flows through the same
     # HouseStatusMonitor.update()/check() path production/engine.py's
-    # tick() already uses.
+    # tick() already uses -- this is exactly what happened in
+    # production when the live feed misparsed HOH as Taylor. First
+    # establish an initial baseline observation (HouseStatusMonitor
+    # treats a HouseStatus()-equal .current as "first observation" and
+    # reports changed=False for it, same as it does on a fresh boot),
+    # then apply the misparsed Taylor value as a genuine second change.
     monitor = engine.watcher.house_status
-    monitor.update(HouseStatus(hoh="Barrett", nominees=("Angela", "Dee")))
+    monitor.update(HouseStatus(hoh="Someone Else"))
+    asyncio.run(monitor.check())
+
+    monitor.update(HouseStatus(hoh="Taylor", nominees=("Angela", "Dee")))
     result = asyncio.run(monitor.check())
 
     assert result.changed is True
-    assert monitor.current.hoh == "Barrett"
+    # HouseStatus (the live-feed observation) does update -- that's
+    # expected and fine, it's what conflict detection surfaces.
+    assert monitor.current.hoh == "Taylor"
+    # But the official fact -- what /hoh, /nominees, /veto, and the
+    # AI chat context actually report -- must be completely unchanged.
+    assert engine.knowledge.active_state("HOH").content == "Yash"
+
+    ds = _discord_service(engine)
+    hoh_module.register(ds)
+    hoh_cmd = ds.bot.tree.get_command("hoh")
+    interaction = FakeInteraction()
+    asyncio.run(hoh_cmd.callback(interaction))
+
+    assert "Yash" in _reply_text(interaction)
+    assert "Taylor" not in _reply_text(interaction)
 
 
 # ==========================================================

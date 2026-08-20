@@ -33,7 +33,7 @@ from production.batch_teach import (
     parse_state_updates,
 )
 from production.knowledge import KnowledgeType
-from production.state_sync import apply_state_topic, is_recognized_topic
+from production.state_sync import is_recognized_topic
 
 routes = web.RouteTableDef()
 
@@ -139,11 +139,27 @@ async def health(request: web.Request) -> web.Response:
 
 @routes.get("/api/v1/game-state")
 async def game_state(request: web.Request) -> web.Response:
+    """house_status/competition are the automated, live-feed-driven
+    observation layer (production/house_status.py, production/
+    competition.py) -- never authoritative. official_state is every
+    active STATE knowledge item (production/knowledge.py
+    KnowledgeStore), keyed by topic -- the actual source of truth
+    /hoh, /noms, /nominees, and /veto read. The dashboard should
+    present official_state as current game state and house_status as
+    a secondary, clearly-labeled live-feed signal -- see docs/
+    ARCHITECTURE.md in the admin dashboard repo."""
+
     engine = _engine(request)
+    official_state = {
+        item.topic: item.to_dict()
+        for item in engine.knowledge.active_items()
+        if item.type == KnowledgeType.STATE and item.topic
+    }
     return web.json_response(
         {
             "house_status": engine.watcher.house_status.snapshot(),
             "competition": engine.watcher.competition.snapshot(),
+            "official_state": official_state,
         }
     )
 
@@ -356,10 +372,16 @@ async def state_plan(request: web.Request) -> web.Response:
 @routes.post("/api/v1/state/apply")
 async def state_apply(request: web.Request) -> web.Response:
     """Mirrors /teach update's confirm handler exactly: writes the
-    selected STATE knowledge, then applies every recognized topic to
-    the live HouseStatus and persists it -- the same single source of
-    game-state truth every other update path uses (see
-    commands/teach.py _StateUpdateConfirmView.handle_confirm)."""
+    selected lines as official-facts STATE knowledge -- the sole
+    source of truth /hoh, /noms, /nominees, and /veto read (see
+    commands/teach.py _StateUpdateConfirmView.handle_confirm).
+
+    Deliberately does NOT touch HouseStatus (production/
+    house_status.py): that is the automated, live-feed-driven
+    observation layer, written only by production/engine.py's RSS
+    pipeline. This is what stops an automated parse from silently
+    overwriting a dashboard-confirmed fact, and vice versa.
+    """
 
     engine = _engine(request)
     body = await _json_body(request)
@@ -381,17 +403,11 @@ async def state_apply(request: web.Request) -> web.Response:
 
     written = apply_plan(plan, engine.knowledge, author_id)
 
-    house_status_monitor = engine.watcher.house_status
-    applied_topics: list[str] = []
-    for item in written:
-        if item.topic and is_recognized_topic(item.topic):
-            house_status_monitor.current = apply_state_topic(
-                item.topic, item.content, house_status_monitor.current
-            )
-            applied_topics.append(item.topic)
-
-    if applied_topics:
-        engine._persist_game_state()
+    applied_topics = [
+        item.topic
+        for item in written
+        if item.topic and is_recognized_topic(item.topic)
+    ]
 
     return web.json_response(
         {

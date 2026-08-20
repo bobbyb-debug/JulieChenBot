@@ -2,11 +2,16 @@
 Julie ChenBot Nominees Command
 ===============================
 
-Shows the current nominees, from tracked house status.
+Shows the current nominees, from the official facts record
+(KnowledgeStore STATE topic "NOMINEES" -- see production/knowledge.py),
+set only via /teach update or the admin dashboard. Deliberately does
+NOT read the automated, live-feed-driven HouseStatus (production/
+house_status.py) -- that value is an unverified observation, never
+treated as confirmed fact by any Discord command.
 
 Registered under two names -- /nominees (canonical) and /noms (short
 alias) -- both calling the exact same _show_nominees() implementation
-below. There is deliberately only one place that reads house status,
+below. There is deliberately only one place that reads official state,
 formats the message, and decides what "no nominees yet" looks like:
 the two commands can never drift out of sync with each other, because
 there is nothing in either of them to drift -- they are both a thin
@@ -28,19 +33,18 @@ async def _show_nominees(
     command_name: str,
 ) -> None:
     """The one implementation both /nominees and /noms call. Same data
-    source (engine.watcher.house_status.current), same formatting,
-    same "not confirmed yet" wording -- command_name only affects the
-    log line, so /nominees and /noms usage can still be told apart in
-    logs without any behavioral difference for the user.
+    source (engine.knowledge.active_state("NOMINEES")), same
+    formatting, same "not confirmed yet" wording -- command_name only
+    affects the log line, so /nominees and /noms usage can still be
+    told apart in logs without any behavioral difference for the user.
     """
 
-    status = discord_service.scheduler.engine.watcher.house_status.current
+    official = discord_service.scheduler.engine.knowledge.active_state("NOMINEES")
 
-    if not status.nominees:
+    if official is None or not official.content.strip():
         message = "🎯 No nominees have been confirmed yet this cycle."
     else:
-        names = ", ".join(status.nominees)
-        message = f"🎯 Nominated: **{names}**"
+        message = f"🎯 Nominated: **{official.content}**"
 
     await interaction.response.send_message(message)
 

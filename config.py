@@ -114,6 +114,15 @@ PRODUCTION_CHANNEL = env_int("PRODUCTION_CHANNEL")
 HOUSE_STATUS_CHANNEL = env_int("HOUSE_STATUS_CHANNEL", 1534566047611617371)
 PRODUCTION_LOG_CHANNEL = env_int("PRODUCTION_LOG_CHANNEL")
 
+# Number of recent chat_messages rows (services/ai_service.py) fed to
+# the AI as conversational context for /chat and @mention replies.
+# Deliberately still a small, bounded recent window -- not "send the
+# whole database" -- per the explicit requirement that conversational
+# memory retrieval must stay scoped; anything a user wants Julie to
+# recall beyond this window is what /remember (production/memory.py)
+# is for.
+CHAT_CONTEXT_MESSAGES = env_int("CHAT_CONTEXT_MESSAGES", 24)
+
 # A Discord role ID trusted to run /teach batch and /teach update
 # (see commands/teach.py _is_trusted_moderator()) without needing full
 # server administrator. Unset means those two commands are effectively

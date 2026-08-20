@@ -1,4 +1,7 @@
-"""Tests for authoritative game-state durability across a process restart.
+"""Tests for HouseStatus/CompetitionState durability across a process
+restart -- the automated, RSS-parser-driven live-feed observation
+layer (production/house_status.py, production/competition.py), NOT
+the official-facts store.
 
 Before this change, ProductionParser, HouseStatusMonitor, and
 CompetitionMonitor all started every process instance with blank in-memory
@@ -8,12 +11,19 @@ forgot HOH, nominees, veto, have-nots, feeds, and competition state, even
 though it had already been correctly detected and announced by the
 previous instance.
 
-/chat, /hoh, /nominees, /veto, and /recap all read the exact same
-ProductionWatcher.house_status.current / .competition.current objects (see
-services/discord.py generate_ai_reply(), commands/hoh.py, nominees.py,
-veto.py, recap.py), so this state loss surfaced as Julie confidently
-saying she didn't know who the HOH was, right after having already
-announced it in the same channel.
+IMPORTANT (post official-facts-architecture fix): /hoh, /nominees,
+/noms, and /veto no longer read this object at all -- they read
+KnowledgeStore official facts exclusively (see commands/hoh.py,
+nominees.py, veto.py, and tests/test_official_state_commands.py /
+tests/test_teach_update_command.py for that persistence path). This
+file's restart-survival tests are still meaningful because /chat and
+@mentions still include HouseStatus as a clearly-labeled, unverified
+"LIVE FEED OBSERVATION" section of AI context (see services/
+ai_service.py format_game_state(), still exercised below via
+format_game_state() directly) -- losing it on restart would just make
+that live-feed color/context go blank, not affect any official-facts
+command. /recap does not use format_game_state() at all (see
+commands/recap.py's own docstring).
 
 ProductionEngine now restores that state from Storage on construction
 (_load_game_state()) and persists it (_persist_game_state()) whenever
@@ -491,7 +501,9 @@ def test_restart_survives_the_exact_production_incident(
     assert engine_b.watcher.house_status.current.hoh == "Yash"
     assert engine_b.watcher.house_status.current.nominees == ("Alex", "Jordan")
 
-    # The exact path /chat uses (services/discord.py generate_ai_reply()).
+    # The exact live-feed-observation path /chat uses (services/discord.py
+    # generate_ai_reply()) -- NOT the official-facts path /hoh/nominees/
+    # veto use (KnowledgeStore, unaffected by this restart entirely).
     game_state = format_game_state(
         engine_b.watcher.house_status.current,
         engine_b.watcher.competition.current,

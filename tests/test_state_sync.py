@@ -1,11 +1,15 @@
-"""Tests for production/state_sync.py -- mapping a manual STATE topic
-onto the real HouseStatus object /hoh, /noms, /nominees, /veto read.
+"""Tests for production/state_sync.py -- the registry of which taught
+STATE topics have a directly comparable automated HouseStatus field,
+used for conflict detection (admin_api/conflicts.py) and /teach
+update's preview messaging. This module does NOT write to
+HouseStatus -- official facts live exclusively in KnowledgeStore STATE
+items (see production/knowledge.py); a manual update never touches
+HouseStatus, which is exclusively the RSS pipeline's to write.
 """
 
 from __future__ import annotations
 
-from production.house_status import HouseStatus
-from production.state_sync import RECOGNIZED_TOPICS, apply_state_topic, is_recognized_topic
+from production.state_sync import RECOGNIZED_TOPICS, is_recognized_topic
 
 
 def test_hoh_topic_is_recognized() -> None:
@@ -13,76 +17,19 @@ def test_hoh_topic_is_recognized() -> None:
     assert is_recognized_topic("hoh") is True  # case-insensitive
 
 
+def test_all_expected_topics_are_recognized() -> None:
+    for topic in ("HOH", "NOMINEES", "VETO_WINNER", "HAVE_NOTS"):
+        assert is_recognized_topic(topic) is True
+
+
 def test_unknown_topic_is_not_recognized() -> None:
     assert is_recognized_topic("FAVORITE_SNACK") is False
 
 
-def test_apply_hoh_sets_the_field() -> None:
-    current = HouseStatus(hoh="Yash")
-    updated = apply_state_topic("HOH", "Barrett", current)
-
-    assert updated.hoh == "Barrett"
-    assert current.hoh == "Yash"  # original untouched (new object returned)
-
-
-def test_apply_nominees_splits_comma_separated_names() -> None:
-    current = HouseStatus()
-    updated = apply_state_topic("NOMINEES", "Angela, Dee", current)
-
-    assert updated.nominees == ("Angela", "Dee")
-
-
-def test_apply_nominees_splits_and_separated_names() -> None:
-    current = HouseStatus()
-    updated = apply_state_topic("NOMINEES", "Angela and Dee", current)
-
-    assert updated.nominees == ("Angela", "Dee")
-
-
-def test_apply_veto_winner_sets_holder_and_resets_used_flag() -> None:
-    current = HouseStatus(veto_holder="Sam", veto_used=True)
-    updated = apply_state_topic("VETO_WINNER", "Barrett", current)
-
-    assert updated.veto_holder == "Barrett"
-    assert updated.veto_used is False  # freshly won, not yet used
-
-
-def test_apply_have_nots_splits_names() -> None:
-    current = HouseStatus()
-    updated = apply_state_topic("HAVE_NOTS", "Kamu, Mallory", current)
-
-    assert updated.have_nots == ("Kamu", "Mallory")
-
-
-def test_unrecognized_topic_leaves_house_status_unchanged() -> None:
-    current = HouseStatus(hoh="Yash")
-    updated = apply_state_topic("FAVORITE_SNACK", "pretzels", current)
-
-    assert updated == current
-
-
 def test_topic_matching_is_case_insensitive() -> None:
-    current = HouseStatus()
-    updated = apply_state_topic("hoh", "Yash", current)
-
-    assert updated.hoh == "Yash"
+    assert is_recognized_topic("hoh") is True
+    assert is_recognized_topic("Nominees") is True
 
 
-def test_applying_one_topic_does_not_disturb_other_fields() -> None:
-    current = HouseStatus(hoh="Yash", nominees=("Angela", "Dee"), veto_holder="Sam")
-    updated = apply_state_topic("HOH", "Barrett", current)
-
-    assert updated.hoh == "Barrett"
-    assert updated.nominees == ("Angela", "Dee")
-    assert updated.veto_holder == "Sam"
-
-
-def test_recognized_topics_constant_matches_all_apply_branches() -> None:
-    """Every topic listed as recognized must actually change
-    something when applied -- prevents the list and the mapping from
-    silently drifting apart."""
-
-    base = HouseStatus()
-    for topic in RECOGNIZED_TOPICS:
-        updated = apply_state_topic(topic, "Test Value", base)
-        assert updated != base, f"{topic} did not change HouseStatus"
+def test_recognized_topics_constant_is_exactly_the_documented_set() -> None:
+    assert set(RECOGNIZED_TOPICS) == {"HOH", "NOMINEES", "VETO_WINNER", "HAVE_NOTS"}
