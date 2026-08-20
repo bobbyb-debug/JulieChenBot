@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Python dependencies (requirements.txt / requirements-dev.txt).
+  # Patch/minor only by default policy below -- major version bumps
+  # still open a PR but are grouped separately so they don't block
+  # routine security patches and can be reviewed/deferred deliberately.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep the GitHub Actions pinned in .github/workflows/*.yml current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10

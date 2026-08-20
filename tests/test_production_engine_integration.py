@@ -1,0 +1,562 @@
+"""
+Integration tests for Julie ChenBot's production runtime pipeline.
+
+The tests use small in-memory doubles around the real ProductionEngine
+so they verify the engine's integration responsibilities without
+requiring Discord or network-backed monitors.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+from database.storage import Storage
+from production.announcer import ProductionAnnouncer
+from production.competition import CompetitionState, CompetitionType
+from production.engine import ProductionEngine
+from production.events import EventSeverity, EventType, ProductionEvent
+from production.house_status import HouseStatus
+from production.monitors import MonitorResult, MonitorStatus
+from production.rss import FeedUpdate
+from services.discord_output import DiscordOutputRouter
+from services.scheduler import Scheduler
+
+
+class SpyEvent(ProductionEvent):
+    """ProductionEvent that records calls to mark_announced()."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.mark_announced_calls = 0
+
+    def mark_announced(self) -> None:
+        self.mark_announced_calls += 1
+        super().mark_announced()
+
+
+class HouseStatusDouble:
+    """Minimal stand-in for ProductionWatcher.house_status."""
+
+    def __init__(self) -> None:
+        self.current = HouseStatus()
+
+    def update(self, status: HouseStatus) -> None:
+        self.current = status
+
+    @property
+    def hoh(self) -> str:
+        return self.current.hoh
+
+
+class CompetitionDouble:
+    """Minimal stand-in for ProductionWatcher.competition."""
+
+    def __init__(self) -> None:
+        self.current = CompetitionState()
+
+    def update(self, state: CompetitionState) -> None:
+        self.current = state
+
+    @property
+    def winner(self) -> str:
+        return self.current.winner
+
+    @property
+    def competition(self) -> CompetitionType:
+        return self.current.competition
+
+
+class WatcherDouble:
+    """Minimal watcher double with the ProductionWatcher public contract."""
+
+    def __init__(
+        self,
+        results: list[MonitorResult] | None = None,
+        events: list[ProductionEvent] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.results = results or []
+        self.events = events or []
+        self.error = error
+        self.run_calls = 0
+        self.total_monitors = len(self.results)
+
+        # ProductionEngine feeds parsed RSS state through these public
+        # watcher collaborators before executing the watcher cycle.
+        self.house_status = HouseStatusDouble()
+        self.competition = CompetitionDouble()
+
+    async def run(self) -> tuple[list[MonitorResult], list[ProductionEvent]]:
+        self.run_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.results, self.events
+
+
+class RSSDouble:
+    """Minimal RSS double that avoids network access in integration tests."""
+
+    def __init__(self, update: FeedUpdate | None = None) -> None:
+        self.update = update
+        self.updates: list[FeedUpdate] = [update] if update else []
+        self.check_calls = 0
+
+    def check(self) -> FeedUpdate | None:
+        self.check_calls += 1
+        update = self.update
+        self.update = None
+        return update
+
+    def check_all(self, limit: int | None = None) -> list[FeedUpdate]:
+        """Mirrors JokersRSS.check_all: drains pending updates."""
+        self.check_calls += 1
+        updates = self.updates
+        self.updates = []
+        if updates:
+            self.update = None
+        return updates
+
+    def current(self) -> FeedUpdate | None:
+        return self.update
+
+
+class AnnouncerDouble:
+    """Minimal announcer double that can fail for a chosen event."""
+
+    def __init__(self, failing_event: ProductionEvent | None = None) -> None:
+        self.failing_event = failing_event
+        self.events: list[ProductionEvent] = []
+
+    async def announce(self, event: ProductionEvent) -> None:
+        self.events.append(event)
+        if event is self.failing_event:
+            raise RuntimeError("announcement failed")
+
+
+class EngineDouble:
+    """Engine double used to exercise Scheduler's continuous loop."""
+
+    def __init__(self) -> None:
+        self.tick_calls = 0
+        self.failure: Exception | None = None
+        self.on_tick = None
+
+    async def tick(self) -> None:
+        self.tick_calls += 1
+        if self.failure is not None:
+            failure = self.failure
+            self.failure = None
+            raise failure
+        if self.on_tick is not None:
+            self.on_tick()
+
+
+def make_event(title: str = "Production event") -> SpyEvent:
+    """Creates an event with the repository's concrete event contract."""
+
+    return SpyEvent(
+        source="IntegrationTest",
+        event_type=EventType.SYSTEM,
+        title=title,
+        detail="Engine integration test event.",
+    )
+
+
+def make_result(events: list[ProductionEvent] | None = None) -> MonitorResult:
+    """Creates a healthy result produced by a monitor."""
+
+    return MonitorResult(
+        monitor="IntegrationMonitor",
+        status=MonitorStatus.HEALTHY,
+        changed=bool(events),
+        detail="Integration monitor completed.",
+        events=events or [],
+    )
+
+
+def make_engine(
+    storage: Storage,
+    watcher: WatcherDouble | None = None,
+    announcer: AnnouncerDouble | None = None,
+    rss_update: FeedUpdate | None = None,
+) -> ProductionEngine:
+    """Creates a real engine with controlled pipeline collaborators."""
+
+    engine = ProductionEngine(storage=storage)
+    engine.watcher = watcher or WatcherDouble()
+    engine.announcer = announcer or AnnouncerDouble()
+    engine.rss = RSSDouble(rss_update)
+    return engine
+
+
+def test_tick_runs_complete_pipeline_and_clears_last_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A successful tick runs watcher, processing, announcing, and saving."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    event = make_event()
+    result = make_result([event])
+    watcher = WatcherDouble(results=[result], events=[event])
+    announcer = AnnouncerDouble()
+    engine = make_engine(Storage(), watcher, announcer)
+    engine.last_error = "previous cycle failed"
+
+    observed_pending_events: list[ProductionEvent] = []
+    original_process_events = engine.process_events
+
+    async def observe_process_events() -> None:
+        observed_pending_events.extend(engine.pending_events)
+        await original_process_events()
+
+    engine.process_events = AsyncMock(side_effect=observe_process_events)
+    engine.announce = AsyncMock(wraps=engine.announce)
+    engine.save_state = AsyncMock(wraps=engine.save_state)
+
+    asyncio.run(engine.tick())
+
+    assert watcher.run_calls == 1
+    assert engine.last_results == [result]
+    assert observed_pending_events == [event]
+    assert announcer.events == [event]
+    assert event.mark_announced_calls == 1
+    assert event.announced is True
+    assert list(engine.pending_events) == []
+    assert engine.tick_count == 1
+    assert engine.last_error is None
+    engine.process_events.assert_awaited_once()
+    engine.announce.assert_awaited_once()
+    engine.save_state.assert_awaited_once()
+
+
+def test_tick_publishes_unrecognized_rss_item_as_live_feed_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Every surfaced RSS item is published even when the parser recognizes no state."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    rss_update = FeedUpdate(
+        guid="rss-live-feed-1",
+        title="09:13 PM PST - Angela was dropping F bombs so much that they think BB won't be able to use much of the scene for TV. (NT)",
+        description="",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=30876270",
+        published="2026-08-09T04:13:00Z",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(
+        Storage(),
+        announcer=announcer,
+        rss_update=rss_update,
+    )
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.event_type is EventType.RSS_UPDATE
+    assert event.title == "LIVE FEED UPDATE"
+    assert event.detail == rss_update.title
+    assert event.metadata["guid"] == rss_update.guid
+    assert event.metadata["link"] == rss_update.link
+    assert event.announced is True
+    assert engine.pending_event_count == 0
+
+
+def test_tick_resolves_imgur_images_for_img_tagged_rss_item(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An (IMG)-tagged RSS item's images are resolved through
+    ImgurResolver and land in the published event's metadata,
+    end-to-end through a real tick()."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    rss_update = FeedUpdate(
+        guid="rss-img-1",
+        title="7:55 AM HGs up and about. (NT) (IMG)",
+        description="7:55 AM HGs up and about. (NT) (IMG)",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=1",
+        published="2026-08-15T10:59:57-07:00",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(Storage(), announcer=announcer, rss_update=rss_update)
+
+    class StubImgurResolver:
+        def resolve_images_for_update(self, update):
+            assert update is rss_update
+            return ["https://i.imgur.com/resolved.jpg"]
+
+    engine.imgur = StubImgurResolver()
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.metadata["image_urls"] == ["https://i.imgur.com/resolved.jpg"]
+    assert event.metadata["image_url"] == "https://i.imgur.com/resolved.jpg"
+
+
+def test_tick_does_not_call_imgur_resolver_for_plain_rss_items(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A normal (non-(IMG)) RSS item must not trigger any Imgur
+    network request. Uses the real ImgurResolver (engine's default)
+    with urlopen blocked, so a regression that bypasses the "(IMG)"
+    gate in ImgurResolver.resolve_images_for_update() -- see
+    production/imgur.py -- is caught end-to-end through a real
+    tick(), not just at the unit level."""
+
+    import production.imgur as imgur_module
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not make a network request")
+
+    monkeypatch.setattr(imgur_module, "urlopen", fail_if_called)
+
+    rss_update = FeedUpdate(
+        guid="rss-plain-1",
+        title="Lala out of bed, wakes Melody. (NT)",
+        description="",
+        link="https://forums.jokersupdates.com/ubbthreads/gotothread.php?gotopost=2",
+        published="2026-08-15T07:02:00-07:00",
+    )
+    announcer = AnnouncerDouble()
+    engine = make_engine(Storage(), announcer=announcer, rss_update=rss_update)
+    # engine.imgur is the real ImgurResolver from ProductionEngine.__init__
+    # -- deliberately not replaced, so this exercises the actual gate.
+
+    asyncio.run(engine.tick())
+
+    assert len(announcer.events) == 1
+    event = announcer.events[0]
+    assert event.metadata["image_urls"] == []
+    assert event.metadata["image_url"] == ""
+    assert event.detail == rss_update.title
+
+
+def test_tick_applies_new_rss_state_to_monitors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A new RSS item is parsed and supplied to both built-in monitors."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    engine = make_engine(
+        Storage(),
+        rss_update=FeedUpdate(
+            guid="rss-1",
+            title="Morgan won HOH",
+            description="",
+            link="https://example.test/rss-1",
+            published="2026-08-08T00:00:00Z",
+        ),
+    )
+
+    asyncio.run(engine.tick())
+
+    assert engine.watcher.house_status.hoh == "Morgan"
+    assert engine.watcher.competition.winner == "Morgan"
+    assert engine.watcher.competition.competition.value == "Head of Household"
+    assert engine.tick_count == 1
+
+
+def test_failed_cycle_records_error_without_counting_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Watcher failures are recorded and do not count as completed cycles."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    engine = make_engine(
+        Storage(),
+        watcher=WatcherDouble(error=RuntimeError("watcher failed")),
+    )
+
+    asyncio.run(engine.tick())
+
+    assert engine.error_count == 1
+    assert engine.last_error == "watcher failed"
+    assert engine.tick_count == 0
+
+
+def test_announcement_failure_requeues_events_in_original_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An announcement failure leaves the failed event and successors queued."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+
+    first = make_event("first")
+    failed = make_event("failed")
+    third = make_event("third")
+    announcer = AnnouncerDouble(failing_event=failed)
+    engine = make_engine(Storage(), announcer=announcer)
+    engine.pending_events = deque([first, failed, third])
+
+    asyncio.run(engine.announce())
+
+    assert announcer.events == [first, failed]
+    assert first.mark_announced_calls == 1
+    assert first.announced is True
+    assert failed.mark_announced_calls == 0
+    assert list(engine.pending_events) == [failed, third]
+
+
+# ==========================================================
+# Competition routing regression (A3 incident)
+# ==========================================================
+#
+# Real production failure: a COMPETITION_WINNER event's "production"
+# Discord destination could never resolve (no such channel exists in
+# the deployed server -- see services/discord_output.py). Because
+# announce() above requeues a failed event at the front of
+# pending_events and stops for that tick, a competition event that
+# can never succeed becomes a PERMANENT head-of-line block: nothing
+# queued behind it -- including on every later tick, since A3 (see
+# production/engine.py _persist_pending_events()) durably persists
+# that exact queue state across restarts -- is ever announced again.
+#
+# This test exercises the real ProductionEngine.announce() loop
+# against a real DiscordOutputRouter (not the AnnouncerDouble used
+# above) wired to fake channels matching the real deployed server
+# (house-status, live-updates -- deliberately no "production"
+# channel), proving the routing fix eliminates this failure mode
+# rather than merely working around it.
+
+
+class _FakeChannel:
+    def __init__(self, channel_id: int, name: str) -> None:
+        self.id = channel_id
+        self.name = name
+        self.messages: list[dict] = []
+
+    async def send(self, **kwargs) -> None:
+        self.messages.append(kwargs)
+
+
+class _FakeBot:
+    def __init__(self, channels: list[_FakeChannel]) -> None:
+        self.channels = channels
+
+    def get_channel(self, channel_id: int):
+        return next((c for c in self.channels if c.id == channel_id), None)
+
+    async def fetch_channel(self, channel_id: int):
+        return self.get_channel(channel_id)
+
+    def get_all_channels(self):
+        return iter(self.channels)
+
+
+def test_competition_event_does_not_permanently_block_later_events(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A competition event, once queued alongside a later unrelated
+    event, must not permanently prevent that later event from
+    eventually being announced -- the real production failure mode."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    monkeypatch.setattr("services.discord_output.HOUSE_STATUS_CHANNEL", 0)
+    monkeypatch.setattr("services.discord_output.LIVE_UPDATES_CHANNEL", 0)
+
+    house = _FakeChannel(1, "house-status")
+    live = _FakeChannel(2, "live-updates")
+    # No "production"-named or -ID'd channel anywhere on this bot --
+    # matching the real deployed Discord server exactly.
+
+    engine = make_engine(Storage())
+    engine.announcer = ProductionAnnouncer()
+    engine.announcer._discord_output = DiscordOutputRouter(_FakeBot([house, live]))
+
+    competition_event = ProductionEvent(
+        source="Competition",
+        event_type=EventType.COMPETITION_WINNER,
+        title="Competition Winner",
+        detail="Yash",
+        severity=EventSeverity.IMPORTANT,
+    )
+    # RSS_UPDATE routes to live-updates -- a real destination, so any
+    # failure to announce it must come from the queue being blocked,
+    # not from this event also targeting an unresolvable channel.
+    later_event = ProductionEvent(
+        source="Joker's Updates",
+        event_type=EventType.RSS_UPDATE,
+        title="LIVE FEED UPDATE",
+        detail="Later, unrelated update.",
+    )
+    engine.pending_events = deque([competition_event, later_event])
+
+    asyncio.run(engine.announce())
+
+    assert competition_event.announced is True
+    assert later_event.announced is True
+    assert list(engine.pending_events) == []
+    assert len(live.messages) == 2
+    assert len(house.messages) == 0  # competition events do not target house-status
+
+
+def test_scheduler_retries_after_error_and_runs_until_stopped(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The scheduler catches tick errors and continues until stop() is called."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    monkeypatch.setattr("services.scheduler.CHECK_INTERVAL", 0)
+
+    scheduler = Scheduler()
+    engine = EngineDouble()
+    engine.failure = RuntimeError("transient tick failure")
+    scheduler.engine = engine
+
+    def stop_after_second_success() -> None:
+        if engine.tick_calls == 3:
+            scheduler.stop()
+
+    engine.on_tick = stop_after_second_success
+
+    asyncio.run(scheduler.start())
+
+    assert engine.tick_calls == 3
+    assert scheduler.running is False
+
+
+def test_shutdown_saves_and_restart_loads_storage_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Shutdown saves storage and the next engine observes persisted state."""
+
+    storage_file = tmp_path / "storage.json"
+    monkeypatch.setattr(Storage, "FILE", storage_file)
+
+    storage = Storage()
+    storage.last_guid = "persisted-guid"
+    storage.save = MagicMock(wraps=storage.save)
+    engine = make_engine(storage)
+    engine.running = True
+
+    asyncio.run(engine.shutdown())
+
+    assert storage.save.call_count == 1
+    assert engine.running is False
+    assert storage_file.exists()
+
+    restarted_engine = make_engine(Storage())
+
+    assert restarted_engine.storage.last_guid == "persisted-guid"

@@ -1,46 +1,64 @@
-"""
-Julie ChenBot
-=============
-
-Main entry point for Julie ChenBot.
-"""
+# Julie ChenBot
+# =============
+#
+# Main entry point for Julie ChenBot.
 
 from __future__ import annotations
 
 import sys
+import signal
+import asyncio
 
-from config import BOT_NAME, VERSION
 from core.application import JulieApplication
-from personality.julie import Julie
-from services.logger import ProductionLogger
-
-
-def banner() -> None:
-
-    print()
-    print("═" * 55)
-    print(f"🤖 {BOT_NAME} v{VERSION}")
-    print("═" * 55)
-    print()
+from services.logger import (
+    ProductionLogger,
+    generate_session_id,
+    shutdown_banner,
+    startup_banner,
+)
 
 
 def main() -> None:
 
     logger = ProductionLogger.get("Bot")
-    julie = Julie()
 
-    banner()
+    session_id = generate_session_id()
 
-    print(julie.startup())
+    print(startup_banner(session_id))
     print()
 
     logger.info("Production systems are coming online.")
+    logger.info("Session ID: %s", session_id)
+
+    app = None
 
     try:
 
         logger.info("Loading application...")
 
         app = JulieApplication()
+
+        # Register shutdown signal handlers to gracefully stop Discord service
+        def _signal_handler(_signum, _frame):
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    app.discord.shutdown(),
+                )
+            else:
+                # Fallback: run shutdown synchronously
+                try:
+                    asyncio.run(app.discord.shutdown())
+                except Exception:
+                    pass
+
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(_sig, _signal_handler)
 
         logger.info("Application loaded successfully.")
 
@@ -50,8 +68,26 @@ def main() -> None:
 
     except KeyboardInterrupt:
 
+        # Read whatever engine stats are available; any missing
+        # link in the chain (app never built, engine never
+        # started) falls back to None, and shutdown_banner()
+        # reports those as "N/A".
+        engine = getattr(
+            getattr(getattr(app, "discord", None), "scheduler", None),
+            "engine",
+            None,
+        )
+
         print()
-        print(julie.shutdown())
+        print(
+            shutdown_banner(
+                session_id,
+                uptime=getattr(engine, "uptime", None),
+                tick_count=getattr(engine, "tick_count", None),
+                error_count=getattr(engine, "error_count", None),
+            )
+        )
+
         logger.info("Julie ChenBot stopped by user.")
 
     except Exception:

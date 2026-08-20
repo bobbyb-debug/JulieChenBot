@@ -2,11 +2,7 @@
 Julie ChenBot Scheduler
 =======================
 
-Runs background tasks for Julie ChenBot.
-
-Current Tasks
--------------
-• Checks JokersUpdates RSS every 60 seconds.
+Runs Julie's Production Engine on a fixed interval.
 """
 
 from __future__ import annotations
@@ -14,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from config import CHECK_INTERVAL
-from production.engine import JokersRSS
+from production.engine import ProductionEngine
 from services.logger import ProductionLogger
 
 
@@ -27,7 +23,7 @@ class Scheduler:
 
         self.logger = ProductionLogger.get("Scheduler")
 
-        self.jokers = JokersRSS()
+        self.engine = ProductionEngine()
 
         self.running = False
 
@@ -36,6 +32,12 @@ class Scheduler:
     # ==========================================================
 
     async def start(self) -> None:
+        """
+        Starts Julie's production scheduler.
+
+        Executes one Production Engine cycle every
+        CHECK_INTERVAL seconds until stopped.
+        """
 
         if self.running:
             return
@@ -50,32 +52,20 @@ class Scheduler:
 
             try:
 
-                update = self.jokers.check()
+                self.logger.info(
+                    "Scheduler invoking engine.tick()."
+                )
 
-                if update:
+                await self.engine.tick()
 
-                    self.logger.info(
-                        "NEW LIVE FEED UPDATE"
-                    )
-
-                    self.logger.info(
-                        update.title
-                    )
-
-                    self.logger.info(
-                        update.link
-                    )
-
-                else:
-
-                    self.logger.info(
-                        "No new live feed updates."
-                    )
+                self.logger.info(
+                    "Engine tick completed."
+                )
 
             except Exception:
 
                 self.logger.exception(
-                    "Scheduler encountered an error."
+                    "Scheduler encountered an unexpected error."
                 )
 
             await asyncio.sleep(
@@ -87,6 +77,9 @@ class Scheduler:
     # ==========================================================
 
     def stop(self) -> None:
+        """
+        Stops the scheduler.
+        """
 
         self.running = False
 
