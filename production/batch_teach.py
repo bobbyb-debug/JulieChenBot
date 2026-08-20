@@ -31,7 +31,11 @@ from dataclasses import dataclass, field
 
 from production.knowledge import KnowledgeItem, KnowledgeStore, KnowledgeType
 
-_LINE_PATTERN = re.compile(r"^(FACT|RULE|STATE)\s*:\s*(.*)$", re.IGNORECASE)
+# No \s* between ":" and the trailing capture group: it would overlap
+# with "(.*)$" (both match spaces), which is exactly the polynomial-time
+# backtracking CodeQL's py/polynomial-redos flags on unbounded input.
+# Harmless to drop -- the caller strips group 2 anyway (see rest below).
+_LINE_PATTERN = re.compile(r"^(FACT|RULE|STATE)\s*:(.*)$", re.IGNORECASE)
 
 
 # ==========================================================
@@ -151,7 +155,12 @@ def _parse_line(line_number: int, raw: str) -> BatchLine:
     )
 
 
-_STATE_UPDATE_LINE_PATTERN = re.compile(r"^([A-Za-z_ ]+?)\s*:\s*(.+)$")
+# No \s* around ":": "[A-Za-z_ ]+?" already includes space in its own
+# charset, so an adjacent \s* on either side is ambiguous about which
+# group consumed a given space -- the same polynomial-backtracking
+# shape CodeQL's py/polynomial-redos flags. Harmless to drop -- both
+# captured groups are stripped by the caller below regardless.
+_STATE_UPDATE_LINE_PATTERN = re.compile(r"^([A-Za-z_ ]+?):(.+)$")
 
 
 def parse_state_updates(text: str, *, note: str | None = None) -> list[BatchLine]:
