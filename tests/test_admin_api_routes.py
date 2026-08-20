@@ -200,7 +200,9 @@ def test_forget_knowledge_deactivates_it(tmp_path: Path, monkeypatch) -> None:
     assert engine.knowledge.get(item.id).active is False
 
 
-def test_reactivate_knowledge_restores_it_in_place(tmp_path: Path, monkeypatch) -> None:
+def test_reactivate_knowledge_restores_it_in_place(
+    tmp_path: Path, monkeypatch
+) -> None:
     engine, app = _build(monkeypatch, tmp_path)
     item = engine.knowledge.teach(KnowledgeType.FACT, "Some fact.", 1)
     engine.knowledge.forget(item.id)
@@ -218,7 +220,7 @@ def test_reactivate_knowledge_restores_it_in_place(tmp_path: Path, monkeypatch) 
                 f"/api/v1/knowledge/{item.id}/reactivate", headers=AUTH
             )
             body2 = await second.json()
-            assert body2["reactivated"] is False  # already active -- idempotent
+            assert body2["reactivated"] is False  # already active
 
     _run(scenario())
     restored = engine.knowledge.get(item.id)

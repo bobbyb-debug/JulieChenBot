@@ -168,7 +168,9 @@ def test_forget_is_idempotent_and_safe_for_unknown_ids(
 # ==========================================================
 
 
-def test_reactivate_restores_a_forgotten_item(tmp_path: Path, monkeypatch) -> None:
+def test_reactivate_restores_a_forgotten_item(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
     store = KnowledgeStore(storage=Storage())
 
@@ -236,7 +238,9 @@ def test_reactivate_is_idempotent_and_safe_for_unknown_ids(
     assert store.reactivate(item.id) is False  # already reactivated
 
 
-def test_reactivated_item_reappears_in_active_items(tmp_path: Path, monkeypatch) -> None:
+def test_reactivated_item_reappears_in_active_items(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
     store = KnowledgeStore(storage=Storage())
 
@@ -261,7 +265,7 @@ def test_reactivate_persists_immediately(tmp_path: Path, monkeypatch) -> None:
     assert reloaded.get(item.id).active is True
 
 
-def test_reactivating_a_state_item_supersedes_the_currently_active_one_for_that_topic(
+def test_reactivating_a_state_item_supersedes_the_active_one_for_topic(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Reactivating an old STATE item must never produce two active
