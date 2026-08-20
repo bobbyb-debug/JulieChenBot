@@ -200,6 +200,48 @@ def test_forget_knowledge_deactivates_it(tmp_path: Path, monkeypatch) -> None:
     assert engine.knowledge.get(item.id).active is False
 
 
+def test_reactivate_knowledge_restores_it_in_place(tmp_path: Path, monkeypatch) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    item = engine.knowledge.teach(KnowledgeType.FACT, "Some fact.", 1)
+    engine.knowledge.forget(item.id)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                f"/api/v1/knowledge/{item.id}/reactivate", headers=AUTH
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body == {"id": item.id, "reactivated": True}
+
+            second = await client.post(
+                f"/api/v1/knowledge/{item.id}/reactivate", headers=AUTH
+            )
+            body2 = await second.json()
+            assert body2["reactivated"] is False  # already active -- idempotent
+
+    _run(scenario())
+    restored = engine.knowledge.get(item.id)
+    assert restored.active is True
+    assert restored.content == "Some fact."
+    assert len(engine.knowledge.all_items()) == 1  # no duplicate created
+
+
+def test_reactivate_knowledge_rejects_a_non_integer_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, app = _build(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/knowledge/not-a-number/reactivate", headers=AUTH
+            )
+            assert resp.status == 400
+
+    _run(scenario())
+
+
 def test_knowledge_list_filters_by_type_and_active(
     tmp_path: Path, monkeypatch
 ) -> None:

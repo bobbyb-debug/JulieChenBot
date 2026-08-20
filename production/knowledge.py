@@ -333,6 +333,52 @@ class KnowledgeStore:
 
         return True
 
+    def reactivate(self, item_id: int) -> bool:
+        """Reactivates a deactivated knowledge item IN PLACE -- the
+        same id, type, content, author_id, created_at, and topic;
+        only `active` flips back to True (and `updated_at` advances).
+        Never creates a new item. Returns False if no such inactive
+        item exists (already active, or never existed) -- reactivating
+        is idempotent, never an error, mirroring forget()'s posture.
+
+        A STATE item is a special case: this store guarantees at most
+        one active STATE item per topic (see active_state() and
+        teach()'s own auto-supersede-on-write) -- every command and
+        the AI chat context rely on that being true. Reactivating a
+        STATE item whose topic currently has a DIFFERENT active STATE
+        item would silently break that guarantee (two "current" values
+        for one topic). So if one exists, it is deactivated first --
+        exactly as if this item had just been re-taught for that
+        topic -- keeping the invariant intact rather than adding a
+        second, competing rule for STATE items to work around it.
+        """
+
+        item = self.get(item_id)
+
+        if item is None or item.active:
+            return False
+
+        if item.type == KnowledgeType.STATE and item.topic:
+            currently_active = self.active_state(item.topic)
+            if currently_active is not None and currently_active.id != item.id:
+                currently_active.active = False
+                currently_active.updated_at = datetime.now(UTC)
+                logger.info(
+                    "Reactivating #%d superseded currently active STATE "
+                    "#%d for topic %s.",
+                    item_id,
+                    currently_active.id,
+                    item.topic,
+                )
+
+        item.active = True
+        item.updated_at = datetime.now(UTC)
+        self._persist()
+
+        logger.info("Reactivated knowledge #%d.", item_id)
+
+        return True
+
     # ======================================================
     # Reads
     # ======================================================
