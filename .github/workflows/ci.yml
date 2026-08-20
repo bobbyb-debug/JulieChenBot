@@ -36,11 +36,6 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    # Non-blocking: the repo currently has pre-existing flake8 E501
-    # violations in a handful of test files (unrelated to this
-    # workflow). Surfacing lint output without failing CI on day one
-    # avoids gating merges on a pre-existing, unrelated cleanup.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -54,5 +49,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      # Non-blocking: the repo currently has pre-existing flake8 E501
+      # violations in a handful of test files (unrelated to this
+      # workflow). Surfacing lint output without failing CI on day one
+      # avoids gating merges on a pre-existing, unrelated cleanup.
       - name: Run flake8
         run: python -m flake8 .
+        continue-on-error: true
