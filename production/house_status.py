@@ -1,0 +1,437 @@
+"""
+Julie ChenBot House Status Monitor
+=================================
+
+Monitors the parsed Big Brother House Status.
+
+The HouseStatusMonitor compares the newest parsed house state
+against the previous state remembered by Julie.
+
+This monitor does NOT download images or RSS feeds.
+It simply evaluates parsed production data.
+
+Future responsibilities include:
+
+• Head of Household changes
+• Nomination changes
+• Power of Veto changes
+• Have-Not changes
+• Feed status changes
+• Evictions
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Optional
+
+from database.storage import Storage
+
+from production.events import (
+    EventSeverity,
+    EventType,
+    ProductionEvent,
+)
+
+from production.monitors import (
+    Monitor,
+    MonitorResult,
+    MonitorStatus,
+)
+
+from services.logger import ProductionLogger
+
+logger = ProductionLogger.get("HouseStatus")
+
+
+# ==========================================================
+# House Status
+# ==========================================================
+
+
+@dataclass(slots=True)
+class HouseStatus:
+    """
+    Represents the current Big Brother house state.
+    """
+
+    hoh: str = ""
+
+    nominees: tuple[str, ...] = ()
+
+    veto_holder: str = ""
+
+    veto_used: bool = False
+
+    have_nots: tuple[str, ...] = ()
+
+    feeds: str = ""
+
+    # ======================================================
+    # Serialization
+    # ======================================================
+
+    def to_dict(self) -> dict:
+        """Converts to a JSON-safe dictionary for durable persistence."""
+
+        return {
+            "hoh": self.hoh,
+            "nominees": list(self.nominees),
+            "veto_holder": self.veto_holder,
+            "veto_used": self.veto_used,
+            "have_nots": list(self.have_nots),
+            "feeds": self.feeds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HouseStatus":
+        """Restores a HouseStatus from a previously persisted dictionary."""
+
+        return cls(
+            hoh=data.get("hoh", ""),
+            nominees=tuple(data.get("nominees", ())),
+            veto_holder=data.get("veto_holder", ""),
+            veto_used=bool(data.get("veto_used", False)),
+            have_nots=tuple(data.get("have_nots", ())),
+            feeds=data.get("feeds", ""),
+        )
+
+
+# ==========================================================
+# House Status Monitor
+# ==========================================================
+
+
+class HouseStatusMonitor(Monitor):
+    """
+    Monitors parsed House Status.
+
+    Another module is responsible for producing a new
+    HouseStatus object. This monitor simply compares it
+    against the previously remembered state.
+    """
+
+    def __init__(
+        self,
+        storage: Optional[Storage] = None,
+    ) -> None:
+
+        super().__init__()
+
+        self.storage = storage or Storage()
+
+        self.current = HouseStatus()
+
+        self.pending_status: Optional[
+            HouseStatus
+        ] = None
+
+        logger.info(
+            "House Status monitor initialized."
+        )
+
+    # ======================================================
+    # Feed New Status
+    # ======================================================
+
+    def update(
+        self,
+        status: HouseStatus,
+    ) -> None:
+        """
+        Supplies a newly parsed house status to be checked
+        during the next production cycle.
+        """
+
+        self.pending_status = status
+
+    # ======================================================
+    # Monitor
+    # ======================================================
+
+    async def check(
+        self,
+    ) -> MonitorResult:
+
+        if self.pending_status is None:
+
+            return MonitorResult(
+
+                monitor=self.name,
+
+                status=MonitorStatus.HEALTHY,
+
+                changed=False,
+
+                detail="No new house status.",
+
+            )
+
+        new = self.pending_status
+
+        self.pending_status = None
+
+        #
+        # First observation
+        #
+
+        if self.current == HouseStatus():
+
+            self.current = new
+
+            return MonitorResult(
+
+                monitor=self.name,
+
+                status=MonitorStatus.HEALTHY,
+
+                changed=False,
+
+                detail="Initial house status captured.",
+
+            )
+
+        #
+        # No changes
+        #
+
+        if new == self.current:
+
+            return MonitorResult(
+
+                monitor=self.name,
+
+                status=MonitorStatus.HEALTHY,
+
+                changed=False,
+
+                detail="House status unchanged.",
+
+            )
+
+        events: list[
+            ProductionEvent
+        ] = []
+
+        #
+        # HOH
+        #
+
+        if new.hoh != self.current.hoh:
+
+            events.append(
+
+                ProductionEvent(
+
+                    source=self.name,
+
+                    event_type=EventType.HOH_CHANGED,
+
+                    title="Live Feed: Possible HOH Change",
+
+                    detail=(
+                        f"Live feed suggests HOH may now be {new.hoh} "
+                        f"(previously tracked: {self.current.hoh or 'none'}). "
+                        "Unconfirmed -- not yet reflected in official state; "
+                        "an admin can confirm via the dashboard."
+                    ),
+
+                    severity=EventSeverity.IMPORTANT,
+
+                )
+
+            )
+
+        #
+        # Nominations
+        #
+
+        if new.nominees != self.current.nominees:
+
+            events.append(
+
+                ProductionEvent(
+
+                    source=self.name,
+
+                    event_type=EventType.NOMINATIONS_CHANGED,
+
+                    title="Live Feed: Possible Nomination Change",
+
+                    detail=(
+                        "Live feed suggests nominees may now be: "
+                        f"{', '.join(new.nominees) or 'none'}. Unconfirmed "
+                        "-- not yet reflected in official state; an admin "
+                        "can confirm via the dashboard."
+                    ),
+
+                )
+
+            )
+
+        #
+        # POV
+        #
+
+        if new.veto_holder != self.current.veto_holder:
+
+            events.append(
+
+                ProductionEvent(
+
+                    source=self.name,
+
+                    event_type=EventType.POV_CHANGED,
+
+                    title="Live Feed: Possible Veto Change",
+
+                    detail=(
+                        f"Live feed suggests the Power of Veto may now be "
+                        f"held by {new.veto_holder or 'no one'}. Unconfirmed "
+                        "-- not yet reflected in official state; an admin "
+                        "can confirm via the dashboard."
+                    ),
+
+                )
+
+            )
+
+        # Have-Nots are deliberately NOT compared/announced here. The
+        # Joker's Updates house-status image (see production/
+        # house_image.py) is the sole authoritative source for the
+        # current Have-Not list -- Julie no longer infers it from
+        # RSS/live-feed text or posts a "Have-Not List Updated" card.
+        # HouseStatus.have_nots still exists as a field (nothing sets
+        # it anymore, but existing persisted game state -- see
+        # ProductionEngine._load_game_state() -- must still round-trip
+        # cleanly), it is just never diffed/announced by this monitor.
+
+        #
+        # Feed Status
+        #
+
+        if new.feeds != self.current.feeds:
+
+            if new.feeds.lower() == "down":
+
+                events.append(
+
+                    ProductionEvent(
+
+                        source=self.name,
+
+                        event_type=EventType.FEEDS_DOWN,
+
+                        title="Live Feeds Down",
+
+                        detail="Feeds are currently unavailable.",
+
+                        severity=EventSeverity.NOTICE,
+
+                    )
+
+                )
+
+            elif new.feeds.lower() == "up":
+
+                events.append(
+
+                    ProductionEvent(
+
+                        source=self.name,
+
+                        event_type=EventType.FEEDS_UP,
+
+                        title="Live Feeds Returned",
+
+                        detail="Feeds are back online.",
+
+                        severity=EventSeverity.NOTICE,
+
+                    )
+
+                )
+
+        #
+        # Save new state
+        #
+
+        self.current = new
+
+        logger.info(
+            "House Status changed."
+        )
+
+        return MonitorResult(
+
+            monitor=self.name,
+
+            status=MonitorStatus.HEALTHY,
+
+            changed=True,
+
+            detail="House status updated.",
+
+            events=events,
+
+        )
+
+    # ======================================================
+    # Snapshot
+    # ======================================================
+
+    def snapshot(self) -> dict:
+
+        return {
+
+            "timestamp":
+                datetime.now(UTC).isoformat(),
+
+            "hoh":
+                self.current.hoh,
+
+            "nominees":
+                list(self.current.nominees),
+
+            "veto_holder":
+                self.current.veto_holder,
+
+            "veto_used":
+                self.current.veto_used,
+
+            "have_nots":
+                list(self.current.have_nots),
+
+            "feeds":
+                self.current.feeds,
+
+        }
+
+    # ======================================================
+    # Convenience Properties
+    # ======================================================
+
+    @property
+    def hoh(self) -> str:
+        return self.current.hoh
+
+    @property
+    def nominees(self) -> tuple[str, ...]:
+        return self.current.nominees
+
+    @property
+    def veto_holder(self) -> str:
+        return self.current.veto_holder
+
+    @property
+    def veto_used(self) -> bool:
+        return self.current.veto_used
+
+    @property
+    def have_nots(self) -> tuple[str, ...]:
+        return self.current.have_nots
+
+    @property
+    def feeds(self) -> str:
+        return self.current.feeds
