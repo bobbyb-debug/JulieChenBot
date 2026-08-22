@@ -9,10 +9,92 @@ here makes a real network call: urlopen is monkeypatched throughout.
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse
 
 import production.imgur as imgur_module
 from production.imgur import ImgurResolver, extract_imgur_ids
 from production.rss import FeedUpdate
+
+_IMGUR_API_HOST = "api.imgur.com"
+
+
+def _is_imgur_api_request(request, image_id: str | None = None) -> bool:
+    """True only when `request` targets Imgur's real API host --
+    parses the URL and checks the `hostname` component (optionally
+    also the exact `/3/image/<id>` path), never a raw substring check
+    against the full URL string.
+
+    This is the fake `urlopen()` replacement's routing decision in
+    every test below: "does this call go to the fake Imgur API
+    response, or the fake HTML page response?" It was previously
+    written as `"api.imgur.com" in request.full_url`, which CodeQL
+    correctly flags as the textbook incomplete-URL-substring-
+    sanitization shape (py/incomplete-url-substring-sanitization) --
+    a URL such as "https://evil.example/api.imgur.com" or
+    "https://api.imgur.com.evil.example/" would satisfy a bare
+    substring check without actually being api.imgur.com. Nothing
+    attacker-controlled reaches this function in practice (both sides
+    of every check here are values this same test file constructs),
+    so the original code was not an exploitable vulnerability -- but
+    the shape was still worth replacing with a real, host-component
+    check rather than leaving a copy of the exact anti-pattern CodeQL
+    exists to catch, and doing so makes this dispatcher correct rather
+    than merely "correct for the URLs used today.\""""
+
+    parsed = urlparse(request.full_url)
+    if parsed.hostname != _IMGUR_API_HOST:
+        return False
+    if image_id is not None:
+        return parsed.path == f"/3/image/{image_id}"
+    return True
+
+
+# ==========================================================
+# Regression coverage for the CodeQL fix itself
+# (py/incomplete-url-substring-sanitization): proves
+# _is_imgur_api_request() actually checks the URL's host component
+# rather than merely whether "api.imgur.com" appears anywhere in the
+# string -- the exact class of bypass the old bare substring check
+# (`"api.imgur.com" in request.full_url`) would have missed.
+# ==========================================================
+
+
+class _FakeRequest:
+    def __init__(self, full_url: str) -> None:
+        self.full_url = full_url
+
+
+def test_is_imgur_api_request_matches_the_real_api_url() -> None:
+    assert _is_imgur_api_request(_FakeRequest("https://api.imgur.com/3/image/abc123")) is True
+
+
+def test_is_imgur_api_request_rejects_a_lookalike_host_with_imgur_as_a_suffix() -> None:
+    """"api.imgur.com" appearing as a substring of a longer, different
+    hostname (e.g. an attacker-registered domain) must not pass."""
+
+    assert _is_imgur_api_request(_FakeRequest("https://evil-api.imgur.com.attacker.example/x")) is False
+
+
+def test_is_imgur_api_request_rejects_the_host_appearing_only_in_the_path() -> None:
+    """"api.imgur.com" appearing in the URL's path, not its host, must
+    not pass -- this is exactly the shape CodeQL's own documentation
+    uses as the canonical bypass example for this rule."""
+
+    assert _is_imgur_api_request(_FakeRequest("https://attacker.example/api.imgur.com")) is False
+
+
+def test_is_imgur_api_request_rejects_the_host_appearing_only_in_the_query_string() -> None:
+    assert _is_imgur_api_request(
+        _FakeRequest("https://attacker.example/?redirect=api.imgur.com")
+    ) is False
+
+
+def test_is_imgur_api_request_with_image_id_requires_the_exact_path() -> None:
+    real = _FakeRequest("https://api.imgur.com/3/image/goodid1")
+    wrong_id = _FakeRequest("https://api.imgur.com/3/image/otherid")
+
+    assert _is_imgur_api_request(real, "goodid1") is True
+    assert _is_imgur_api_request(wrong_id, "goodid1") is False
 
 
 class FakeResponse:
@@ -158,7 +240,7 @@ def test_resolve_images_returns_url_on_successful_api_response(monkeypatch) -> N
     )
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             assert request.headers.get("Authorization") == "Client-ID test-client-id"
             return FakeResponse(_imgur_api_success("https://i.imgur.com/Q1n6TNW.jpg"))
         return FakeResponse(page_html.encode("utf-8"))
@@ -177,7 +259,7 @@ def test_resolve_images_handles_api_error_response(monkeypatch) -> None:
     page_html = '<blockquote class="imgur-embed-pub" data-id="deleted1"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(
                 json.dumps(
                     {"data": {"error": "Image not found"}, "success": False, "status": 404}
@@ -197,7 +279,7 @@ def test_resolve_images_handles_malformed_json(monkeypatch) -> None:
     page_html = '<blockquote class="imgur-embed-pub" data-id="Q1n6TNW"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(b"not valid json{{{")
         return FakeResponse(page_html.encode("utf-8"))
 
@@ -213,7 +295,7 @@ def test_resolve_images_handles_missing_link_field(monkeypatch) -> None:
     page_html = '<blockquote class="imgur-embed-pub" data-id="Q1n6TNW"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(
                 json.dumps({"data": {"id": "Q1n6TNW"}, "success": True}).encode("utf-8")
             )
@@ -277,9 +359,9 @@ def test_one_image_fails_another_succeeds_returns_only_successful(monkeypatch) -
     )
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com/3/image/goodid1" in request.full_url:
+        if _is_imgur_api_request(request, "goodid1"):
             return FakeResponse(_imgur_api_success("https://i.imgur.com/goodid1.jpg"))
-        if "api.imgur.com/3/image/badid99" in request.full_url:
+        if _is_imgur_api_request(request, "badid99"):
             return FakeResponse(
                 json.dumps({"data": {}, "success": False, "status": 404}).encode("utf-8")
             )
@@ -299,7 +381,7 @@ def test_all_images_fail_returns_empty_list(monkeypatch) -> None:
     page_html = '<blockquote class="imgur-embed-pub" data-id="badid99"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(
                 json.dumps({"data": {}, "success": False, "status": 404}).encode("utf-8")
             )
@@ -320,9 +402,9 @@ def test_multiple_images_all_resolve_preserving_order(monkeypatch) -> None:
     )
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com/3/image/0Pn0kFs" in request.full_url:
+        if _is_imgur_api_request(request, "0Pn0kFs"):
             return FakeResponse(_imgur_api_success("https://i.imgur.com/0Pn0kFs.jpg"))
-        if "api.imgur.com/3/image/GGT1ttT" in request.full_url:
+        if _is_imgur_api_request(request, "GGT1ttT"):
             return FakeResponse(_imgur_api_success("https://i.imgur.com/GGT1ttT.jpg"))
         return FakeResponse(page_html.encode("utf-8"))
 
@@ -403,7 +485,7 @@ def test_successful_resolution_logs_embed_detected_attempt_and_success(monkeypat
     page_html = '<blockquote class="imgur-embed-pub" data-id="Q1n6TNW"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(_imgur_api_success("https://i.imgur.com/Q1n6TNW.jpg"))
         return FakeResponse(page_html.encode("utf-8"))
 
@@ -425,7 +507,7 @@ def test_failed_resolution_logs_failure(monkeypatch) -> None:
     page_html = '<blockquote class="imgur-embed-pub" data-id="badid99"></blockquote>'
 
     def fake_urlopen(request, timeout=None):
-        if "api.imgur.com" in request.full_url:
+        if _is_imgur_api_request(request):
             return FakeResponse(
                 json.dumps({"data": {}, "success": False, "status": 404}).encode("utf-8")
             )
@@ -461,9 +543,9 @@ def test_client_id_value_never_appears_in_any_log_call(monkeypatch) -> None:
         # the wrong reason (it did, the first time this was written).
         observed_auth_headers.append(request.headers.get("Authorization"))
 
-        if "api.imgur.com/3/image/goodid1" in request.full_url:
+        if _is_imgur_api_request(request, "goodid1"):
             return FakeResponse(_imgur_api_success("https://i.imgur.com/goodid1.jpg"))
-        if "api.imgur.com/3/image/badid99" in request.full_url:
+        if _is_imgur_api_request(request, "badid99"):
             return FakeResponse(b"not valid json{{{")
         return FakeResponse(page_html.encode("utf-8"))
 
