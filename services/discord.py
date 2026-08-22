@@ -33,11 +33,13 @@ from production.hamsterwatch_context import (
     HistoricalContextResult,
     retrieve_historical_context,
 )
+from production.historical_retrieval import retrieve_hoh
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
 from services.ai_service import (
     format_game_state,
     format_historical_context,
+    format_historical_events,
     format_learned_knowledge,
     format_long_term_memory,
     format_official_state,
@@ -176,6 +178,27 @@ class DiscordService:
                 )
         historical_context = format_historical_context(historical_result)
 
+        # Same best-effort posture as the Hamsterwatch block above:
+        # never mutates anything (see database/historical_events.py --
+        # every read path used here returns ADMIN_VERIFIED, active
+        # records only), never raises. engine.historical_events is
+        # constructed unconditionally in ProductionEngine.__init__()
+        # (unlike hamsterwatch, which can fail to construct), but the
+        # try/except stays anyway -- a store-level error must degrade
+        # to "no historical events" rather than break /chat.
+        try:
+            historical_hoh_result = retrieve_hoh(user_text, engine.historical_events)
+        except Exception:
+            self.logger.exception(
+                "Historical event retrieval failed; continuing without it."
+            )
+            historical_hoh_result = None
+        historical_events = (
+            format_historical_events(historical_hoh_result)
+            if historical_hoh_result is not None
+            else ""
+        )
+
         return await generate_julie_response(
             channel_id,
             user_text,
@@ -185,6 +208,7 @@ class DiscordService:
             game_state=game_state,
             knowledge=knowledge,
             memory=memory,
+            historical_events=historical_events,
             historical_context=historical_context,
         )
 

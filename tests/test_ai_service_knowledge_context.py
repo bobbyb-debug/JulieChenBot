@@ -18,8 +18,10 @@ from types import SimpleNamespace
 
 import services.ai_service as ai_service
 from database.hamsterwatch_archive import ArchivedArticle
+from database.historical_events import HistoricalEventStore
 from production.competition import CompetitionState, CompetitionType
 from production.hamsterwatch_context import HistoricalContextResult
+from production.historical_retrieval import retrieve_hoh
 from production.house_status import HouseStatus
 from production.knowledge import KnowledgeItem, KnowledgeType
 
@@ -738,3 +740,152 @@ def test_official_state_outranks_historical_context_in_prompt_order(
 
     # The boundary paragraph explicitly names this new source too.
     assert "historical season context" in ai_service.SYSTEM_INSTRUCTION.lower()
+
+
+# ==========================================================
+# format_historical_events() -- Phase 1 structured historical HOH.
+# See database/historical_events.py and
+# production/historical_retrieval.py for the store/router this
+# formatter only renders, never queries or mutates.
+# ==========================================================
+
+
+def _verified_hoh_result(tmp_path, *, season=28, cycle=6, week=6, winner="Melody"):
+    store = HistoricalEventStore(db_path=tmp_path / "historical_events.db")
+    claim = store.record_hoh_claim(
+        season=season, cycle_sequence_number=cycle, week_number=week,
+        winner=winner, source_type="manual_admin_note", source_ref="x",
+    )
+    store.verify_hoh(claim.id)
+    return retrieve_hoh(f"Who was HOH in Cycle {cycle}?", store)
+
+
+def test_format_historical_events_empty_when_nothing_retrieved():
+    from production.historical_retrieval import HistoricalHohResult
+
+    assert ai_service.format_historical_events(HistoricalHohResult()) == ""
+
+
+def test_format_historical_events_is_labeled_verified_and_non_current(tmp_path):
+    result = _verified_hoh_result(tmp_path)
+    text = ai_service.format_historical_events(result)
+
+    assert "HISTORICAL STRUCTURED EVENTS" in text
+    assert "administrator-verified" in text.lower()
+    assert "not current game state" in text.lower()
+    assert "never a substitute for official game facts" in text.lower()
+
+
+def test_format_historical_events_preserves_season_week_cycle_and_winner(tmp_path):
+    result = _verified_hoh_result(tmp_path, season=28, cycle=6, week=6, winner="Melody")
+    text = ai_service.format_historical_events(result)
+
+    assert "Season 28" in text
+    assert "Week 6" in text
+    assert "Cycle 6" in text
+    assert "Melody" in text
+
+
+def test_format_historical_events_renders_every_cycle_for_a_double_eviction(tmp_path):
+    store = HistoricalEventStore(db_path=tmp_path / "historical_events.db")
+    for cycle, winner in ((9, "Drew"), (10, "LaTrice")):
+        claim = store.record_hoh_claim(
+            season=28, cycle_sequence_number=cycle, week_number=9, winner=winner,
+            source_type="manual_admin_note", source_ref="x",
+        )
+        store.verify_hoh(claim.id)
+
+    result = retrieve_hoh("Who was HOH in Week 9?", store)
+    text = ai_service.format_historical_events(result)
+
+    assert "Drew" in text
+    assert "Latrice" in text
+    assert "multiple hoh cycles" in text.lower()
+
+
+# ==========================================================
+# generate_julie_response(): historical_events reaches the real
+# prompt, positioned between memory and historical_context, and is
+# omitted when nothing was retrieved.
+# ==========================================================
+
+
+HISTORICAL_EVENTS_TEXT = (
+    "HISTORICAL STRUCTURED EVENTS (administrator-verified...):\n"
+    "- [Season 28, Week 2, Cycle 2] HOH winner: Taylor"
+)
+
+
+def test_generate_julie_response_places_historical_events_before_historical_context(
+    monkeypatch, tmp_path
+) -> None:
+    memory_text = "REMEMBERED CONTEXT:\n- someone asked you to remember: a nickname"
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(
+            30, "what happened when Taylor was HOH?",
+            memory=memory_text,
+            historical_events=HISTORICAL_EVENTS_TEXT,
+            historical_context=HISTORICAL_TEXT,
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert content.index(memory_text) < content.index(HISTORICAL_EVENTS_TEXT)
+    assert content.index(HISTORICAL_EVENTS_TEXT) < content.index(HISTORICAL_TEXT)
+
+
+def test_generate_julie_response_omits_historical_events_block_when_nothing_retrieved(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(31, "hello", historical_events="", historical_context="")
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert "administrator-verified historical game" not in content
+
+
+def test_official_state_outranks_historical_events_in_prompt_order(
+    monkeypatch, tmp_path
+) -> None:
+    """Prompt-assembly half of the structured-events critical trust
+    test: OFFICIAL GAME FACTS must appear ahead of HISTORICAL
+    STRUCTURED EVENTS, exactly as it already outranks HISTORICAL
+    SEASON CONTEXT and LIVE FEED OBSERVATION. The behavioral half is
+    covered end-to-end in tests/test_historical_hoh_boundary.py."""
+
+    official = ai_service.format_official_state(
+        SimpleNamespace(
+            active_items=lambda: [
+                KnowledgeItem(
+                    id=1, type=KnowledgeType.STATE, content="Yash", author_id=1,
+                    created_at=datetime(2026, 8, 1, tzinfo=UTC),
+                    updated_at=datetime(2026, 8, 1, tzinfo=UTC), topic="HOH",
+                )
+            ]
+        )
+    )
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(
+            32, "who is HoH?", official_state=official,
+            historical_events=HISTORICAL_EVENTS_TEXT,
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert "Yash" in content
+    assert "Taylor" in content
+    assert content.index("OFFICIAL GAME FACTS") < content.index("HISTORICAL STRUCTURED EVENTS")

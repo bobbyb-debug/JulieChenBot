@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 from config import BOT_NAME, BUILD, ENABLE_ADMIN_API, PHASE, VERSION
+from database.historical_events import HistoricalEventStore
 from database.storage import Storage
 from production.announcer import ProductionAnnouncer
 from production.competition import CompetitionState
@@ -90,6 +91,17 @@ class ProductionEngine:
         # above: a /remember entry is never an official game fact and
         # must never be conflated with one.
         self.memory = MemoryStore(storage=self.storage)
+
+        # Structured, administrator-verified historical game events
+        # (see database/historical_events.py) -- Phase 1: HOH winners
+        # by game cycle. Deliberately its own dedicated SQLite file,
+        # not the Storage/JSON abstraction above (that mechanism
+        # rewrites its whole file on every write and has no query
+        # capability -- the same reason HamsterwatchArchive lives
+        # outside it too). Never touched by tick(), never written by
+        # anything but an explicit administrator command -- see
+        # commands/teach.py's historical-hoh subcommand.
+        self.historical_events = HistoricalEventStore()
 
         # ProductionParser and HouseStatusMonitor/CompetitionMonitor all
         # start with blank in-memory state and have no persistence of
