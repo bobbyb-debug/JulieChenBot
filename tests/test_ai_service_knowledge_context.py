@@ -562,6 +562,78 @@ def test_format_historical_context_renders_scraped_content_as_delimited_quoted_d
 
 
 # ==========================================================
+# format_historical_context() -- bounded content (MAX_HISTORICAL_CONTENT_CHARS)
+# ==========================================================
+
+
+def test_format_historical_context_preserves_normal_sized_day_n_content():
+    """A normal-length recap (well under the cap) is rendered exactly
+    as before -- no truncation marker, nothing clipped."""
+
+    normal_content = "LaLa and Devens discussed the veto plan in detail on day twelve."
+
+    result = HistoricalContextResult(
+        articles=[_article(content=normal_content, summary="short")],
+        matched_bb_day=12,
+    )
+    text = ai_service.format_historical_context(result)
+
+    assert normal_content in text
+    assert "TRUNCATED" not in text
+
+
+def test_format_historical_context_bounds_oversized_day_n_content():
+    """An unusually long Day-N article (e.g. a very long recap
+    section) must not land in the prompt verbatim -- it's capped at
+    MAX_HISTORICAL_CONTENT_CHARS."""
+
+    oversized_content = "word " * 1000  # 5000 chars, well over the 2000-char cap
+
+    result = HistoricalContextResult(
+        articles=[_article(content=oversized_content, summary="short")],
+        matched_bb_day=12,
+    )
+    text = ai_service.format_historical_context(result)
+
+    # The rendered entry itself (not the whole prompt block, which
+    # also contains the fixed framing text) must be bounded.
+    entry_line = text.splitlines()[-1]
+    assert len(entry_line) < len(oversized_content)
+    assert ai_service.MAX_HISTORICAL_CONTENT_CHARS < len(oversized_content)
+
+
+def test_format_historical_context_marks_truncated_entries_explicitly():
+    """Julie must be told explicitly when an entry was cut short --
+    never left to believe a truncated article is the whole thing."""
+
+    oversized_content = "word " * 1000
+
+    result = HistoricalContextResult(
+        articles=[_article(content=oversized_content, summary="short")],
+        matched_bb_day=12,
+    )
+    text = ai_service.format_historical_context(result)
+
+    assert "TRUNCATED" in text
+    assert "incomplete" in text.lower()
+
+
+def test_format_historical_context_does_not_truncate_the_summary_path_for_normal_content():
+    """Keyword/recency results (which already use the short `summary`
+    field, not full content) remain unaffected by the new cap for
+    ordinary-sized summaries -- same behavior as before this change."""
+
+    result = HistoricalContextResult(
+        articles=[_article(content="irrelevant full content", summary="a normal short summary")],
+        matched_bb_day=None,
+    )
+    text = ai_service.format_historical_context(result)
+
+    assert "a normal short summary" in text
+    assert "TRUNCATED" not in text
+
+
+# ==========================================================
 # generate_julie_response(): historical_context reaches the real
 # system instruction, in the intended position, for both provider
 # paths -- and is omitted entirely when nothing was retrieved.

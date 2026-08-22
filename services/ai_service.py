@@ -436,6 +436,40 @@ def format_game_state(house_status, competition) -> str:
 # read-only, third-party; see production/hamsterwatch_context.py)
 # ==========================================================
 
+# Caps how much of one article's text (almost always the Day-N full
+# recap content -- summaries are already short by construction, see
+# production/hamsterwatch_parser.py summarize()'s own 280-char
+# default) can land in a single prompt. Matches the existing order of
+# magnitude this file already uses for a whole reply's own token
+# budget (see the provider calls in generate_julie_response/
+# generate_recap below) rather than inventing an unrelated number --
+# generous enough that a normal day's recap is untouched, while still
+# keeping one unusually long article from unexpectedly consuming an
+# outsized share of Julie's context window.
+MAX_HISTORICAL_CONTENT_CHARS = 2000
+
+
+def _bounded_historical_text(text: str) -> tuple[str, bool]:
+    """Collapses internal whitespace/newlines to keep one entry on
+    one visual line (so the historical block stays clearly delimited
+    from whatever prompt section follows it), then truncates to
+    MAX_HISTORICAL_CONTENT_CHARS at the nearest word boundary if
+    needed. Returns (text, was_truncated) -- the caller uses the flag
+    to tell Julie explicitly when she isn't seeing the whole entry,
+    rather than letting a cut-off article silently look complete.
+    """
+
+    collapsed = " ".join(text.split())
+
+    if len(collapsed) <= MAX_HISTORICAL_CONTENT_CHARS:
+        return collapsed, False
+
+    truncated = collapsed[:MAX_HISTORICAL_CONTENT_CHARS]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.strip(), True
+
 
 def format_historical_context(result: HistoricalContextResult) -> str:
     """Formats retrieved Hamsterwatch archive material for the
@@ -462,7 +496,12 @@ def format_historical_context(result: HistoricalContextResult) -> str:
     renders each entry's full recap content -- there is normally
     exactly one, and it is literally what was asked for. A keyword or
     recency result renders each entry's bounded summary instead, so a
-    multi-entry, multi-day result can never balloon the prompt.
+    multi-entry, multi-day result can never balloon the prompt. Either
+    way, one entry's rendered text is capped at
+    MAX_HISTORICAL_CONTENT_CHARS (see _bounded_historical_text()) so a
+    single unusually long article can't do the same on its own --
+    Julie is told explicitly when that happens rather than being left
+    to believe a truncated entry is the whole thing.
     """
 
     if not result.articles:
@@ -477,7 +516,13 @@ def format_historical_context(result: HistoricalContextResult) -> str:
         else:
             day_label = article.article_date or "date unknown"
 
-        text = (article.content if use_full_content else article.summary).strip()
+        raw_text = (article.content if use_full_content else article.summary).strip()
+        text, was_truncated = _bounded_historical_text(raw_text)
+        if was_truncated:
+            text += (
+                " [...TRUNCATED -- this entry is longer than shown here; "
+                "treat it as possibly incomplete]"
+            )
         lines.append(f'- [{day_label}] "{article.heading}": {text}')
 
     return (
