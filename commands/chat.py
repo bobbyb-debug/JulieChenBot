@@ -14,6 +14,7 @@ import discord
 
 from production.authorization import is_trusted_moderator
 from services.logger import ProductionLogger
+from services.message_chunking import send_long_message
 
 logger = ProductionLogger.get("Chat")
 
@@ -42,7 +43,7 @@ def register(discord_service) -> None:
             is_moderator=is_trusted_moderator(interaction.user),
         )
 
-        await interaction.followup.send(reply)
+        await send_long_message(interaction.followup.send, reply)
 
         logger.info(
             "/chat used by %s (%s)",
