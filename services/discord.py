@@ -29,10 +29,15 @@ from config import (
     ENABLE_SCHEDULER,
     LIVE_UPDATES_CHANNEL,
 )
+from production.hamsterwatch_context import (
+    HistoricalContextResult,
+    retrieve_historical_context,
+)
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
 from services.ai_service import (
     format_game_state,
+    format_historical_context,
     format_learned_knowledge,
     format_long_term_memory,
     format_official_state,
@@ -145,6 +150,32 @@ class DiscordService:
             engine.memory.recall(channel_id, user_text)
         )
 
+        # Best-effort: never mutates the archive, KnowledgeStore,
+        # HouseStatus, or CompetitionState. Never raises -- this is
+        # additive background context, not a required dependency, so
+        # any failure here (the Hamsterwatch monitor never
+        # constructed, see
+        # ProductionWatcher._register_builtin_monitors(); a test
+        # double with no `hamsterwatch` attribute; an unexpected
+        # SQLite error) degrades to "no historical context" rather
+        # than breaking /chat or a mention/DM reply. Kept inline
+        # (not its own method) so it's part of generate_ai_reply()'s
+        # existing single call path rather than a second method every
+        # caller/test double needs to know about separately.
+        hamsterwatch = getattr(engine.watcher, "hamsterwatch", None)
+        historical_result = HistoricalContextResult()
+        if hamsterwatch is not None:
+            try:
+                historical_result = retrieve_historical_context(
+                    user_text, hamsterwatch.archive
+                )
+            except Exception:
+                self.logger.exception(
+                    "Hamsterwatch historical-context retrieval failed; "
+                    "continuing without it."
+                )
+        historical_context = format_historical_context(historical_result)
+
         return await generate_julie_response(
             channel_id,
             user_text,
@@ -154,6 +185,7 @@ class DiscordService:
             game_state=game_state,
             knowledge=knowledge,
             memory=memory,
+            historical_context=historical_context,
         )
 
     # ==========================================================

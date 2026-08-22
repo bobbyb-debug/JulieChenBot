@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import services.ai_service as ai_service
+from database.hamsterwatch_archive import HamsterwatchArchive
 from production.house_status import HouseStatus
 from production.competition import CompetitionState
 from production.knowledge import KnowledgeType
 from production.memory import MemoryStore
 from services.discord import DiscordService
+from services.logger import ProductionLogger
 
 
 class _KnowledgeSpy:
@@ -50,14 +53,24 @@ class _KnowledgeSpy:
 
 
 class _FakeWatcher:
-    def __init__(self) -> None:
+    def __init__(self, hamsterwatch=None) -> None:
         self.house_status = type("H", (), {"current": HouseStatus()})()
         self.competition = type("C", (), {"current": CompetitionState()})()
+        # Deliberately optional and defaulting to None (not simply
+        # omitted): existing tests below construct this with no
+        # hamsterwatch at all, exercising the exact same
+        # getattr(engine.watcher, "hamsterwatch", None) fallback path
+        # generate_ai_reply() must use for a real ProductionWatcher
+        # whose HamsterwatchMonitor failed to construct (see
+        # production/watcher.py) -- an attribute holding None and a
+        # genuinely missing attribute are indistinguishable to that
+        # getattr() call, so this is not a behavior change for them.
+        self.hamsterwatch = hamsterwatch
 
 
 class _FakeEngine:
-    def __init__(self, knowledge, memory) -> None:
-        self.watcher = _FakeWatcher()
+    def __init__(self, knowledge, memory, hamsterwatch=None) -> None:
+        self.watcher = _FakeWatcher(hamsterwatch=hamsterwatch)
         self.knowledge = knowledge
         self.memory = memory
 
@@ -74,8 +87,8 @@ class _FakeDiscordServiceHost:
 
     def __init__(self, engine) -> None:
         self._ai_cooldowns: dict[int, float] = {}
-        from types import SimpleNamespace
         self.scheduler = SimpleNamespace(engine=engine)
+        self.logger = ProductionLogger.get("Test")
 
 
 class FakeGroqMessage:
@@ -120,7 +133,7 @@ class _HostileGroqClient:
         return _Chat()
 
 
-def _setup(tmp_path: Path, monkeypatch, reply_text: str):
+def _setup(tmp_path: Path, monkeypatch, reply_text: str, hamsterwatch=None):
     monkeypatch.setattr(ai_service, "CHAT_HISTORY_FILE", tmp_path / "chat.db")
     monkeypatch.setattr(ai_service, "groq_client", _HostileGroqClient(reply_text))
     monkeypatch.setattr(ai_service, "ai_client", None)
@@ -134,7 +147,7 @@ def _setup(tmp_path: Path, monkeypatch, reply_text: str):
     )
     spy = _KnowledgeSpy(real_knowledge)
     memory = MemoryStore(storage=storage)
-    engine = _FakeEngine(spy, memory)
+    engine = _FakeEngine(spy, memory, hamsterwatch=hamsterwatch)
     host = _FakeDiscordServiceHost(engine)
     return host, spy, real_knowledge
 
@@ -237,3 +250,219 @@ def test_forget_clears_chat_history_but_leaves_official_facts_untouched(
     assert ai_service._recent_history(88) == []
     # /forget must never touch official facts.
     assert knowledge.active_state("HOH").content == "Yash"
+
+
+# ==========================================================
+# M: Historical Hamsterwatch context -- retrieved read-only
+# background, additive to /chat, never authoritative, and never a
+# path back into KnowledgeStore/HouseStatus/CompetitionState.
+# ==========================================================
+
+
+def _hamsterwatch(tmp_path: Path, day: int, content: str, summary: str | None = None):
+    """A real, file-backed HamsterwatchArchive (not a mock) wrapped
+    the same shape generate_ai_reply() actually reads
+    (engine.watcher.hamsterwatch.archive) -- proving the real
+    retrieval/formatting code path end to end, not a stand-in for
+    it."""
+
+    archive = HamsterwatchArchive(db_path=tmp_path / "hamsterwatch_archive.db")
+    archive.upsert(
+        page_url="http://hamsterwatch.com/bb28/test.shtml",
+        section_slug=f"day-{day}",
+        heading=f"Day {day} recap heading",
+        article_date=f"2026-07-{day:02d}",
+        bb_day=day,
+        content=content,
+        summary=summary or content,
+    )
+    return SimpleNamespace(archive=archive)
+
+
+def test_generate_ai_reply_works_normally_with_no_hamsterwatch_attribute_at_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Matches a real ProductionWatcher whose HamsterwatchMonitor
+    failed to construct (see production/watcher.py
+    _register_builtin_monitors()) -- self.hamsterwatch is simply never
+    set in that case. /chat must degrade to its exact pre-feature
+    behavior, not error."""
+
+    host, _, _ = _setup(tmp_path, monkeypatch, reply_text="Good evening, Houseguest.")
+    del host.scheduler.engine.watcher.hamsterwatch  # simulate a genuinely absent attribute
+
+    reply = asyncio.run(
+        host.generate_ai_reply(user_id=1, channel_id=1, user_text="hi Julie", author_name="Alex")
+    )
+
+    assert reply == "Good evening, Houseguest."
+
+
+def test_generate_ai_reply_works_normally_when_hamsterwatch_has_no_relevant_material(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hamsterwatch = _hamsterwatch(tmp_path, 3, "Completely unrelated content about breakfast.")
+    host, _, _ = _setup(
+        tmp_path, monkeypatch, reply_text="I don't have anything on that.",
+        hamsterwatch=hamsterwatch,
+    )
+
+    reply = asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1, user_text="What happened on Day 99?", author_name="Alex"
+        )
+    )
+
+    assert reply == "I don't have anything on that."
+    prompt = host.scheduler.engine.watcher.hamsterwatch.archive  # sanity: still queryable
+    assert prompt.count() == 1
+    # No misleading fallback material reached the model. SYSTEM_INSTRUCTION
+    # itself always names "HISTORICAL SEASON CONTEXT" in its boundary
+    # paragraph, so the real proof of "no block was rendered" is the
+    # absence of the formatted block's own marker text, not that label.
+    groq_calls = ai_service.groq_client.calls
+    system_message = groq_calls[0]["messages"][0]["content"]
+    assert "source: Hamsterwatch archive" not in system_message
+    assert "breakfast" not in system_message
+
+
+def test_generate_ai_reply_includes_historical_context_when_relevant_material_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hamsterwatch = _hamsterwatch(
+        tmp_path, 12, "LaLa and Devens discussed the veto plan in detail on day twelve."
+    )
+    host, _, _ = _setup(
+        tmp_path, monkeypatch, reply_text="Here's what happened.", hamsterwatch=hamsterwatch
+    )
+
+    asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1, user_text="What happened on Day 12?", author_name="Alex"
+        )
+    )
+
+    system_message = ai_service.groq_client.calls[0]["messages"][0]["content"]
+    assert "HISTORICAL SEASON CONTEXT" in system_message
+    assert "Day 12" in system_message
+    assert "veto plan" in system_message
+
+
+def test_critical_trust_official_hoh_outranks_historical_hamsterwatch_material(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exact scenario this feature must never regress on:
+
+        OFFICIAL GAME STATE: HOH = Yash
+        HISTORICAL HAMSTERWATCH MATERIAL: "Taylor was HOH during an
+          earlier period."
+
+    Both pieces of information must reach the model, correctly
+    labeled and correctly prioritized (OFFICIAL GAME FACTS ahead of
+    HISTORICAL SEASON CONTEXT, exactly as it already outranks LIVE
+    FEED OBSERVATION -- see
+    tests/test_ai_service_knowledge_context.py's
+    test_official_state_outranks_historical_context_in_prompt_order
+    for the same guarantee at the formatter level). This test proves
+    what our code controls -- what Julie is given and how it's
+    framed; it cannot prove what an actual AI provider does with that
+    prompt, which is outside this codebase.
+    """
+
+    hamsterwatch = _hamsterwatch(
+        tmp_path, 5, "Taylor was HOH during an earlier period this season."
+    )
+    host, _, real_knowledge = _setup(
+        tmp_path, monkeypatch, reply_text="Yash is the current HOH.",
+        hamsterwatch=hamsterwatch,
+    )
+    real_knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+
+    reply = asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1, user_text="Who is the current HOH?", author_name="Alex"
+        )
+    )
+
+    assert "Yash" in reply
+
+    system_message = ai_service.groq_client.calls[0]["messages"][0]["content"]
+    assert "OFFICIAL GAME FACTS" in system_message
+    assert "Yash" in system_message
+    assert "HISTORICAL SEASON CONTEXT" in system_message
+    assert "Taylor" in system_message
+    assert system_message.index("OFFICIAL GAME FACTS") < system_message.index(
+        "HISTORICAL SEASON CONTEXT"
+    )
+    # Official state was never touched by any of this.
+    assert real_knowledge.active_state("HOH").content == "Yash"
+
+
+def test_historical_question_about_a_different_topic_still_retrieves_its_own_material(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Second half of the critical-trust scenario: asking a genuinely
+    historical question (not a current-state question) must still
+    surface the relevant Hamsterwatch material -- official state
+    outranking historical context for CURRENT-state questions must
+    not mean historical context is suppressed outright."""
+
+    hamsterwatch = _hamsterwatch(
+        tmp_path, 5, "Taylor was HOH during an earlier period and nominated two Houseguests."
+    )
+    host, _, real_knowledge = _setup(
+        tmp_path, monkeypatch, reply_text="Here's what was happening then.",
+        hamsterwatch=hamsterwatch,
+    )
+    real_knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="HOH")
+
+    asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1,
+            user_text="What was happening when Taylor was HOH?", author_name="Alex",
+        )
+    )
+
+    system_message = ai_service.groq_client.calls[0]["messages"][0]["content"]
+    assert "HISTORICAL SEASON CONTEXT" in system_message
+    assert "Taylor" in system_message
+    assert "nominated" in system_message
+
+
+def test_historical_context_retrieval_never_calls_knowledge_teach(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hamsterwatch = _hamsterwatch(tmp_path, 5, "Taylor was HOH during an earlier period.")
+    host, spy, _ = _setup(
+        tmp_path, monkeypatch, reply_text="reply", hamsterwatch=hamsterwatch
+    )
+
+    asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1, user_text="What happened on Day 5?", author_name="Alex"
+        )
+    )
+
+    assert spy.teach_calls == []
+
+
+def test_historical_context_retrieval_never_mutates_house_status_or_competition_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hamsterwatch = _hamsterwatch(tmp_path, 5, "Taylor was HOH during an earlier period.")
+    host, _, _ = _setup(
+        tmp_path, monkeypatch, reply_text="reply", hamsterwatch=hamsterwatch
+    )
+    watcher = host.scheduler.engine.watcher
+    house_status_before = watcher.house_status.current
+    competition_before = watcher.competition.current
+
+    asyncio.run(
+        host.generate_ai_reply(
+            user_id=1, channel_id=1, user_text="What happened on Day 5?", author_name="Alex"
+        )
+    )
+
+    assert watcher.house_status.current is house_status_before
+    assert watcher.competition.current is competition_before
+    assert watcher.house_status.current.hoh == ""  # untouched, still the default
