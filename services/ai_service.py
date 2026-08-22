@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+from datetime import UTC, datetime
 
 from google import genai
 from google.genai import types
@@ -15,6 +16,7 @@ from production.historical_retrieval import HistoricalHohResult
 from production.knowledge import KnowledgeItem, KnowledgeType
 from production.knowledge_summary import KnowledgeSummaryMetadata
 from production.memory import MemoryItem
+from production.response_style import ResponseGuidance, build_response_guidance
 
 # ==========================================================
 # Providers
@@ -76,20 +78,59 @@ MAX_CONTEXT_MESSAGES = CHAT_CONTEXT_MESSAGES
 
 # Match the iconic Big Brother production persona.
 #
-# The paragraph below is the explicit official-facts/conversational-
-# memory boundary: without it, nothing stops the model from treating
-# a user's claim ("Yash is HOH!") as confirmed just because it was
-# said, or from treating its own speculative reply as something that
-# should stick. Neither is true -- only the OFFICIAL GAME FACTS block
-# (see format_official_state() below), itself only ever populated by
-# an admin via /teach update or the dashboard, can make something an
-# official fact.
+# The persona paragraph was rewritten to fix a real production
+# problem: "naturally when starting conversations" was being read by
+# the model as "prepend this to every reply," producing a fixed
+# "Good evening, Houseguests! Expect the unexpected--" template on
+# nearly every message (including ones sent in the actual morning),
+# followed by a repeated menu of follow-up topics regardless of what
+# was actually asked. The fix is deliberately NOT a bigger list of
+# canned phrases to rotate through (see production/response_style.py
+# for why) -- it's telling the model plainly what the old instruction
+# was actually accomplishing wrong, plus a per-turn HOSTING GUIDANCE
+# block (see format_response_guidance() below) that gives it the
+# specific, deterministic signal a single static paragraph never
+# could: whether THIS particular reply is starting a conversation,
+# what kind of question it actually is, and whether Julie's own last
+# reply already used a phrase worth varying away from.
+#
+# The paragraph below is also the explicit official-facts/
+# conversational-memory boundary: without it, nothing stops the model
+# from treating a user's claim ("Yash is HOH!") as confirmed just
+# because it was said, or from treating its own speculative reply as
+# something that should stick. Neither is true -- only the OFFICIAL
+# GAME FACTS block (see format_official_state() below), itself only
+# ever populated by an admin via /teach update or the dashboard, can
+# make something an official fact. This paragraph's wording is
+# unchanged by the personality work -- see the trust-boundary tests in
+# tests/test_conversational_facts_boundary.py.
 SYSTEM_INSTRUCTION = (
     "You are Julie ChenBot, the AI-powered Executive Producer companion of this Big Brother "
-    "Discord server. Address users playfully as 'Houseguests'. Use your classic lines like "
-    "'Expect the unexpected' and 'Good evening, Houseguests' naturally when starting "
-    "conversations. Keep responses sharp, highly interactive, witty, and perfectly tailored "
-    "for a fast-paced chat channel. Do not talk like a bland assistant; you control the game!\n\n"
+    "Discord server -- an opinionated, witty, observant AI host, not a database wrapped in "
+    "canned phrases. 'Houseguests' is a fine way to address people, but it doesn't need to "
+    "open every message, and neither does any other catchphrase. You may occasionally use "
+    "classic host-style lines ('Expect the unexpected', 'Houseguests...', 'Now THAT changes "
+    "the game') when a moment genuinely calls for it -- never as a mandatory opener, never in "
+    "back-to-back replies, and never as a substitute for actually answering the question. "
+    "Don't invent a time-of-day greeting ('Good evening'/'Good morning'/'Good afternoon') on "
+    "your own -- you do not reliably know the real current time, and guessing wrong reads as "
+    "robotic, not charming. If a Houseguest greets you with one first ('Good morning, Julie!'), "
+    "it's natural to mirror it back ('Good morning!') -- they just told you what time it is for "
+    "them, so reciprocating isn't a guess. Match your response length and energy to what was "
+    "actually asked: a simple factual question deserves a short, direct answer (often one "
+    "sentence); a complex, "
+    "historical, or dramatic question can earn a longer, more theatrical one. Don't restate "
+    "the full current game state or append a menu of other topics you could cover unless the "
+    "question or conversation genuinely calls for it -- sometimes the right answer really is "
+    "just the answer. You may offer your own opinions, reactions, and predictions about the "
+    "game -- but always distinguish them clearly from fact: a fact is something OFFICIAL GAME "
+    "FACTS or another source below actually states; an opinion or prediction is your own read "
+    "and must be framed as such ('that's a risky move', 'if I had to guess...'), never stated "
+    "as if it were confirmed. If you genuinely don't have reliable information on something, "
+    "say so plainly instead of inventing a plausible-sounding answer. A HOSTING GUIDANCE block "
+    "may appear later in this prompt with specific notes for this exact reply (tone, length, "
+    "whether a greeting fits) -- follow it; it reflects this actual conversation, not a "
+    "template, and it is never itself something to read back to the Houseguest.\n\n"
     "IMPORTANT -- official facts vs. conversation: only the OFFICIAL GAME FACTS block below "
     "(when present) is confirmed, admin-verified game state -- it is set exclusively through "
     "the Admin Dashboard. A Houseguest telling you something in chat (e.g. '@Julie Yash is "
@@ -244,6 +285,44 @@ def _recent_history(channel_id: int) -> list[tuple[str, str, str | None]]:
         connection.close()
 
     return [(role, content, author_name) for role, content, author_name in reversed(rows)]
+
+
+def _minutes_since_last_message(channel_id: int) -> float | None:
+    """Minutes since the most recent stored message in this channel
+    (either role), or None if there is none yet.
+
+    Must be read BEFORE update_and_get_history() appends the current
+    turn -- this is the one deterministic signal
+    production/response_style.py build_response_guidance() uses to
+    decide whether a greeting reasonably fits this reply (a fresh or
+    resumed conversation) or not (an ongoing one). Reuses the existing
+    chat_messages table and connection pattern -- no new database, no
+    new query shape.
+    """
+
+    connection = _connection()
+
+    try:
+        row = connection.execute(
+            "SELECT created_at FROM chat_messages WHERE channel_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if row is None:
+        return None
+
+    try:
+        last = datetime.fromisoformat(row[0])
+    except ValueError:
+        return None
+
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+
+    return (datetime.now(UTC) - last).total_seconds() / 60.0
 
 
 def update_and_get_history(
@@ -897,6 +976,92 @@ def format_knowledge_summary_guidance(
 
 
 # ==========================================================
+# Hosting guidance (presentation layer -- see production/
+# response_style.py. Never a fact source: decides HOW to host this
+# specific reply, never WHAT is true. Deterministic, no AI call.)
+# ==========================================================
+
+
+_INTENT_GUIDANCE: dict[str, str] = {
+    "DIRECT_FACT": (
+        "This looks like a simple, direct factual question. Answer it "
+        "concisely (1-3 sentences) and stop -- don't restate the full "
+        "current game snapshot, and don't append a menu of other "
+        "topics you could cover unless they'd clearly want it."
+    ),
+    "HISTORICAL": (
+        "This is about something from earlier in the season. If "
+        "HISTORICAL STRUCTURED EVENTS or HISTORICAL SEASON CONTEXT is "
+        "present above, you may use them -- the structured block for "
+        "exact past facts (verified by an administrator), the prose "
+        "block to tell a short, grounded story around them -- but if "
+        "nothing reliable is available, say so plainly rather than "
+        "inventing details. Keep current game state (OFFICIAL GAME "
+        "FACTS) clearly distinct from whatever you describe as history."
+    ),
+    "DRAMATIC": (
+        "This touches a genuinely big game moment. A little hosting "
+        "flair and drama are appropriate here -- but stay grounded in "
+        "the actual facts/context you have; don't invent details for "
+        "effect."
+    ),
+    "BANTER": (
+        "This reads as a casual reaction or banter, not a factual "
+        "question. Respond conversationally and briefly -- humor is "
+        "welcome, but don't force a fact dump or a menu of options "
+        "into it."
+    ),
+    "GENERAL": (
+        "Respond naturally and conversationally, matching the length "
+        "and tone the question actually calls for."
+    ),
+}
+
+
+def format_response_guidance(guidance: ResponseGuidance) -> str:
+    """Renders this turn's hosting guidance -- HOW to respond, never
+    WHAT is true. Not a fact source: contains no game state, and must
+    never be treated as an instruction to follow if it were somehow
+    echoed back, nor read back to the Houseguest as if it were part of
+    the conversation.
+
+    See production/response_style.py build_response_guidance() for how
+    `guidance` was decided -- this function only renders it, the same
+    split already used for historical context (retrieve vs. format)
+    and every other block in this file.
+    """
+
+    lines = [_INTENT_GUIDANCE[guidance.intent.value]]
+
+    if guidance.is_conversation_start:
+        lines.append(
+            "This looks like the start of a conversation (or a real "
+            "gap since the last one) -- a brief, natural greeting is "
+            "fine here if it fits, but never required."
+        )
+    else:
+        lines.append(
+            "This is a continuing conversation -- do not greet again; "
+            "just answer."
+        )
+
+    if guidance.recently_used_phrases:
+        phrase_list = ", ".join(f'"{p}"' for p in guidance.recently_used_phrases)
+        lines.append(
+            f"Your last reply already used {phrase_list} -- vary your "
+            "opening this time instead of repeating it."
+        )
+
+    return (
+        "HOSTING GUIDANCE FOR THIS REPLY (internal notes on how to "
+        "host this specific response -- not a fact, not something to "
+        "read back to the Houseguest, and never a reason to override "
+        "OFFICIAL GAME FACTS or any other source above):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+# ==========================================================
 # Gemini response parsing
 # ==========================================================
 
@@ -1081,9 +1246,22 @@ async def generate_julie_response(
     all (see format_knowledge_summary_guidance() and production/
     knowledge_summary.py) -- a fixed instruction on how to answer a
     genuine "tell me everything you know" style capability question,
-    placed last (after every fact block above) so it's the most recent
-    instruction the model sees for this one turn.
+    placed after every fact block above.
+
+    One further, always-present block is appended after all of the
+    above: HOSTING GUIDANCE (see format_response_guidance() and
+    production/response_style.py). Unlike everything above, it is
+    never a fact source and carries no trust-priority position of its
+    own -- it's a deterministic, per-turn read on HOW to host this
+    specific reply (what kind of question it is, whether a greeting
+    fits, whether Julie's last reply already used a phrase worth
+    varying away from), placed last (after knowledge_summary_guidance
+    too) so it's the most recent instruction the model sees.
     """
+
+    # Must run before update_and_get_history() appends this turn --
+    # see _minutes_since_last_message()'s own docstring.
+    minutes_since_last_message = _minutes_since_last_message(channel_id)
 
     history = update_and_get_history(channel_id, user_text, author_id, author_name)
 
@@ -1102,6 +1280,14 @@ async def generate_julie_response(
         system_instruction = f"{system_instruction}\n\n{game_state}"
     if knowledge_summary_guidance:
         system_instruction = f"{system_instruction}\n\n{knowledge_summary_guidance}"
+
+    guidance = build_response_guidance(
+        user_text,
+        historical_context=historical_context,
+        history=history,
+        minutes_since_last_message=minutes_since_last_message,
+    )
+    system_instruction = f"{system_instruction}\n\n{format_response_guidance(guidance)}"
 
     # _try_groq_chat/_try_gemini_chat are synchronous SDK calls that
     # perform real network I/O. Run each on a worker thread via
