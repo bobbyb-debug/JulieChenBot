@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import discord
 
+from production.authorization import is_trusted_moderator
 from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("Chat")
@@ -38,6 +39,7 @@ def register(discord_service) -> None:
             interaction.channel_id,
             message,
             author_name=author_name,
+            is_moderator=is_trusted_moderator(interaction.user),
         )
 
         await interaction.followup.send(reply)

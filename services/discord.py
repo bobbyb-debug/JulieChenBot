@@ -29,17 +29,20 @@ from config import (
     ENABLE_SCHEDULER,
     LIVE_UPDATES_CHANNEL,
 )
+from production.authorization import is_trusted_moderator
 from production.hamsterwatch_context import (
     HistoricalContextResult,
     retrieve_historical_context,
 )
 from production.historical_retrieval import retrieve_hoh
+from production.knowledge_summary import collect_summary_metadata, is_broad_knowledge_query
 from services.logger import ProductionLogger
 from services.scheduler import Scheduler
 from services.ai_service import (
     format_game_state,
     format_historical_context,
     format_historical_events,
+    format_knowledge_summary_guidance,
     format_learned_knowledge,
     format_long_term_memory,
     format_official_state,
@@ -119,12 +122,22 @@ class DiscordService:
         channel_id: int,
         user_text: str,
         author_name: str | None = None,
+        is_moderator: bool = False,
     ) -> str:
         """Generates Julie's AI reply, applying cooldown and real game
         state context.
 
         Shared by the mention/DM handler and the /chat command, so both
         entry points behave identically rather than drifting apart.
+
+        `is_moderator` is decided by the caller (see production/
+        authorization.py's is_trusted_moderator(), applied to the real
+        discord.Member/discord.User this method never sees itself) --
+        it only ever changes how much architectural framing the
+        KNOWLEDGE_SUMMARY guidance uses (see
+        production/knowledge_summary.py and
+        format_knowledge_summary_guidance()'s own docstring); every
+        other code path in this method ignores it completely.
 
         Returns a cooldown message if the user is rate-limited, rather
         than raising, since callers just send whatever string comes
@@ -199,6 +212,27 @@ class DiscordService:
             else ""
         )
 
+        # Deterministic, no-AI-call check (see production/
+        # knowledge_summary.py). The real metadata collection only
+        # runs for a genuine broad-summary question -- an ordinary
+        # message pays no extra store reads at all.
+        knowledge_summary_guidance = ""
+        if is_broad_knowledge_query(user_text):
+            summary_metadata = collect_summary_metadata(
+                knowledge_items=engine.knowledge.active_items(),
+                historical_events=engine.historical_events,
+                hamsterwatch_archive=(
+                    hamsterwatch.archive if hamsterwatch is not None else None
+                ),
+                house_status=house_status,
+                competition=competition,
+                memory_store=engine.memory,
+                channel_id=channel_id,
+            )
+            knowledge_summary_guidance = format_knowledge_summary_guidance(
+                summary_metadata, is_moderator=is_moderator
+            )
+
         return await generate_julie_response(
             channel_id,
             user_text,
@@ -210,6 +244,7 @@ class DiscordService:
             memory=memory,
             historical_events=historical_events,
             historical_context=historical_context,
+            knowledge_summary_guidance=knowledge_summary_guidance,
         )
 
     # ==========================================================
@@ -328,6 +363,7 @@ class DiscordService:
                                 message.author, "display_name", None
                             )
                             or str(message.author),
+                            is_moderator=is_trusted_moderator(message.author),
                         )
                         await message.channel.send(ai_reply)
                     except Exception:

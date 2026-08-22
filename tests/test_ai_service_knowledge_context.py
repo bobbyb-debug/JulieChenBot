@@ -24,6 +24,7 @@ from production.hamsterwatch_context import HistoricalContextResult
 from production.historical_retrieval import retrieve_hoh
 from production.house_status import HouseStatus
 from production.knowledge import KnowledgeItem, KnowledgeType
+from production.knowledge_summary import KnowledgeSummaryMetadata
 
 
 def _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=None):
@@ -132,6 +133,199 @@ def test_generate_julie_response_omits_knowledge_block_when_none_active(
 
     content = recorder["messages"][0]["content"]
     assert content == ai_service.SYSTEM_INSTRUCTION
+
+
+# ==========================================================
+# knowledge_summary_guidance: only ever present for a genuine "tell me
+# everything you know" style question (see production/
+# knowledge_summary.py and services/discord.py's generate_ai_reply()),
+# and placed after every fact block, never before one.
+# ==========================================================
+
+
+def test_knowledge_summary_guidance_placed_after_every_fact_block(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+    guidance = svc.format_knowledge_summary_guidance(KnowledgeSummaryMetadata())
+
+    asyncio.run(
+        svc.generate_julie_response(
+            4,
+            "Tell me everything you know.",
+            game_state=GAME_STATE_TEXT,
+            knowledge=KNOWLEDGE_TEXT,
+            knowledge_summary_guidance=guidance,
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert guidance in content
+    assert content.index(KNOWLEDGE_TEXT) < content.index(guidance)
+    assert content.index(GAME_STATE_TEXT) < content.index(guidance)
+
+
+def test_knowledge_summary_guidance_omitted_for_an_ordinary_question(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(5, "who is HoH?", knowledge_summary_guidance="")
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert "KNOWLEDGE SUMMARY GUIDANCE" not in content
+
+
+def test_knowledge_summary_guidance_instructs_against_revealing_internals() -> None:
+    """The guidance text must explicitly tell the model NOT to
+    describe credentials/config/implementation if asked -- distinct
+    from actually leaking a secret VALUE, which can't happen here
+    since `metadata` is counts/booleans/topic-names only (see
+    test_broad_knowledge_question_never_leaks_configured_secrets in
+    tests/test_knowledge_summary_boundary.py for the real end-to-end
+    guarantee with live secret values)."""
+
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata()
+    ).lower()
+
+    assert "credentials" in guidance
+    assert "never describe your own implementation" in guidance
+
+
+def test_knowledge_summary_guidance_is_deterministic_given_the_same_metadata() -> None:
+    """Same metadata in -> byte-identical text out every time -- the
+    only thing that can vary the rendered guidance is `metadata`
+    itself, never hidden state, randomness, or an environment read."""
+
+    metadata = KnowledgeSummaryMetadata(official_state_topics=("HOH",))
+
+    assert (
+        ai_service.format_knowledge_summary_guidance(metadata)
+        == ai_service.format_knowledge_summary_guidance(metadata)
+    )
+
+
+# ==========================================================
+# format_knowledge_summary_guidance(): reflects actual metadata,
+# never a hardcoded capability list -- the capability-vs-actual-data
+# distinction production/knowledge_summary.py's docstring describes.
+# ==========================================================
+
+
+def test_guidance_reports_only_the_official_state_topics_actually_set() -> None:
+    # Raw topics as KnowledgeStore actually stores them (uppercase) --
+    # rendered with the same "Topic Name" display convention
+    # format_official_state() already uses.
+    metadata = KnowledgeSummaryMetadata(official_state_topics=("HOH", "VETO_WINNER"))
+    guidance = ai_service.format_knowledge_summary_guidance(metadata)
+
+    assert "Hoh" in guidance
+    assert "Veto Winner" in guidance
+    assert "nothing is set right now" not in guidance
+
+
+def test_guidance_admits_no_official_state_when_none_is_set() -> None:
+    guidance = ai_service.format_knowledge_summary_guidance(KnowledgeSummaryMetadata())
+
+    assert "nothing is set right now" in guidance
+
+
+def test_guidance_distinguishes_historical_capability_from_actual_records() -> None:
+    """Zero known winners must still say the CAPABILITY exists (Phase
+    1, HOH-only) -- it must never claim a verified record that doesn't
+    exist, and must never claim the capability doesn't exist either."""
+
+    no_data_guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(historical_hoh_known_winners_count=0)
+    )
+    assert "no verified historical hoh record has been entered yet" in no_data_guidance.lower()
+    assert "phase 1" in no_data_guidance.lower()
+
+    with_data_guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(historical_hoh_known_winners_count=3)
+    )
+    assert "3 known winner" in with_data_guidance
+
+
+def test_guidance_never_claims_unimplemented_historical_categories() -> None:
+    """Phase 1 is HOH-only -- the guidance must say so explicitly and
+    never imply nominations/veto/eviction history exists."""
+
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(historical_hoh_known_winners_count=2)
+    ).lower()
+
+    assert "do not have structured records for" in guidance
+    assert "nominations, veto, evictions" in guidance
+
+
+def test_guidance_separates_live_feed_from_official_state() -> None:
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(
+            official_state_topics=("HOH",), live_feed_populated=True
+        )
+    )
+
+    assert "never a substitute for official game facts" in guidance.lower()
+
+
+def test_guidance_reports_memory_as_a_count_never_content() -> None:
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(channel_memory_count=4)
+    )
+
+    assert "4 thing(s)" in guidance
+    assert "never a confirmed game fact" in guidance.lower()
+
+
+# ==========================================================
+# Moderator vs normal-user framing (see production/authorization.py)
+# ==========================================================
+
+
+def test_moderator_guidance_uses_the_moderator_header() -> None:
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(), is_moderator=True
+    )
+
+    assert "MODERATOR BRIEFING" in guidance
+    assert "AUTHORITATIVE" in guidance
+
+
+def test_normal_user_guidance_does_not_use_the_moderator_header() -> None:
+    guidance = ai_service.format_knowledge_summary_guidance(
+        KnowledgeSummaryMetadata(), is_moderator=False
+    )
+
+    assert "MODERATOR BRIEFING" not in guidance
+
+
+def test_moderator_and_normal_guidance_never_differ_in_available_data() -> None:
+    """is_moderator only changes framing/depth, never which data is
+    included -- every KnowledgeSummaryMetadata field must appear (or
+    be equally absent) in both modes, since none of it is actually
+    sensitive."""
+
+    metadata = KnowledgeSummaryMetadata(
+        official_state_topics=("HOH",),
+        admin_rule_count=2,
+        historical_hoh_known_winners_count=1,
+        channel_memory_count=3,
+    )
+
+    normal = ai_service.format_knowledge_summary_guidance(metadata, is_moderator=False)
+    moderator = ai_service.format_knowledge_summary_guidance(metadata, is_moderator=True)
+
+    for marker in ("Hoh", "2 standing rule", "1 known winner", "3 thing(s)"):
+        assert marker in normal
+        assert marker in moderator
 
 
 # ==========================================================
