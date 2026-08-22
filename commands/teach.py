@@ -56,6 +56,7 @@ from production.batch_teach import (
     parse_state_updates,
 )
 from config import TRUSTED_MODERATOR_ROLE_ID
+from database.historical_events import AlreadyVerifiedError, HistoricalEvent
 from production.knowledge import KnowledgeItem, KnowledgeType
 from production.state_sync import is_recognized_topic
 from services.logger import ProductionLogger
@@ -426,6 +427,199 @@ class _StateUpdateConfirmView(_BatchConfirmView):
         await self._finish(interaction, summary)
 
 
+# ==========================================================
+# Historical HOH events (/teach historical-hoh) -- Phase 1 of the
+# structured historical event system (see
+# database/historical_events.py and production/historical_retrieval.py).
+# Writes ONLY to HistoricalEventStore -- never to KnowledgeStore, never
+# to HouseStatus, never to CompetitionState. A verified historical HOH
+# record can never become current OFFICIAL GAME FACTS state; that
+# still only ever happens through /teach update above, run separately
+# and explicitly for the current week.
+# ==========================================================
+
+
+def _historical_hoh_preview_embed(
+    *, season: int, cycle: int, week: Optional[int], winner: str,
+    existing: Optional[HistoricalEvent],
+) -> discord.Embed:
+    """Shows exactly what will be written, and -- critically -- warns
+    up front if this looks like a correction (an ADMIN_VERIFIED record
+    already exists for this cycle) rather than a fresh record, so a
+    moderator never supersedes an existing verified fact by accident.
+    """
+
+    embed = discord.Embed(title="🏆 Historical HOH Record", color=0x9B59B6)
+    week_line = f"Week {week}" if week is not None else "week unknown"
+    embed.description = f"**Season {season}, {week_line}, Cycle {cycle}**\nHOH: {winner}"
+
+    if existing is not None:
+        existing_winner = next(
+            (p.houseguest for p in existing.participants if p.role == "WINNER"),
+            "unknown",
+        )
+        if existing_winner == winner.strip().upper():
+            embed.add_field(
+                name="ℹ️ Already recorded",
+                value=f"This cycle's verified HOH is already **{existing_winner.title()}**. "
+                "Confirming will not change anything.",
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="⚠️ This corrects an existing verified record",
+                value=(
+                    f"Cycle {cycle} is currently verified as **{existing_winner.title()}**. "
+                    f"Confirming will supersede it with **{winner}** -- the old record is "
+                    "kept, not deleted, and stays traceable."
+                ),
+                inline=False,
+            )
+
+    embed.set_footer(text="Confirm to write this as a verified historical record.")
+    return embed
+
+
+class _HistoricalHohConfirmView(discord.ui.View):
+    """Confirm/Cancel gate for one /teach historical-hoh entry --
+    same posture as _BatchConfirmView above: zero writes happen until
+    handle_confirm() actually runs, only the requesting moderator may
+    confirm or cancel, and a timeout discards everything rather than
+    silently applying it."""
+
+    def __init__(
+        self, *, store, season: int, cycle: int, week: Optional[int], winner: str,
+        source_ref: str, excerpt: Optional[str], existing, requester_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.store = store
+        self.season = season
+        self.cycle = cycle
+        self.week = week
+        self.winner = winner
+        self.source_ref = source_ref
+        self.excerpt = excerpt
+        self.existing = existing
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+
+    async def _finish(self, interaction: discord.Interaction, content: str) -> None:
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        await interaction.response.edit_message(content=content, embed=None, view=self)
+
+    async def handle_confirm(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the moderator who started this entry can confirm it.",
+                ephemeral=True,
+            )
+            return
+
+        if self.existing is not None:
+            existing_winner = next(
+                (p.houseguest for p in self.existing.participants if p.role == "WINNER"),
+                None,
+            )
+            if existing_winner == self.winner.strip().upper():
+                await self._finish(
+                    interaction,
+                    f"ℹ️ Cycle {self.cycle}'s verified HOH is already "
+                    f"{self.winner} -- nothing changed.",
+                )
+                return
+
+            self.store.correct_hoh(
+                old_event_id=self.existing.id, winner=self.winner,
+                source_type="manual_admin_note", source_ref=self.source_ref,
+                excerpt=self.excerpt, author_id=self.requester_id,
+            )
+            logger.info(
+                "/teach historical-hoh correction confirmed by %s: cycle %d "
+                "now %s (superseded #%d).",
+                self.requester_id, self.cycle, self.winner, self.existing.id,
+            )
+            await self._finish(
+                interaction,
+                f"✅ Corrected Cycle {self.cycle}'s HOH to {self.winner} "
+                f"(previous record kept, superseded).",
+            )
+            return
+
+        claim = self.store.record_hoh_claim(
+            season=self.season, cycle_sequence_number=self.cycle,
+            week_number=self.week, winner=self.winner,
+            source_type="manual_admin_note", source_ref=self.source_ref,
+            excerpt=self.excerpt, author_id=self.requester_id,
+        )
+        try:
+            self.store.verify_hoh(claim.id, author_id=self.requester_id)
+        except AlreadyVerifiedError:
+            # Another verified record appeared for this cycle between
+            # the preview and this confirm click (a race, not
+            # expected in normal single-moderator use) -- the new
+            # claim is still safely recorded as UNVERIFIED, never
+            # silently promoted or discarded.
+            await self._finish(
+                interaction,
+                f"⚠️ Cycle {self.cycle} was verified by someone else just now. "
+                "Your entry was saved as an unverified candidate, not applied.",
+            )
+            return
+
+        logger.info(
+            "/teach historical-hoh confirmed by %s: season %d cycle %d HOH=%s.",
+            self.requester_id, self.season, self.cycle, self.winner,
+        )
+        await self._finish(
+            interaction,
+            f"✅ Recorded and verified: Season {self.season}, Cycle {self.cycle} "
+            f"HOH = {self.winner}.",
+        )
+
+    async def handle_cancel(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the moderator who started this entry can cancel it.",
+                ephemeral=True,
+            )
+            return
+
+        logger.info(
+            "/teach historical-hoh cancelled by %s: zero writes.", self.requester_id
+        )
+        await self._finish(interaction, "❌ Cancelled. Nothing was written.")
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+        logger.info(
+            "/teach historical-hoh timed out for %s: zero writes.", self.requester_id
+        )
+
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="⌛ Timed out. Nothing was written.", view=self
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self.handle_confirm(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self.handle_cancel(interaction)
+
+
 def register(discord_service) -> None:
     """Registers the /teach command group."""
 
@@ -691,6 +885,71 @@ def register(discord_service) -> None:
             len(plan.valid),
             len(plan.invalid),
             len(plan.conflicts),
+        )
+
+    @teach.command(
+        name="historical-hoh",
+        description="Record a verified historical HOH result for a past game cycle.",
+    )
+    @app_commands.describe(
+        season="The Big Brother season number, e.g. 28.",
+        cycle=(
+            "The chronological HOH-cycle number within the season (1st cycle=1, "
+            "2nd=2, ...) -- NOT the week number. A double eviction has two "
+            "cycles sharing one week; give each its own cycle number."
+        ),
+        winner="The houseguest who won HOH this cycle.",
+        source="Where this comes from -- a URL, or a note if manually confirmed.",
+        week="Optional: the show's own Week number, for display only.",
+        excerpt="Optional: the source text this is based on.",
+    )
+    async def historical_hoh(
+        interaction: discord.Interaction,
+        season: int,
+        cycle: int,
+        winner: str,
+        source: str,
+        week: Optional[int] = None,
+        excerpt: Optional[str] = None,
+    ) -> None:
+        if not _is_trusted_moderator(interaction):
+            await _reject_unauthorized(interaction)
+            return
+
+        winner = winner.strip()
+        source = source.strip()
+        if not winner or not source:
+            await interaction.response.send_message(
+                "Both a winner and a source are required, Houseguest.",
+                ephemeral=True,
+            )
+            return
+
+        engine = discord_service.scheduler.engine
+        store = engine.historical_events
+
+        candidates = store.find_hoh_candidates(season=season, cycle_sequence_number=cycle)
+        existing = next(
+            (c for c in candidates if c.verification_status == "ADMIN_VERIFIED"), None
+        )
+
+        embed = _historical_hoh_preview_embed(
+            season=season, cycle=cycle, week=week, winner=winner, existing=existing,
+        )
+        view = _HistoricalHohConfirmView(
+            store=store, season=season, cycle=cycle, week=week, winner=winner,
+            source_ref=source, excerpt=excerpt, existing=existing,
+            requester_id=interaction.user.id,
+        )
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
+        logger.info(
+            "/teach historical-hoh previewed by %s (%s): season %d cycle %d "
+            "winner=%s%s.",
+            interaction.user, interaction.user.id, season, cycle, winner,
+            " (existing verified record found)" if existing is not None else "",
         )
 
     discord_service.bot.tree.add_command(teach)
