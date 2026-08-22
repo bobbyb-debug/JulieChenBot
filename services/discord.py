@@ -37,6 +37,7 @@ from production.hamsterwatch_context import (
 from production.historical_retrieval import retrieve_hoh
 from production.knowledge_summary import collect_summary_metadata, is_broad_knowledge_query
 from services.logger import ProductionLogger
+from services.message_chunking import send_long_message
 from services.scheduler import Scheduler
 from services.ai_service import (
     format_game_state,
@@ -365,7 +366,7 @@ class DiscordService:
                             or str(message.author),
                             is_moderator=is_trusted_moderator(message.author),
                         )
-                        await message.channel.send(ai_reply)
+                        await send_long_message(message.channel.send, ai_reply)
                     except Exception:
                         self.logger.exception(
                             "Failed while generating Julie response."
