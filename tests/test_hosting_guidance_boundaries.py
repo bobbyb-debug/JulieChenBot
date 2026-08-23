@@ -293,5 +293,6 @@ def test_mention_dm_shared_path_direct_fact_guidance_has_no_greeting_mandate(
     prompt = ai_service.groq_client.calls[0]["messages"][0]["content"]
     start = prompt.index("HOSTING GUIDANCE FOR THIS REPLY")
     hosting_block = prompt[start:]
-    assert "concisely" in hosting_block.lower()
+    assert "lead with the actual answer" in hosting_block.lower()
+    assert "1-3 sentences" not in hosting_block.lower()
     assert "expect the unexpected" not in hosting_block.lower()
