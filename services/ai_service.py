@@ -11,12 +11,22 @@ from google.genai import types
 from groq import Groq
 
 from config import CHAT_CONTEXT_MESSAGES, DATABASE
+from production.context_budget import (
+    MAX_MEMORY_ITEM_CHARS,
+    allocate_context_budget,
+    estimate_tokens,
+    truncate_for_budget,
+    trim_history_to_budget,
+)
 from production.hamsterwatch_context import HistoricalContextResult
 from production.historical_retrieval import HistoricalHohResult
 from production.knowledge import KnowledgeItem, KnowledgeType
 from production.knowledge_summary import KnowledgeSummaryMetadata
 from production.memory import MemoryItem
 from production.response_style import ResponseGuidance, build_response_guidance
+from services.logger import ProductionLogger
+
+logger = ProductionLogger.get("AIService")
 
 # ==========================================================
 # Providers
@@ -702,13 +712,20 @@ def format_long_term_memory(items: list[MemoryItem]) -> str:
     Julie to remember, but never itself a confirmed game fact, and
     never a substitute for OFFICIAL GAME FACTS on a game-state
     question.
+
+    Each item's content is capped at MAX_MEMORY_ITEM_CHARS (see
+    production/context_budget.py) -- an unusually long remembered note
+    can no longer alone consume an outsized share of the request
+    budget. This is a length bound only; MemoryStore.recall()'s own
+    channel-scoping and item count are untouched.
     """
 
     if not items:
         return ""
 
     lines = [
-        f'{item.author_name or "someone"} asked you to remember: {item.content}'
+        f'{item.author_name or "someone"} asked you to remember: '
+        f'{truncate_for_budget(item.content, MAX_MEMORY_ITEM_CHARS)[0]}'
         for item in items
     ]
 
@@ -1257,6 +1274,22 @@ async def generate_julie_response(
     fits, whether Julie's last reply already used a phrase worth
     varying away from), placed last (after knowledge_summary_guidance
     too) so it's the most recent instruction the model sees.
+
+    official_state, knowledge, memory, historical_events,
+    historical_context, and knowledge_summary_guidance are each
+    included only if production/context_budget.py's
+    allocate_context_budget() decides they fit this request's token
+    budget -- evaluated in a SEPARATE priority order (official state,
+    then relevant history, then relevant admin knowledge, then
+    memory, then Hamsterwatch, then the knowledge-summary guidance)
+    from the textual order they're assembled in above, since which
+    block survives being over budget is a different question from how
+    authoritative it is once included. A block that doesn't fit is
+    dropped ENTIRELY, never partially truncated -- see that module's
+    docstring for the production incident (Groq 413 "Request too
+    large") this exists to prevent, and why. game_state is not part of
+    this budget (see format_game_state() -- already small/bounded by
+    construction) and is always included when provided.
     """
 
     # Must run before update_and_get_history() appends this turn --
@@ -1264,22 +1297,40 @@ async def generate_julie_response(
     minutes_since_last_message = _minutes_since_last_message(channel_id)
 
     history = update_and_get_history(channel_id, user_text, author_id, author_name)
+    history = trim_history_to_budget(history)
+
+    # Priority order for SURVIVING an over-budget request (see
+    # production/context_budget.py and this function's own docstring)
+    # -- deliberately separate from the priority order these same
+    # blocks are concatenated in below, which instead reflects each
+    # source's actual authority once it's included.
+    budget_priority_blocks = [
+        ("official_state", official_state),
+        ("historical_events", historical_events),
+        ("knowledge", knowledge),
+        ("memory", memory),
+        ("historical_context", historical_context),
+        ("knowledge_summary_guidance", knowledge_summary_guidance),
+    ]
+    included, budget_report = allocate_context_budget(budget_priority_blocks)
 
     system_instruction = SYSTEM_INSTRUCTION
-    if official_state:
-        system_instruction = f"{system_instruction}\n\n{official_state}"
-    if knowledge:
-        system_instruction = f"{system_instruction}\n\n{knowledge}"
-    if memory:
-        system_instruction = f"{system_instruction}\n\n{memory}"
-    if historical_events:
-        system_instruction = f"{system_instruction}\n\n{historical_events}"
-    if historical_context:
-        system_instruction = f"{system_instruction}\n\n{historical_context}"
+    if "official_state" in included:
+        system_instruction = f"{system_instruction}\n\n{included['official_state']}"
+    if "knowledge" in included:
+        system_instruction = f"{system_instruction}\n\n{included['knowledge']}"
+    if "memory" in included:
+        system_instruction = f"{system_instruction}\n\n{included['memory']}"
+    if "historical_events" in included:
+        system_instruction = f"{system_instruction}\n\n{included['historical_events']}"
+    if "historical_context" in included:
+        system_instruction = f"{system_instruction}\n\n{included['historical_context']}"
     if game_state:
         system_instruction = f"{system_instruction}\n\n{game_state}"
-    if knowledge_summary_guidance:
-        system_instruction = f"{system_instruction}\n\n{knowledge_summary_guidance}"
+    if "knowledge_summary_guidance" in included:
+        system_instruction = (
+            f"{system_instruction}\n\n{included['knowledge_summary_guidance']}"
+        )
 
     guidance = build_response_guidance(
         user_text,
@@ -1288,6 +1339,20 @@ async def generate_julie_response(
         minutes_since_last_message=minutes_since_last_message,
     )
     system_instruction = f"{system_instruction}\n\n{format_response_guidance(guidance)}"
+
+    # Recomputed from the FINAL assembled system_instruction (rather
+    # than trusting allocate_context_budget()'s own partial estimate)
+    # so this always reflects exactly what's actually sent -- SYSTEM_
+    # INSTRUCTION, game_state, and HOSTING GUIDANCE aren't part of the
+    # budget allocation above but still cost real tokens. Logged as
+    # counts/labels only -- see ContextBudgetReport.log_line(), never
+    # the prompt content itself.
+    history_tokens = sum(
+        estimate_tokens(_speaker_prefix(role, author) + text)
+        for role, text, author in history
+    )
+    budget_report.estimated_input_tokens = estimate_tokens(system_instruction) + history_tokens
+    logger.info(budget_report.log_line())
 
     # _try_groq_chat/_try_gemini_chat are synchronous SDK calls that
     # perform real network I/O. Run each on a worker thread via
