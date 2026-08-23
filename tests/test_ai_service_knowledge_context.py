@@ -1028,14 +1028,34 @@ def test_format_response_guidance_is_labeled_internal_and_not_a_fact():
     assert "never a reason to override official game facts" in text.lower()
 
 
-def test_format_response_guidance_direct_fact_asks_for_a_concise_answer():
+def test_format_response_guidance_direct_fact_leads_with_the_answer_no_padding():
+    """No fixed sentence ceiling ("1-3 sentences") -- see the R1 audit
+    finding this replaces -- but still direct, still no full-state
+    dump, still no unsolicited topic menu, still no padding."""
+
     guidance = ResponseGuidance(
         intent=ResponseIntent.DIRECT_FACT, is_conversation_start=False
     )
     text = ai_service.format_response_guidance(guidance).lower()
 
-    assert "concisely" in text
+    assert "lead with the actual answer" in text
+    assert "don't pad the answer" in text
     assert "don't restate the full current game snapshot" in text
+    assert "1-3 sentences" not in text
+    assert "sentence" not in text  # no fixed sentence-count language at all
+
+
+def test_format_response_guidance_direct_fact_permits_relevant_adjacent_context():
+    """The actual fix: a directly relevant adjacent fact is explicitly
+    permitted when it genuinely helps, not just tolerated."""
+
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.DIRECT_FACT, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "directly relevant piece of context" in text
+    assert "genuinely helps" in text
 
 
 def test_format_response_guidance_historical_allows_storytelling_but_grounded():
