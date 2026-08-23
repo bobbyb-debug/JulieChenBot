@@ -25,6 +25,7 @@ from production.historical_retrieval import retrieve_hoh
 from production.house_status import HouseStatus
 from production.knowledge import KnowledgeItem, KnowledgeType
 from production.knowledge_summary import KnowledgeSummaryMetadata
+from production.response_style import ResponseGuidance, ResponseIntent
 
 
 def _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=None):
@@ -123,7 +124,9 @@ def test_generate_julie_response_omits_knowledge_block_when_none_active(
     monkeypatch, tmp_path
 ) -> None:
     """No active knowledge -> knowledge="" -> the system instruction
-    must not gain an empty/awkward extra section."""
+    must not gain an empty/awkward extra section for it -- only
+    SYSTEM_INSTRUCTION plus the always-present, non-fact HOSTING
+    GUIDANCE block (see production/response_style.py) is appended."""
 
     recorder: dict = {}
     groq = make_groq_client_capturing(recorder)
@@ -132,7 +135,23 @@ def test_generate_julie_response_omits_knowledge_block_when_none_active(
     asyncio.run(svc.generate_julie_response(3, "hello", game_state="", knowledge=""))
 
     content = recorder["messages"][0]["content"]
-    assert content == ai_service.SYSTEM_INSTRUCTION
+    assert content.startswith(ai_service.SYSTEM_INSTRUCTION)
+    appended = content[len(ai_service.SYSTEM_INSTRUCTION):]
+    assert "HOSTING GUIDANCE FOR THIS REPLY" in appended
+    # SYSTEM_INSTRUCTION's own prose mentions "OFFICIAL GAME FACTS" by
+    # name (see its boundary/opinion paragraphs), so the real proof of
+    # omission is that none of these fact blocks' own marker text
+    # appears in what was APPENDED after it -- only the always-present
+    # HOSTING GUIDANCE block should be there.
+    for marker in (
+        "OFFICIAL GAME FACTS (admin-confirmed",
+        "ADMINISTRATOR-TAUGHT KNOWLEDGE.",
+        "REMEMBERED CONTEXT",
+        "source: Hamsterwatch archive",
+        "LIVE FEED OBSERVATION",
+        "KNOWLEDGE SUMMARY GUIDANCE",
+    ):
+        assert marker not in appended
 
 
 # ==========================================================
@@ -879,9 +898,15 @@ def test_generate_julie_response_omits_historical_context_block_when_nothing_ret
 
     content = recorder["messages"][0]["content"]
     # SYSTEM_INSTRUCTION itself names "HISTORICAL SEASON CONTEXT" in
-    # its boundary paragraph, so the real proof of omission is that
-    # nothing else was appended at all -- not a naive substring check.
-    assert content == ai_service.SYSTEM_INSTRUCTION
+    # its boundary paragraph, so the real proof of omission is the
+    # absence of the rendered block's own distinguishing marker text
+    # ("source: Hamsterwatch archive") -- not a naive substring check,
+    # and not exact equality, since the always-present, non-fact
+    # HOSTING GUIDANCE block (production/response_style.py) is still
+    # appended regardless of whether any fact block is.
+    assert content.startswith(ai_service.SYSTEM_INSTRUCTION)
+    assert "HOSTING GUIDANCE FOR THIS REPLY" in content
+    assert "source: Hamsterwatch archive" not in content
 
 
 def test_official_state_outranks_historical_context_in_prompt_order(
@@ -934,6 +959,268 @@ def test_official_state_outranks_historical_context_in_prompt_order(
 
     # The boundary paragraph explicitly names this new source too.
     assert "historical season context" in ai_service.SYSTEM_INSTRUCTION.lower()
+
+
+# ==========================================================
+# SYSTEM_INSTRUCTION -- personality/hosting-behavior static guarantees
+# (see production/response_style.py for the per-turn counterpart)
+# ==========================================================
+
+
+def test_system_instruction_forbids_inventing_time_of_day_greetings():
+    """The literal bug report this feature fixes: "Good evening" was
+    being used regardless of the actual time. Rather than compute an
+    unreliable time-of-day (no house timezone is configured anywhere
+    in this codebase -- only UTC server time), the fix forbids
+    self-initiated time-specific greetings -- but still allows Julie
+    to mirror a greeting the Houseguest used first (see
+    tests/test_hosting_guidance_boundaries.py's own coverage of that
+    carve-out)."""
+
+    lowered = ai_service.SYSTEM_INSTRUCTION.lower()
+    assert "good evening" in lowered  # named explicitly, as something NOT to invent
+    assert "don't invent a time-of-day greeting" in lowered
+
+
+def test_system_instruction_no_longer_mandates_a_fixed_opener():
+    """The literal root cause of the repeated "Good evening,
+    Houseguests! Expect the unexpected--" template: the old wording
+    told the model to use these lines "naturally when starting
+    conversations", which was read as "prepend this every time"."""
+
+    lowered = ai_service.SYSTEM_INSTRUCTION.lower()
+    assert "naturally when starting conversations" not in lowered
+    assert "never as a mandatory opener" in lowered
+    assert "never in back-to-back replies" in lowered
+
+
+def test_system_instruction_discourages_full_state_dumps_and_menus():
+    lowered = ai_service.SYSTEM_INSTRUCTION.lower()
+    assert "menu of other topics" in lowered
+    assert "restate the full current game state" in lowered
+
+
+def test_system_instruction_grants_clearly_framed_opinion_and_judgment():
+    lowered = ai_service.SYSTEM_INSTRUCTION.lower()
+    assert "own opinions, reactions, and predictions" in lowered
+    assert "never stated as if it were confirmed" in lowered
+
+
+def test_system_instruction_still_refuses_to_invent_unknown_information():
+    lowered = ai_service.SYSTEM_INSTRUCTION.lower()
+    assert "say so plainly instead of inventing" in lowered
+
+
+# ==========================================================
+# format_response_guidance() -- presentation-only, never a fact source
+# ==========================================================
+
+
+def test_format_response_guidance_is_labeled_internal_and_not_a_fact():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.GENERAL, is_conversation_start=True
+    )
+    text = ai_service.format_response_guidance(guidance)
+
+    assert "HOSTING GUIDANCE FOR THIS REPLY" in text
+    assert "not a fact" in text.lower()
+    assert "not something to read back to the houseguest" in text.lower()
+    assert "never a reason to override official game facts" in text.lower()
+
+
+def test_format_response_guidance_direct_fact_asks_for_a_concise_answer():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.DIRECT_FACT, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "concisely" in text
+    assert "don't restate the full current game snapshot" in text
+
+
+def test_format_response_guidance_historical_allows_storytelling_but_grounded():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.HISTORICAL, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "tell a short, grounded story" in text
+    assert "say so plainly rather than inventing details" in text
+
+
+def test_format_response_guidance_dramatic_allows_flair_but_grounded():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.DRAMATIC, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "hosting flair and drama are appropriate" in text
+    assert "don't invent details for effect" in text
+
+
+def test_format_response_guidance_banter_stays_brief_and_conversational():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.BANTER, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "casual reaction or banter" in text
+    assert "don't force a fact dump" in text
+
+
+def test_format_response_guidance_conversation_start_permits_a_greeting():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.GENERAL, is_conversation_start=True
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "a brief, natural greeting is fine here" in text
+    assert "do not greet again" not in text
+
+
+def test_format_response_guidance_continuing_conversation_forbids_greeting():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.GENERAL, is_conversation_start=False
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "do not greet again" in text
+    assert "a brief, natural greeting is fine here" not in text
+
+
+def test_format_response_guidance_names_a_recently_used_phrase_to_avoid():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.GENERAL,
+        is_conversation_start=False,
+        recently_used_phrases=["expect the unexpected"],
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "expect the unexpected" in text
+    assert "vary your opening this time" in text
+
+
+def test_format_response_guidance_omits_repetition_note_when_nothing_to_avoid():
+    guidance = ResponseGuidance(
+        intent=ResponseIntent.GENERAL, is_conversation_start=False,
+        recently_used_phrases=[],
+    )
+    text = ai_service.format_response_guidance(guidance).lower()
+
+    assert "vary your opening" not in text
+
+
+# ==========================================================
+# generate_julie_response(): HOSTING GUIDANCE reaches the real prompt,
+# for both provider paths, positioned last -- and adapts turn to turn
+# ==========================================================
+
+
+def test_generate_julie_response_places_hosting_guidance_after_game_state(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(
+        svc.generate_julie_response(
+            30, "who is hoh?", game_state=GAME_STATE_TEXT
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert content.index(GAME_STATE_TEXT) < content.index("HOSTING GUIDANCE FOR THIS REPLY")
+
+
+def test_generate_julie_response_places_hosting_guidance_after_knowledge_summary_guidance(
+    monkeypatch, tmp_path
+) -> None:
+    """HOSTING GUIDANCE must be the truly-last block, even after
+    KNOWLEDGE_SUMMARY's own guidance -- it's the most recent
+    instruction the model sees, governing HOW to present whatever
+    came before it, including a knowledge summary."""
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+    ks_guidance = ai_service.format_knowledge_summary_guidance(KnowledgeSummaryMetadata())
+
+    asyncio.run(
+        svc.generate_julie_response(
+            31, "Tell me everything you know.", knowledge_summary_guidance=ks_guidance
+        )
+    )
+
+    content = recorder["messages"][0]["content"]
+    assert content.index("KNOWLEDGE SUMMARY GUIDANCE") < content.index(
+        "HOSTING GUIDANCE FOR THIS REPLY"
+    )
+
+
+def test_generate_julie_response_hosting_guidance_reaches_gemini_path(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    gemini = make_gemini_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=None, gemini=gemini)
+
+    asyncio.run(svc.generate_julie_response(32, "who is hoh?"))
+
+    assert "HOSTING GUIDANCE FOR THIS REPLY" in recorder["system_instruction"]
+
+
+def test_generate_julie_response_first_message_reads_as_conversation_start(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder)
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(svc.generate_julie_response(33, "hi Julie"))
+
+    content = recorder["messages"][0]["content"]
+    assert "a brief, natural greeting is fine here" in content
+
+
+def test_generate_julie_response_immediate_followup_does_not_read_as_conversation_start(
+    monkeypatch, tmp_path
+) -> None:
+    """The mechanism behind the repeated-greeting bug for rapid
+    back-to-back facts: a second message in the same channel, moments
+    later, must not re-signal a conversation start."""
+
+    recorder: dict = {}
+    groq = make_groq_client_capturing(recorder, content="Dee.")
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(svc.generate_julie_response(34, "who is hoh?"))
+    asyncio.run(svc.generate_julie_response(34, "nominees?"))
+
+    content = recorder["messages"][0]["content"]
+    assert "do not greet again" in content
+    assert "a brief, natural greeting is fine here" not in content
+
+
+def test_generate_julie_response_avoids_repeating_julies_own_recent_catchphrase(
+    monkeypatch, tmp_path
+) -> None:
+    recorder: dict = {}
+    groq = make_groq_client_capturing(
+        recorder, content="Good evening, Houseguests! Expect the unexpected--Dee is HOH."
+    )
+    svc = _reset_ai_service_clients(monkeypatch, tmp_path, groq=groq, gemini=None)
+
+    asyncio.run(svc.generate_julie_response(35, "who is hoh?"))
+
+    # Second call's fake reply no longer matters for this assertion --
+    # only the PROMPT for the second call is being checked, proving the
+    # guidance layer noticed the first reply's catchphrase.
+    asyncio.run(svc.generate_julie_response(35, "nominees?"))
+
+    content = recorder["messages"][0]["content"]
+    assert "expect the unexpected" in content
+    assert "vary your opening this time" in content
 
 
 # ==========================================================

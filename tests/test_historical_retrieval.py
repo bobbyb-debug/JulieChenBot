@@ -13,6 +13,7 @@ from production.historical_retrieval import (
     extract_cycle_number,
     extract_ordinal,
     extract_week_number,
+    find_known_players_mentioned,
     retrieve_hoh,
 )
 
@@ -168,6 +169,72 @@ def test_a_player_who_won_hoh_multiple_times_returns_every_verified_cycle(store)
     result = retrieve_hoh("Was Yash ever HOH?", store)
 
     assert {e.cycle_sequence_number for e in result.events} == {3, 11}
+
+
+# ==========================================================
+# A question naming more than one known player (a comparison) must
+# retrieve every named player's events, not silently just one --
+# see find_known_players_mentioned() and retrieve_hoh()'s own
+# docstring for the "Compare Taylor's HOH with Dee's" scenario this
+# covers.
+# ==========================================================
+
+
+def test_find_known_players_mentioned_matches_every_known_name_present(store):
+    _verified(store, cycle=2, week=2, winner="Taylor")
+    _verified(store, cycle=5, week=5, winner="Dee")
+
+    matches = find_known_players_mentioned("Compare Taylor's HOH with Dee's", store)
+
+    assert set(matches) == {"TAYLOR", "DEE"}
+
+
+def test_find_known_players_mentioned_ignores_unmentioned_known_players(store):
+    _verified(store, cycle=2, week=2, winner="Taylor")
+    _verified(store, cycle=5, week=5, winner="Dee")
+
+    matches = find_known_players_mentioned("What happened during Taylor's HOH?", store)
+
+    assert matches == ["TAYLOR"]
+
+
+def test_comparison_question_retrieves_both_named_players_events(store):
+    _verified(store, cycle=2, week=2, winner="Taylor")
+    _verified(store, cycle=5, week=5, winner="Dee")
+
+    result = retrieve_hoh("Compare Taylor's HOH with Dee's", store)
+
+    winners = {
+        participant.houseguest
+        for event in result.events
+        for participant in event.participants
+        if participant.role == "WINNER"
+    }
+    assert winners == {"TAYLOR", "DEE"}
+
+
+def test_comparison_question_includes_multiple_cycles_for_a_repeat_winner(store):
+    _verified(store, cycle=2, week=2, winner="Taylor")
+    _verified(store, cycle=9, week=9, winner="Taylor")
+    _verified(store, cycle=5, week=5, winner="Dee")
+
+    result = retrieve_hoh("Compare Taylor's HOH with Dee's", store)
+
+    assert {e.cycle_sequence_number for e in result.events} == {2, 9, 5}
+    assert result.multiple_cycles is True
+
+
+def test_a_single_named_player_still_returns_only_that_players_events(store):
+    """Backward compatibility: naming just one known player must
+    behave exactly as before this change."""
+
+    _verified(store, cycle=2, week=2, winner="Taylor")
+    _verified(store, cycle=5, week=5, winner="Dee")
+
+    result = retrieve_hoh("What happened during Taylor's HOH?", store)
+
+    assert len(result.events) == 1
+    assert result.events[0].participants[0].houseguest == "TAYLOR"
 
 
 # ==========================================================

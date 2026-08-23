@@ -86,6 +86,25 @@ def test_what_do_you_know_about_topic_is_not_broad():
     assert is_broad_knowledge_query("What do you know about Week 2?") is False
 
 
+# ==========================================================
+# "about" doesn't automatically mean narrowly scoped -- a genuinely
+# broad historical question ("about the history of BB28") must still
+# be recognized as broad, distinct from a specific-topic one
+# ("about Taylor's HOH").
+# ==========================================================
+
+
+def test_about_the_history_of_the_season_is_still_broad():
+    assert (
+        is_broad_knowledge_query("Tell me everything you know about the history of Big Brother 28")
+        is True
+    )
+
+
+def test_about_the_season_is_still_broad():
+    assert is_broad_knowledge_query("What do you know about the season?") is True
+
+
 def test_plain_banter_is_not_broad():
     assert is_broad_knowledge_query("lol that nomination is wild") is False
 

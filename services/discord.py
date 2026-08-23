@@ -30,6 +30,7 @@ from config import (
     LIVE_UPDATES_CHANNEL,
 )
 from production.authorization import is_trusted_moderator
+from production.context_budget import select_relevant_knowledge_items
 from production.hamsterwatch_context import (
     HistoricalContextResult,
     retrieve_historical_context,
@@ -161,7 +162,16 @@ class DiscordService:
 
         official_state = format_official_state(engine.knowledge)
         game_state = format_game_state(house_status, competition)
-        knowledge = format_learned_knowledge(engine.knowledge.active_items())
+        # select_relevant_knowledge_items() bounds this to the most
+        # relevant/recent items rather than every active item ever
+        # taught (see production/context_budget.py) -- the fix for the
+        # unbounded growth that contributed to Groq's 413 "Request too
+        # large" in production. KNOWLEDGE_SUMMARY's own metadata below
+        # still counts against the FULL unfiltered store -- it needs
+        # real totals, not a relevance-scoped subset.
+        knowledge = format_learned_knowledge(
+            select_relevant_knowledge_items(engine.knowledge.active_items(), user_text)
+        )
         memory = format_long_term_memory(
             engine.memory.recall(channel_id, user_text)
         )

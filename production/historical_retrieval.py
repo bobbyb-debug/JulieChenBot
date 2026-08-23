@@ -35,6 +35,13 @@ time) is simply not recognized as a player-anchored question, and the
 caller falls through to "no match" rather than guessing which
 houseguest was meant.
 
+A question can name more than one known player ("Compare Taylor's HOH
+with Dee's") -- find_known_players_mentioned() (plural) matches every
+one, and retrieve_hoh() merges each matched player's verified events
+into a single result, so a comparison question retrieves every
+relevant record rather than silently answering for only one of the
+two players named.
+
 Ambiguity policy
 -------------------
 When a week matches more than one game cycle (a double or triple
@@ -87,15 +94,19 @@ def extract_ordinal(text: str) -> int | None:
     return _ORDINAL_WORDS[match.group(1).lower()] if match else None
 
 
-def find_known_player_mentioned(text: str, store: HistoricalEventStore) -> str | None:
-    """Exact, non-fuzzy match against houseguests Julie already has
-    verified HOH data for -- see module docstring. Returns the
-    normalized name, or None if no known winner's name appears as a
-    whole word in the text."""
+def find_known_players_mentioned(text: str, store: HistoricalEventStore) -> list[str]:
+    """Exact, non-fuzzy match against every houseguest Julie already
+    has verified HOH data for -- see module docstring. Returns every
+    matching normalized name (in store.known_hoh_winners()'s own
+    order), the plural counterpart to find_known_player_mentioned()
+    that supports a "Compare Taylor's HOH with Dee's" style question
+    naming more than one known player -- a single-name lookup would
+    silently return only whichever one happened to be checked first,
+    dropping the other player's records from a comparison entirely."""
 
     known = store.known_hoh_winners()
     if not known:
-        return None
+        return []
 
     # Strip a trailing possessive ("Taylor's HOH") the same way
     # production/hamsterwatch_context.py already does for keyword
@@ -106,10 +117,18 @@ def find_known_player_mentioned(text: str, store: HistoricalEventStore) -> str |
         word = raw.upper()
         words.add(word[:-2] if word.endswith("'S") else word)
 
-    for name in known:
-        if name in words:
-            return name
-    return None
+    return [name for name in known if name in words]
+
+
+def find_known_player_mentioned(text: str, store: HistoricalEventStore) -> str | None:
+    """Exact, non-fuzzy match against houseguests Julie already has
+    verified HOH data for -- see module docstring. Returns the first
+    matching normalized name (see find_known_players_mentioned() for
+    the plural, comparison-question-aware version), or None if no
+    known winner's name appears as a whole word in the text."""
+
+    matches = find_known_players_mentioned(text, store)
+    return matches[0] if matches else None
 
 
 def _resolve_unambiguous_season(store: HistoricalEventStore) -> int | None:
@@ -149,11 +168,13 @@ def retrieve_hoh(user_text: str, store: HistoricalEventStore) -> HistoricalHohRe
        Nth cycle sharing that week, by ascending cycle_sequence_number.
     3. "Week N" alone -> every verified HOH for cycles sharing that
        week. Never picks one when more than one exists.
-    4. A known HOH winner's name mentioned -> every verified cycle
-       that player won, across the whole store (not season-scoped --
-       a player-anchored question doesn't need season disambiguation
-       the way a week-anchored one does, since cycle ids are already
-       globally unique).
+    4. One or more known HOH winners' names mentioned -> every
+       verified cycle each of them won, across the whole store (not
+       season-scoped -- a player-anchored question doesn't need season
+       disambiguation the way a week-anchored one does, since cycle
+       ids are already globally unique). More than one name (e.g.
+       "Compare Taylor's HOH with Dee's") returns every matched
+       player's events together -- see find_known_players_mentioned().
     5. None of the above -> an empty result. Never a guess.
     """
 
@@ -191,9 +212,17 @@ def retrieve_hoh(user_text: str, store: HistoricalEventStore) -> HistoricalHohRe
             multiple_cycles=len(events) > 1,
         )
 
-    player = find_known_player_mentioned(user_text, store)
-    if player is not None:
-        events = store.verified_hoh_for_player(player)
+    players = find_known_players_mentioned(user_text, store)
+    if players:
+        # Every event self-identifies its own winner (see
+        # services/ai_service.py format_historical_events(), which
+        # renders each entry's "HOH winner: <name>" independently) --
+        # merging more than one player's events into one list needs no
+        # special grouping/labeling for a comparison question like
+        # "Compare Taylor's HOH with Dee's" to read unambiguously.
+        events = [
+            event for player in players for event in store.verified_hoh_for_player(player)
+        ]
         return HistoricalHohResult(events=events, multiple_cycles=len(events) > 1)
 
     return HistoricalHohResult()
