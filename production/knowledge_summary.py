@@ -52,24 +52,42 @@ _BROAD_SUMMARY_TRIGGERS = (
     "what do you have access to",
 )
 
-# A trigger phrase followed by "about" is scoping the question down to
-# one topic ("tell me everything you know about Taylor's HOH") rather
-# than genuinely asking for a capability overview -- that belongs to
-# the existing historical/Hamsterwatch retrieval, not this feature.
+# A trigger phrase followed by "about" is USUALLY scoping the question
+# down to one specific topic ("tell me everything you know about
+# Taylor's HOH") rather than genuinely asking for a capability
+# overview -- that belongs to the existing historical/Hamsterwatch
+# retrieval, not this feature. But "about" alone is too blunt a signal:
+# "tell me everything you know about the history of Big Brother 28" is
+# still a genuine broad request (there's no single player/week/cycle
+# to look up), and treating it as narrowly scoped left it with nothing
+# useful to retrieve at all. _BROAD_ABOUT_CONTINUATIONS carves out the
+# generic topics that keep a question broad even with "about" present.
 _SCOPING_MARKER = "about"
+_BROAD_ABOUT_CONTINUATIONS = ("history", "season", "show", "game", "everything")
+# How far past "about" to look for one of those words -- long enough
+# for "about the history of Big Brother 28", short enough that a real
+# specific topic much further into a long sentence doesn't accidentally
+# get read as still-broad.
+_ABOUT_LOOKAHEAD_CHARS = 40
 
 
 def is_broad_knowledge_query(user_text: str) -> bool:
-    """True only for a genuine "what do you know"/"what can you do"
-    style capability question -- see module docstring for why this is
-    phrase-based and excludes anything scoped with "about"."""
+    """True for a genuine "what do you know"/"what can you do" style
+    capability question -- see module docstring for why this is
+    phrase-based, and _BROAD_ABOUT_CONTINUATIONS's own comment for why
+    "about" alone doesn't automatically disqualify a question."""
 
     lowered = user_text.strip().lower()
 
     if not any(trigger in lowered for trigger in _BROAD_SUMMARY_TRIGGERS):
         return False
 
-    return _SCOPING_MARKER not in lowered
+    about_index = lowered.find(_SCOPING_MARKER)
+    if about_index == -1:
+        return True
+
+    lookahead = lowered[about_index:about_index + _ABOUT_LOOKAHEAD_CHARS]
+    return any(word in lookahead for word in _BROAD_ABOUT_CONTINUATIONS)
 
 
 @dataclass(slots=True)
