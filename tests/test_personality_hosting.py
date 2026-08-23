@@ -418,5 +418,5 @@ def test_chat_command_and_mention_path_receive_identical_hosting_guidance(
     assert "HOSTING GUIDANCE FOR THIS REPLY" in mention_prompt
     assert "a brief, natural greeting is fine here" in chat_prompt
     assert "a brief, natural greeting is fine here" in mention_prompt
-    assert "concisely" in chat_prompt
-    assert "concisely" in mention_prompt
+    assert "lead with the actual answer" in chat_prompt.lower()
+    assert "lead with the actual answer" in mention_prompt.lower()
