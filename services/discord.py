@@ -37,6 +37,7 @@ from production.hamsterwatch_context import (
 )
 from production.historical_retrieval import retrieve_hoh
 from production.knowledge_summary import collect_summary_metadata, is_broad_knowledge_query
+from production.live_feed_window import parse_recent_window, select_recent_updates
 from services.logger import ProductionLogger
 from services.message_chunking import send_long_message
 from services.scheduler import Scheduler
@@ -48,6 +49,7 @@ from services.ai_service import (
     format_learned_knowledge,
     format_long_term_memory,
     format_official_state,
+    format_recent_live_feed,
     generate_julie_response,
 )
 
@@ -224,6 +226,32 @@ class DiscordService:
         )
 
         # Deterministic, no-AI-call check (see production/
+        # live_feed_window.py). Only a genuine "what happened
+        # recently?"-style question pays the cost of an extra
+        # engine.recent_updates() read -- an ordinary message doesn't
+        # match parse_recent_window() and this stays "". Same
+        # best-effort posture as the Hamsterwatch/historical-events
+        # blocks above: engine.recent_updates() doesn't raise by
+        # design (see its own docstring -- bad entries are skipped,
+        # never propagated), but the try/except is kept anyway so a
+        # future change there can never break /chat.
+        recent_live_feed = ""
+        window_hours = parse_recent_window(user_text)
+        if window_hours is not None:
+            try:
+                raw_updates = engine.recent_updates(hours=window_hours)
+                selected_updates, subject_keywords = select_recent_updates(
+                    raw_updates, user_text
+                )
+                recent_live_feed = format_recent_live_feed(
+                    selected_updates, window_hours, subject_keywords=subject_keywords
+                )
+            except Exception:
+                self.logger.exception(
+                    "Recent live-feed retrieval failed; continuing without it."
+                )
+
+        # Deterministic, no-AI-call check (see production/
         # knowledge_summary.py). The real metadata collection only
         # runs for a genuine broad-summary question -- an ordinary
         # message pays no extra store reads at all.
@@ -255,6 +283,7 @@ class DiscordService:
             memory=memory,
             historical_events=historical_events,
             historical_context=historical_context,
+            recent_live_feed=recent_live_feed,
             knowledge_summary_guidance=knowledge_summary_guidance,
         )
 
