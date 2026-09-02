@@ -674,6 +674,95 @@ def format_historical_context(result: HistoricalContextResult) -> str:
 
 
 # ==========================================================
+# Recent live-feed activity (automated, unverified -- see production/
+# live_feed_window.py and engine.recent_updates(), untouched by this
+# module). Conversational counterpart to /recap: same underlying
+# buffer, a user-requested window instead of a fixed default, and
+# routed through the model's normal reasoning/personality rather than
+# a dedicated recap prompt.
+# ==========================================================
+
+# Per-item cap, same posture as MAX_HISTORICAL_CONTENT_CHARS above and
+# MAX_MEMORY_ITEM_CHARS (production/context_budget.py) -- an unusually
+# long raw feed entry can no longer alone consume an outsized share of
+# the budget. Smaller than a Hamsterwatch article (a curated recap) but
+# larger than a /remember note, matching a raw Joker's Update's typical
+# length.
+MAX_RECENT_FEED_ITEM_CHARS = 500
+
+
+def _format_window_label(hours: float) -> str:
+    """Renders a window like 1.0/2.0/24.0 hours as "last hour"/"last 2
+    hours"/"last 24 hours" -- always phrased as a rolling lookback,
+    never as a calendar claim ("today", "overnight"), since
+    production/live_feed_window.py's parse_recent_window() already
+    collapsed every named phrase into a plain hour count and this
+    function has no way to recover which phrase was actually used --
+    see that module's docstring for why a rolling-hours label is also
+    the more honest one regardless."""
+
+    if hours == 1:
+        return "last hour"
+    if hours == int(hours):
+        return f"last {int(hours)} hours"
+    return f"last {hours:g} hours"
+
+
+def format_recent_live_feed(
+    updates: list[str], window_hours: float, *, subject_keywords: list[str] | None = None
+) -> str:
+    """Formats an already-time-windowed, already-selected slice of
+    engine.recent_updates() for the model's context -- recent,
+    automated, UNVERIFIED evidence of what was reported happening or
+    being discussed, never confirmed game state.
+
+    Unlike this file's other format_*() functions, an EMPTY `updates`
+    still renders a real block rather than returning "" -- the user
+    explicitly asked about a specific window, so Julie needs to know a
+    window WAS checked and came up empty, distinct from never having
+    asked at all. The wording is deliberately hedged ("nothing was
+    captured here", not "nothing happened") -- an empty feed window is
+    not proof nothing happened, only that nothing was recorded on the
+    raw Joker's Updates feed during it (see production/live_feed_window.py's
+    module docstring and this feature's own requirement to never let
+    an empty retrieval be reported as a confident negative).
+
+    `subject_keywords`, when non-empty (see
+    production/live_feed_window.py select_recent_updates()), means
+    `updates` was already narrowed to entries mentioning those terms --
+    named in the label so Julie (and a human reading logs) can tell a
+    player-focused result from a generic one.
+    """
+
+    label = _format_window_label(window_hours)
+    subject_note = (
+        f", focused on mentions of {', '.join(subject_keywords)}" if subject_keywords else ""
+    )
+
+    if not updates:
+        return (
+            f"RECENT LIVE-FEED ACTIVITY ({label}{subject_note} -- automated, unverified, from "
+            "the raw Joker's Updates feed). Nothing was recorded on the feed during this window. "
+            "That does NOT prove nothing happened -- only that nothing was captured here. Say so "
+            "plainly and naturally (e.g. \"not much I can verify from that window\") -- never "
+            "state with confidence that literally nothing happened."
+        )
+
+    lines = [truncate_for_budget(update, MAX_RECENT_FEED_ITEM_CHARS)[0] for update in updates]
+
+    return (
+        f"RECENT LIVE-FEED ACTIVITY ({label}{subject_note} -- automated, unverified, from the "
+        "raw Joker's Updates feed, oldest first). This is EVIDENCE of what was reported "
+        "happening or being discussed -- NOT confirmed game state. If anything here conflicts "
+        "with OFFICIAL GAME FACTS above, OFFICIAL GAME FACTS is correct and this is not. Never "
+        "use this alone to answer who currently holds HOH, is nominated, holds veto, or is a "
+        "Have-Not -- for those, use OFFICIAL GAME FACTS only. Treat plans/arguments/speculation "
+        "reported here as exactly that -- evidence and color, never as a confirmed outcome:\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+# ==========================================================
 # Historical STRUCTURED events (administrator-verified game records --
 # see database/historical_events.py and production/historical_retrieval.py.
 # Phase 1: HOH winners by game cycle only. Distinct from
@@ -1403,6 +1492,7 @@ async def generate_julie_response(
     memory: str = "",
     historical_events: str = "",
     historical_context: str = "",
+    recent_live_feed: str = "",
     knowledge_summary_guidance: str = "",
 ) -> str:
     """Generates Julie's reply: Groq first, Gemini if Groq can't answer.
@@ -1452,9 +1542,22 @@ async def generate_julie_response(
     still never authoritative, but a step more reliable than an
     unverified live parse.
 
+    recent_live_feed, when provided, is an already-time-windowed,
+    already-selected slice of engine.recent_updates() (see
+    format_recent_live_feed() and production/live_feed_window.py) --
+    automated, unverified, raw Joker's Updates activity, only ever
+    populated when the message itself asked a recent-window-shaped
+    question ("what happened in the last hour?"). Same trust tier as
+    game_state (both automated/unverified), placed just after
+    historical_context and before game_state: like historical_context
+    it's about the past (a requested window), not the current
+    snapshot, so it belongs ahead of game_state's always-current
+    reading in the assembled text.
+
     game_state, when provided, is the automated, unverified live-feed
-    observation (see format_game_state()) -- placed last and
-    explicitly subordinate to official_state, since it can be wrong.
+    observation (see format_game_state()) -- placed last of the
+    fact-priority blocks and explicitly subordinate to official_state,
+    since it can be wrong.
 
     knowledge_summary_guidance, when provided, is not a fact source at
     all (see format_knowledge_summary_guidance() and production/
@@ -1563,6 +1666,7 @@ async def generate_julie_response(
         ("knowledge", knowledge),
         ("memory", memory),
         ("historical_context", historical_context),
+        ("recent_live_feed", recent_live_feed),
         ("knowledge_summary_guidance", knowledge_summary_guidance),
     ]
     included, budget_report = allocate_context_budget(
@@ -1580,6 +1684,8 @@ async def generate_julie_response(
         system_instruction = f"{system_instruction}\n\n{included['historical_events']}"
     if "historical_context" in included:
         system_instruction = f"{system_instruction}\n\n{included['historical_context']}"
+    if "recent_live_feed" in included:
+        system_instruction = f"{system_instruction}\n\n{included['recent_live_feed']}"
     if game_state:
         system_instruction = f"{system_instruction}\n\n{game_state}"
     if "knowledge_summary_guidance" in included:
