@@ -127,10 +127,45 @@ class ProductionParser:
         re.IGNORECASE,
     )
 
+    # Conjunctions that can grammatically open a subordinate/conditional
+    # clause as a capitalized sentence-starter -- the same discourse
+    # vocabulary as _REPORTED_SPEECH_MARKERS above, but this set exists
+    # for a different, narrower reason: a capitalized "If"/"When"/etc.
+    # sitting DIRECTLY in front of a name (e.g. "If Yash wins HOH
+    # again...") gets swept INTO the name-capture group itself by the
+    # win-patterns' own [A-Z] character class, rather than staying in
+    # the "preceding text" window _is_genuine_announcement() already
+    # checks -- so _REPORTED_SPEECH_MARKERS never sees it at all in
+    # that case (verified: for "If Yash wins HOH", the match starts at
+    # "If" itself, making the preceding-text slice empty). This is a
+    # real, demonstrated production incident: a live-feed sentence
+    # shaped like this produced a persisted HOH winner of "If Yash".
+    # Checking whether the captured text's own FIRST word is one of
+    # these closes that gap without touching the broader
+    # _REPORTED_SPEECH_MARKERS check, which still does its job for
+    # every case where the marker word isn't itself capitalized/
+    # adjacent (e.g. "Barrett wonders if Yash wins HOH" -- "if" there
+    # is lowercase and mid-sentence, so it's never absorbed into the
+    # name capture and the existing preceding-text check already
+    # catches it).
+    _LEADING_CONDITIONAL_WORDS = frozenset({
+        "if", "whether", "since", "after", "before", "when",
+    })
+
     def __init__(self) -> None:
         self.house_status = HouseStatus()
         self.competition = CompetitionState()
         logger.info("Production parser initialized.")
+
+    @classmethod
+    def _starts_with_conditional_marker(cls, text: str) -> bool:
+        """True if `text`'s own first word is a conditional/subordinating
+        conjunction that could never legitimately be a houseguest's
+        name -- see _LEADING_CONDITIONAL_WORDS above for exactly why
+        this check exists and what it does NOT duplicate."""
+
+        first_word = text.strip().split(" ", 1)[0].strip(" ,.-'’").lower()
+        return first_word in cls._LEADING_CONDITIONAL_WORDS
 
     def parse(self, update: FeedUpdate) -> ParsedProductionData:
         """Parse one RSS update and return cumulative production state."""
@@ -282,6 +317,9 @@ class ProductionParser:
         if not name[0].isupper():
             return False
 
+        if cls._starts_with_conditional_marker(name):
+            return False
+
         preceding = text[max(0, match.start() - 80):match.start()]
         if cls._REPORTED_SPEECH_MARKERS.search(preceding):
             return False
@@ -322,6 +360,26 @@ class ProductionParser:
                 continue
 
             raw = match.group("names")
+
+            # Same reported-speech/hypothetical-language guard
+            # _is_genuine_announcement() applies to HOH/POV/competition
+            # winners (see _LEADING_CONDITIONAL_WORDS' docstring) --
+            # nominations are just as vulnerable: "If the nominees are
+            # Drew and LaLa, that changes everything" would otherwise
+            # be read as a real nomination. Checked both ways for the
+            # same reason _is_genuine_announcement() needs both: a
+            # marker word can sit in the text BEFORE the match (caught
+            # by _REPORTED_SPEECH_MARKERS against the preceding
+            # window), or get swept directly INTO the captured
+            # `names` text itself when the pattern's own match starts
+            # right at a capitalized marker like "If" (caught by
+            # _starts_with_conditional_marker on `raw`).
+            preceding = text[max(0, match.start() - 80):match.start()]
+            if self._REPORTED_SPEECH_MARKERS.search(preceding):
+                continue
+            if self._starts_with_conditional_marker(raw):
+                continue
+
             raw = re.sub(r"\s*\((?:NT|[^)]*)\)\s*$", "", raw, flags=re.IGNORECASE)
             raw = raw.strip(" .,:;-—–")
             raw = re.split(
@@ -350,10 +408,30 @@ class ProductionParser:
         return None
 
     @classmethod
+    def _is_hypothetical_mention(cls, text: str, index: int) -> bool:
+        """True if a reported-speech/conditional marker sits in the
+        text immediately before position `index` -- shared by
+        _extract_veto_used() so "if Dee uses the veto, it changes
+        everything" is not read as a completed veto use. Position-aware
+        (unlike the plain substring checks this supports), since
+        _VETO_USED/_VETO_NOT_USED have no capture group of their own to
+        anchor a "preceding text" window against otherwise."""
+
+        preceding = text[max(0, index - 80):index]
+        return bool(cls._REPORTED_SPEECH_MARKERS.search(preceding))
+
+    @classmethod
     def _extract_veto_used(cls, text: str) -> Optional[bool]:
         lowered = text.lower()
-        if any(phrase in lowered for phrase in cls._VETO_NOT_USED):
-            return False
-        if any(phrase in lowered for phrase in cls._VETO_USED):
-            return True
+
+        for phrase in cls._VETO_NOT_USED:
+            index = lowered.find(phrase)
+            if index != -1 and not cls._is_hypothetical_mention(text, index):
+                return False
+
+        for phrase in cls._VETO_USED:
+            index = lowered.find(phrase)
+            if index != -1 and not cls._is_hypothetical_mention(text, index):
+                return True
+
         return None
