@@ -412,6 +412,15 @@ class _StateUpdateConfirmView(_BatchConfirmView):
             if item.topic and is_recognized_topic(item.topic)
         ]
 
+        # Keep the engine's separately-persisted game_state from
+        # silently contradicting what was just confirmed here -- see
+        # production/state_sync.py and production/engine.py
+        # reconcile_game_state_from_knowledge()'s own docstring for
+        # the production incident this closes. Still never writes
+        # anything back into Knowledge -- one-directional, same as
+        # every other call to this method.
+        self.engine.reconcile_game_state_from_knowledge()
+
         logger.info(
             "/teach update confirmed by %s: %d item(s) written, official "
             "state changed for: %s",
