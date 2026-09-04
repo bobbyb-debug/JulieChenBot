@@ -205,8 +205,19 @@ def test_update_with_no_lines_sends_plain_message(tmp_path: Path, monkeypatch) -
 
 
 # ==========================================================
-# Confirm writes official facts (KnowledgeStore), never HouseStatus;
-# structured commands read the official facts, not HouseStatus.
+# Confirm writes official facts (KnowledgeStore) -- structured
+# commands (/hoh, /nominees, /veto) read those official facts
+# exclusively, never HouseStatus. HouseStatus's own RECOGNIZED_TOPICS
+# fields (production/state_sync.py) ARE now synchronized from
+# Knowledge on confirm (ProductionEngine.reconcile_game_state_from_knowledge(),
+# called from _StateUpdateConfirmView.handle_confirm()) -- this is
+# the fix for a real production incident where the two could diverge
+# and a stale/malformed automated HouseStatus snapshot kept surviving
+# restarts even after the real fact was taught. See
+# tests/test_state_sync.py and tests/test_game_state_reconciliation.py
+# for that mechanism's own dedicated tests; this file still proves
+# structured commands read Knowledge, never HouseStatus, regardless of
+# whether HouseStatus happens to agree.
 # ==========================================================
 
 
@@ -217,9 +228,11 @@ def test_confirm_applies_hoh_and_hoh_command_reflects_it(
     asyncio.run(_run_update_and_confirm(engine, "HOH: Yash"))
 
     assert engine.knowledge.active_state("HOH").content == "Yash"
-    # Confirming a manual update must never touch the automated,
-    # RSS-driven HouseStatus object -- that's the whole point.
-    assert engine.watcher.house_status.current.hoh == ""
+    # A recognized topic (see production/state_sync.py) is also
+    # reconciled into HouseStatus on confirm now -- proving the sync
+    # actually ran, not proving /hoh depends on it (the next
+    # assertions do that separately, via the real command).
+    assert engine.watcher.house_status.current.hoh == "Yash"
 
     ds = _discord_service(engine)
     hoh_module.register(ds)
@@ -237,7 +250,7 @@ def test_confirm_applies_nominees_and_both_nominee_commands_reflect_it(
     asyncio.run(_run_update_and_confirm(engine, "Nominees: Angela, Dee"))
 
     assert engine.knowledge.active_state("NOMINEES").content == "Angela, Dee"
-    assert engine.watcher.house_status.current.nominees == ()
+    assert engine.watcher.house_status.current.nominees == ("Angela", "Dee")
 
     ds = _discord_service(engine)
     nominees_module.register(ds)
@@ -257,7 +270,7 @@ def test_confirm_applies_veto_winner_and_veto_command_reflects_it(
     asyncio.run(_run_update_and_confirm(engine, "VETO_WINNER: Barrett"))
 
     assert engine.knowledge.active_state("VETO_WINNER").content == "Barrett"
-    assert engine.watcher.house_status.current.veto_holder == ""
+    assert engine.watcher.house_status.current.veto_holder == "Barrett"
 
     ds = _discord_service(engine)
     veto_module.register(ds)
@@ -277,10 +290,13 @@ def test_confirm_persists_official_state(tmp_path: Path, monkeypatch) -> None:
     assert any(
         item["topic"] == "HOH" and item["content"] == "Yash" for item in persisted
     )
-    # Confirming a manual update must not write anything under the
-    # game-state key either -- that key belongs solely to the
-    # automated pipeline (ProductionEngine._persist_game_state()).
-    assert engine.storage.get(engine.GAME_STATE_KEY) is None
+    # Confirming HOH -- a recognized topic -- now also reconciles and
+    # persists under the game-state key (see
+    # reconcile_game_state_from_knowledge()), reflecting the new
+    # synchronized value rather than staying absent.
+    game_state = engine.storage.get(engine.GAME_STATE_KEY)
+    assert game_state is not None
+    assert game_state["house_status"]["hoh"] == "Yash"
 
 
 def test_confirm_survives_simulated_restart(tmp_path: Path, monkeypatch) -> None:
@@ -290,7 +306,11 @@ def test_confirm_survives_simulated_restart(tmp_path: Path, monkeypatch) -> None
     engine_b = ProductionEngine(storage=Storage())
 
     assert engine_b.knowledge.active_state("HOH").content == "Yash"
-    assert engine_b.watcher.house_status.current.hoh == ""
+    # The synchronized HouseStatus value survives restart too -- both
+    # because it was persisted under game_state when confirmed, and
+    # because startup reconciliation would re-derive the same value
+    # from Knowledge even if it hadn't been.
+    assert engine_b.watcher.house_status.current.hoh == "Yash"
 
 
 # ==========================================================
