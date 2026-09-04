@@ -267,3 +267,53 @@ def test_reconciliation_generates_no_monitor_events(tmp_path: Path, monkeypatch)
 
     assert engine.watcher.house_status.pending_status is None
     assert list(engine.pending_events) == []
+
+
+# ==========================================================
+# Topic-alias conflicts (see production/state_sync.py and
+# tests/test_state_sync.py for the pure-function unit tests) surface
+# through the real reconciliation path too -- logged, never guessed,
+# never crashing startup.
+# ==========================================================
+
+
+def test_startup_reconciliation_survives_a_topic_alias_conflict(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exact real production finding: 'VETO WINNER' and
+    'VETO_WINNER' both independently active with different values.
+    Startup must not crash, must not guess, and must still reconcile
+    every OTHER recognized field normally."""
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    storage = Storage()
+
+    from production.knowledge import KnowledgeStore
+
+    knowledge = KnowledgeStore(storage=storage)
+    knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+    knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
+
+    engine = ProductionEngine(storage=Storage())  # must not raise
+
+    assert engine.watcher.house_status.current.hoh == "Barrett"
+    # Neither "LaLa" nor "" was guessed -- the field is left at
+    # whatever it already was (the blank default, since nothing was
+    # persisted for this fresh scenario).
+    assert engine.watcher.house_status.current.veto_holder == ""
+
+
+def test_reconcile_logs_a_warning_on_alias_conflict(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging as _logging
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    engine = ProductionEngine(storage=Storage())
+    engine.knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    engine.knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
+
+    with caplog.at_level(_logging.WARNING, logger="Engine"):
+        engine.reconcile_game_state_from_knowledge()
+
+    assert "conflict" in caplog.text.lower()
+    assert "VETO_WINNER" in caplog.text

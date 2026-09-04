@@ -309,7 +309,23 @@ class ProductionEngine:
         """
 
         current = self.watcher.house_status.current
-        reconciled = sync_house_status_from_knowledge(current, self.knowledge)
+        reconciled, conflicted_topics = sync_house_status_from_knowledge(
+            current, self.knowledge
+        )
+
+        if conflicted_topics:
+            # A real Knowledge data-quality issue (e.g. "VETO WINNER"
+            # and "VETO_WINNER" both active with different values) --
+            # never guessed at (see production/state_sync.py's own
+            # docstring); surfaced here so it's visible in production
+            # logs rather than silently resolved one way or the other.
+            # The affected field(s) are simply left untouched below,
+            # same as if nothing had been taught for them at all.
+            self.logger.warning(
+                "Knowledge topic alias conflict during game-state "
+                "reconciliation -- leaving affected field(s) untouched: %s",
+                conflicted_topics,
+            )
 
         if reconciled == current:
             return False

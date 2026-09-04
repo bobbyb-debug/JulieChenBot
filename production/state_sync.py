@@ -40,6 +40,32 @@ observation can never become (or influence) an official fact merely
 because reconciliation ran, which is the same "no feedback loop"
 guarantee /teach update's write path already relied on (see
 commands/teach.py _StateUpdateConfirmView's own docstring).
+
+Topic aliasing
+----------------
+Forensic inspection of real production Knowledge found independently-
+active duplicate topic keys for the same real-world fact -- "BB
+BLOCKBUSTER" alongside "BB_BLOCKBUSTER", "VETO WINNER" alongside
+"VETO_WINNER". Root cause, confirmed directly in KnowledgeStore.
+active_state(): topic lookup normalizes ONLY via `.strip().upper()` --
+it never collapses a space/underscore difference, so two spellings of
+what a human considers the same topic are, to that method, two
+genuinely different topics that can both be independently active at
+once.
+
+This is NOT fixed by changing KnowledgeStore or by deleting/merging
+any existing Knowledge entry -- see this module's own "does NOT write"
+guarantee above, which extends to never touching Knowledge at all,
+destructively or otherwise. Instead, _resolve_active_state() below
+gives sync_house_status_from_knowledge() its own alias-aware lookup:
+_TOPIC_ALIASES lists every spelling variant known to exist for each
+canonical sync-relevant topic, and a lookup checks all of them. When
+every active variant agrees (or only one is active), that value is
+used, exactly as if there had been no alias to begin with. When active
+variants genuinely DISAGREE, this never guesses which one is right --
+see sync_house_status_from_knowledge()'s own docstring for exactly
+what happens instead (the field is left untouched, and the conflict is
+returned to the caller to log, not silently resolved).
 """
 
 from __future__ import annotations
@@ -103,6 +129,67 @@ _UNCONFIRMED_VALUES = frozenset({
 _TRUE_VALUES = frozenset({"yes", "true", "y"})
 _FALSE_VALUES = frozenset({"no", "false", "n"})
 
+# Every spelling variant currently known to exist in production
+# Knowledge for the same real-world fact -- see this module's
+# docstring's "Topic aliasing" section for the forensic finding this
+# closes. A topic not listed here (HOH, NOMINEES today) has no known
+# alternate spelling in production, so it maps to itself only; adding
+# a variant here later is the entire fix if another one is ever found
+# -- no other code changes needed.
+_TOPIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "HOH": ("HOH",),
+    "NOMINEES": ("NOMINEES",),
+    "VETO_WINNER": ("VETO_WINNER", "VETO WINNER"),
+    "VETO_USED": ("VETO_USED", "VETO USED"),
+    "HAVE_NOTS": ("HAVE_NOTS", "HAVE NOTS"),
+}
+
+
+def _resolve_active_state(
+    knowledge: "KnowledgeStore", canonical_topic: str
+):
+    """Alias-aware counterpart to knowledge.active_state(): checks
+    every spelling variant of `canonical_topic` (_TOPIC_ALIASES above)
+    and returns (item_or_None, had_conflict).
+
+    - No variant has an active item: (None, False) -- exactly like a
+      plain active_state() miss; the caller leaves the field untouched.
+    - One variant is active, or several are active but all AGREE
+      (case/whitespace-insensitive content match): (that item, False).
+      When more than one agrees, the most recently updated is returned
+      -- the same "freshest wins" behavior a single active_state()
+      topic already has over time via teach()'s auto-supersede.
+    - Several variants are active with genuinely DIFFERENT content:
+      (None, True) -- a real conflict. Never guessed at; the caller
+      treats this like "nothing taught" for the field itself, but logs
+      it rather than resolving it in silence (see
+      sync_house_status_from_knowledge()'s docstring).
+
+    Read-only: active_state() never mutates KnowledgeStore.
+    """
+
+    variants = _TOPIC_ALIASES.get(canonical_topic, (canonical_topic,))
+
+    found = []
+    checked: set[str] = set()
+    for variant in variants:
+        normalized = variant.strip().upper()
+        if normalized in checked:
+            continue
+        checked.add(normalized)
+        item = knowledge.active_state(variant)
+        if item is not None:
+            found.append(item)
+
+    if not found:
+        return None, False
+
+    distinct_values = {item.content.strip().lower() for item in found}
+    if len(distinct_values) > 1:
+        return None, True
+
+    return max(found, key=lambda item: item.updated_at), False
+
 
 def _split_taught_names(value: str) -> list[str]:
     """Splits a taught multi-name STATE value ("Devens, LaLa, Taylor")
@@ -116,7 +203,7 @@ def _split_taught_names(value: str) -> list[str]:
 
 def sync_house_status_from_knowledge(
     house_status: HouseStatus, knowledge: "KnowledgeStore"
-) -> HouseStatus:
+):
     """Returns a NEW HouseStatus with every recognized topic's field
     (_STRING_TOPIC_FIELDS/_LIST_TOPIC_FIELDS/_BOOL_TOPIC_FIELDS above)
     re-derived from Knowledge State's current active_state() value for
@@ -133,24 +220,43 @@ def sync_house_status_from_knowledge(
     invents a value Knowledge State didn't actually confirm, and never
     touches CompetitionState at all.
 
+    Topic lookup is alias-aware (see _resolve_active_state() and this
+    module's docstring's "Topic aliasing" section): when a topic has
+    more than one active spelling variant in Knowledge and they
+    genuinely disagree, that field is left untouched -- exactly like
+    "nothing taught" -- rather than silently picking whichever variant
+    happened to be found first. Returns (new_house_status,
+    conflicted_topics): `conflicted_topics` lists the canonical topic
+    name(s) where this happened, for the caller to log -- never raised
+    as an exception, since a Knowledge data-quality issue must not be
+    able to crash reconciliation or startup.
+
     Pure function: never mutates `house_status` or `knowledge` --
     `knowledge.active_state()` is a read-only lookup, and this returns
     a new HouseStatus rather than assigning into anything. The caller
     (production/engine.py ProductionEngine.reconcile_game_state_from_knowledge())
-    owns deciding what to do with the result and any persistence.
+    owns deciding what to do with the result, any logging, and any
+    persistence.
     """
 
     fields = house_status.to_dict()
+    conflicted_topics: list[str] = []
+
+    def _resolve(topic: str):
+        item, conflict = _resolve_active_state(knowledge, topic)
+        if conflict:
+            conflicted_topics.append(topic)
+        return item
 
     for topic, field in _STRING_TOPIC_FIELDS.items():
-        item = knowledge.active_state(topic)
+        item = _resolve(topic)
         if item is None:
             continue
         value = item.content.strip()
         fields[field] = "" if value.lower() in _UNCONFIRMED_VALUES else value
 
     for topic, field in _LIST_TOPIC_FIELDS.items():
-        item = knowledge.active_state(topic)
+        item = _resolve(topic)
         if item is None:
             continue
         value = item.content.strip()
@@ -159,7 +265,7 @@ def sync_house_status_from_knowledge(
         )
 
     for topic, field in _BOOL_TOPIC_FIELDS.items():
-        item = knowledge.active_state(topic)
+        item = _resolve(topic)
         if item is None:
             continue
         value = item.content.strip().lower()
@@ -173,4 +279,4 @@ def sync_house_status_from_knowledge(
         # it rather than guessing True or False either way. See this
         # module's docstring: a documented, deliberate limitation.
 
-    return HouseStatus.from_dict(fields)
+    return HouseStatus.from_dict(fields), conflicted_topics
