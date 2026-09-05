@@ -478,13 +478,25 @@ def format_official_state(knowledge_store) -> str:
     Deliberately not a hardcoded topic list: whatever an admin has
     actually taught (HOH, NOMINEES, VETO_WINNER, HAVE_NOTS,
     EVICTED, or anything else) shows up here with no code change.
+
+    Uses knowledge_store.current_state_items() when available (the
+    real KnowledgeStore -- see production/knowledge.py) rather than a
+    raw active_items() filter, so a WEEK_SCOPED_TOPICS value taught
+    for a previous week and never re-confirmed this week is correctly
+    excluded instead of being presented as current "ground truth"
+    forever (the production bug this closes). Falls back to the old
+    raw filter for a test double that only implements active_items().
     """
 
-    items = [
-        item
-        for item in knowledge_store.active_items()
-        if item.type == KnowledgeType.STATE and item.topic
-    ]
+    current_state_items = getattr(knowledge_store, "current_state_items", None)
+    if current_state_items is not None:
+        items = current_state_items()
+    else:
+        items = [
+            item
+            for item in knowledge_store.active_items()
+            if item.type == KnowledgeType.STATE and item.topic
+        ]
 
     if not items:
         return ""
@@ -499,6 +511,46 @@ def format_official_state(knowledge_store) -> str:
         "truth for the Big Brother house's current state; always answer HOH/nominee/veto/"
         "Have-Not questions from this list, never from conversation or the live feed below, "
         "and say you don't know yet if a topic isn't listed here):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+# ==========================================================
+# Weekly state archive (admin-confirmed, historical -- see production/
+# knowledge.py KnowledgeStore.close_week()/set_archived_week())
+# ==========================================================
+
+
+def format_weekly_archive(record: dict | None, week: int) -> str:
+    """Formats one closed/archived week's STATE snapshot for the
+    model's context -- the historical counterpart to
+    format_official_state() above, for topics (nominees, veto,
+    Have-Nots, BB Blockbuster) that have no other historical retrieval
+    mechanism (unlike HOH, see production/historical_retrieval.py's
+    Phase 1 HistoricalEventStore coverage).
+
+    `record` is whatever production/knowledge.py KnowledgeStore.
+    archived_week() returned for `week` -- None (or an empty snapshot)
+    means nothing has been archived for it, and this returns "" rather
+    than inventing a historical claim. Explicitly labeled historical/
+    closed so the model never mistakes a past week's snapshot for the
+    current state -- this must never be blended with OFFICIAL GAME
+    FACTS or presented as an answer to a *current*-state question.
+    """
+
+    if not record or not record.get("snapshot"):
+        return ""
+
+    lines = [
+        f"{topic.replace('_', ' ').title()}: {value}"
+        for topic, value in sorted(record["snapshot"].items())
+    ]
+
+    return (
+        f"WEEKLY STATE ARCHIVE -- Week {week} (admin-confirmed, but CLOSED/HISTORICAL, not "
+        f"current -- use this ONLY to answer a question specifically about Week {week}; never "
+        "as the current game state, and never blended with OFFICIAL GAME FACTS above, even if "
+        "a field here looks unchanged since):\n"
         + "\n".join(f"- {line}" for line in lines)
     )
 
@@ -1493,6 +1545,7 @@ async def generate_julie_response(
     historical_events: str = "",
     historical_context: str = "",
     recent_live_feed: str = "",
+    weekly_archive: str = "",
     knowledge_summary_guidance: str = "",
 ) -> str:
     """Generates Julie's reply: Groq first, Gemini if Groq can't answer.
@@ -1530,6 +1583,16 @@ async def generate_julie_response(
     never answer a *current*-state question, only a specific past
     week/cycle one, and unverified/disputed historical claims never
     reach this parameter at all (see database/historical_events.py).
+
+    weekly_archive, when provided, is one CLOSED week's admin-confirmed
+    STATE snapshot (see format_weekly_archive() and production/
+    knowledge.py KnowledgeStore.archived_week()) -- only ever populated
+    when the message itself names a specific past week ("who won the
+    Week 8 veto?"). Placed right after historical_events: like that
+    block, it was explicitly admin-confirmed (just for a topic
+    HistoricalEventStore's Phase 1 doesn't cover yet -- nominees, veto,
+    Have-Nots, BB Blockbuster), and it can never answer a *current*-
+    state question, only the specific named week's.
 
     historical_context, when provided, is retrieved Hamsterwatch
     archive material (see format_historical_context() and
@@ -1663,6 +1726,7 @@ async def generate_julie_response(
     budget_priority_blocks = [
         ("official_state", official_state),
         ("historical_events", historical_events),
+        ("weekly_archive", weekly_archive),
         ("knowledge", knowledge),
         ("memory", memory),
         ("historical_context", historical_context),
@@ -1682,6 +1746,8 @@ async def generate_julie_response(
         system_instruction = f"{system_instruction}\n\n{included['memory']}"
     if "historical_events" in included:
         system_instruction = f"{system_instruction}\n\n{included['historical_events']}"
+    if "weekly_archive" in included:
+        system_instruction = f"{system_instruction}\n\n{included['weekly_archive']}"
     if "historical_context" in included:
         system_instruction = f"{system_instruction}\n\n{included['historical_context']}"
     if "recent_live_feed" in included:

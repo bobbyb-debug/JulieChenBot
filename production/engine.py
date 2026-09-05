@@ -87,6 +87,23 @@ class ProductionEngine:
         # on every mutation rather than waiting for a production cycle.
         self.knowledge = KnowledgeStore(storage=self.storage)
 
+        # Self-healing topic-spelling repair (see KnowledgeStore.
+        # dedupe_topics()) -- run unconditionally at every startup,
+        # same posture as reconcile_game_state_from_knowledge() below:
+        # idempotent, so a deployment with nothing to repair pays only
+        # the cost of one pass over already-canonical topics. Must run
+        # BEFORE reconcile_game_state_from_knowledge(), which reads
+        # Knowledge State via topic string and would otherwise inherit
+        # whichever stale/duplicate spelling happened to be considered
+        # "active" first.
+        repaired_topics = self.knowledge.dedupe_topics()
+        if repaired_topics:
+            self.logger.warning(
+                "Repaired duplicate/aliased Knowledge STATE topic spelling(s) "
+                "at startup: %s",
+                repaired_topics,
+            )
+
         # Explicit long-term conversational memory (see production/
         # memory.py) -- deliberately separate from KnowledgeStore
         # above: a /remember entry is never an official game fact and

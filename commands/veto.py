@@ -37,7 +37,14 @@ def register(discord_service) -> None:
     async def veto(interaction: discord.Interaction):
 
         knowledge = discord_service.scheduler.engine.knowledge
-        holder = knowledge.active_state("VETO_WINNER")
+        # current_state() additionally enforces the current reporting
+        # week's boundary (see production/knowledge.py KnowledgeStore.
+        # current_state()) so a veto winner/used flag taught for a
+        # previous week and never re-confirmed this week correctly
+        # reads as "not confirmed yet." Falls back to active_state()
+        # for a test double that doesn't define current_state().
+        current_state = getattr(knowledge, "current_state", knowledge.active_state)
+        holder = current_state("VETO_WINNER")
 
         if holder is None or not holder.content.strip():
             message = (
@@ -45,7 +52,7 @@ def register(discord_service) -> None:
                 "this cycle."
             )
         else:
-            used_state = knowledge.active_state("VETO_USED")
+            used_state = current_state("VETO_USED")
             if used_state is not None and used_state.content.strip():
                 used_yes = used_state.content.strip().lower() in (
                     "yes", "true", "used"

@@ -499,3 +499,177 @@ def test_conflicts_endpoint_reason_does_not_imply_equal_authority(
             assert hoh_conflict["house_status_value"] == "Taylor"
 
     _run(scenario())
+
+
+# ==========================================================
+# Weekly game state -- the dashboard's CURRENT WEEK / WEEKLY ARCHIVE /
+# CLOSE WEEK / START NEW WEEK control plane (see production/
+# knowledge.py KnowledgeStore.start_new_week()/close_week()).
+# ==========================================================
+
+
+def test_week_status_reports_current_week_and_archive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.start_new_week(8)
+    engine.knowledge.close_week()
+    engine.knowledge.start_new_week(9)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/week", headers=AUTH)
+            body = await resp.json()
+            assert body["current_week"] == 9
+            assert body["archived_weeks"] == [8]
+
+    _run(scenario())
+
+
+def test_week_start_moves_the_current_week_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.teach(KnowledgeType.STATE, "Dee", 1, topic="HOH")
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/week/start", json={"week": 9}, headers=AUTH
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["current_week"] == 9
+
+    _run(scenario())
+
+    # The old HOH value must now read as unconfirmed for the new week.
+    assert engine.knowledge.current_state("HOH") is None
+    assert engine.knowledge.active_state("HOH").content == "Dee"  # history preserved
+
+
+def test_week_start_requires_an_integer_week(tmp_path: Path, monkeypatch) -> None:
+    _, app = _build(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/week/start", json={"week": "nine"}, headers=AUTH
+            )
+            assert resp.status == 400
+
+    _run(scenario())
+
+
+def test_week_close_freezes_the_current_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.start_new_week(8)
+    engine.knowledge.teach(KnowledgeType.STATE, "Yash", 1, topic="VETO_WINNER")
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/v1/week/close", headers=AUTH)
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["week"] == 8
+            assert body["snapshot"]["VETO_WINNER"] == "Yash"
+
+    _run(scenario())
+
+
+def test_week_close_without_a_current_week_is_a_400(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, app = _build(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/v1/week/close", headers=AUTH)
+            assert resp.status == 400
+
+    _run(scenario())
+
+
+def test_week_detail_returns_current_snapshot_for_the_live_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.start_new_week(9)
+    engine.knowledge.teach(KnowledgeType.STATE, "Barrett", 1, topic="HOH")
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/week/9", headers=AUTH)
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["status"] == "current"
+            assert body["snapshot"]["HOH"] == "Barrett"
+
+    _run(scenario())
+
+
+def test_week_detail_returns_404_for_a_week_never_recorded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.start_new_week(9)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/week/3", headers=AUTH)
+            assert resp.status == 404
+
+    _run(scenario())
+
+
+def test_week_backfill_records_a_historical_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A human-friendly way to record Week 7/8's final state after
+    this feature first ships, with no manual JSON editing -- see
+    KnowledgeStore.set_archived_week()."""
+
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.start_new_week(9)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/week/8/archive",
+                json={"snapshot": {"VETO_WINNER": "Yash", "BB_BLOCKBUSTER": "Devens"}},
+                headers=AUTH,
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["snapshot"]["BB_BLOCKBUSTER"] == "Devens"
+
+            detail = await client.get("/api/v1/week/8", headers=AUTH)
+            detail_body = await detail.json()
+            assert detail_body["status"] == "archived"
+            assert detail_body["snapshot"]["VETO_WINNER"] == "Yash"
+
+    _run(scenario())
+
+
+def test_game_state_official_state_excludes_a_stale_week_scoped_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The dashboard's own /api/v1/game-state must not show a
+    previous week's HOH as current either -- same fix as Julie's
+    OFFICIAL GAME FACTS block (services/ai_service.py
+    format_official_state())."""
+
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.teach(KnowledgeType.STATE, "Dee", 1, topic="HOH")
+    engine.knowledge.start_new_week(9)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/game-state", headers=AUTH)
+            body = await resp.json()
+            assert "HOH" not in body["official_state"]
+            assert body["current_week"] == 9
+
+    _run(scenario())

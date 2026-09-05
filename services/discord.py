@@ -35,7 +35,7 @@ from production.hamsterwatch_context import (
     HistoricalContextResult,
     retrieve_historical_context,
 )
-from production.historical_retrieval import retrieve_hoh
+from production.historical_retrieval import extract_week_number, retrieve_hoh
 from production.knowledge_summary import collect_summary_metadata, is_broad_knowledge_query
 from production.live_feed_window import parse_recent_window, select_recent_updates
 from services.logger import ProductionLogger
@@ -50,6 +50,7 @@ from services.ai_service import (
     format_long_term_memory,
     format_official_state,
     format_recent_live_feed,
+    format_weekly_archive,
     generate_julie_response,
 )
 
@@ -225,6 +226,29 @@ class DiscordService:
             else ""
         )
 
+        # Deterministic, no-AI-call check (reuses production/
+        # historical_retrieval.py's extract_week_number() -- same
+        # regex-extractor convention as the HOH lookup just above, not
+        # a new parser). Only populated when the message names a
+        # specific week that ISN'T the current one: a "current week"
+        # question is already fully covered by official_state above,
+        # and a week never archived (see production/knowledge.py
+        # KnowledgeStore.close_week()/set_archived_week()) simply has
+        # no block to add. This is what lets a question like "who won
+        # the Week 8 veto?" be answered correctly instead of falling
+        # back to semantic knowledge retrieval, which has no notion of
+        # "this value belongs to a past, closed week."
+        weekly_archive = ""
+        requested_week = extract_week_number(user_text)
+        if requested_week is not None and requested_week != engine.knowledge.current_week:
+            try:
+                record = engine.knowledge.archived_week(requested_week)
+                weekly_archive = format_weekly_archive(record, requested_week)
+            except Exception:
+                self.logger.exception(
+                    "Weekly archive retrieval failed; continuing without it."
+                )
+
         # Deterministic, no-AI-call check (see production/
         # live_feed_window.py). Only a genuine "what happened
         # recently?"-style question pays the cost of an extra
@@ -284,6 +308,7 @@ class DiscordService:
             historical_events=historical_events,
             historical_context=historical_context,
             recent_live_feed=recent_live_feed,
+            weekly_archive=weekly_archive,
             knowledge_summary_guidance=knowledge_summary_guidance,
         )
 

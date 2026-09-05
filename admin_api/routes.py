@@ -159,14 +159,14 @@ async def game_state(request: web.Request) -> web.Response:
     engine = _engine(request)
     official_state = {
         item.topic: item.to_dict()
-        for item in engine.knowledge.active_items()
-        if item.type == KnowledgeType.STATE and item.topic
+        for item in engine.knowledge.current_state_items()
     }
     return web.json_response(
         {
             "house_status": engine.watcher.house_status.snapshot(),
             "competition": engine.watcher.competition.snapshot(),
             "official_state": official_state,
+            "current_week": engine.knowledge.current_week,
         }
     )
 
@@ -175,6 +175,152 @@ async def game_state(request: web.Request) -> web.Response:
 async def conflicts(request: web.Request) -> web.Response:
     engine = _engine(request)
     return web.json_response({"conflicts": detect_conflicts(engine)})
+
+
+# ==========================================================
+# Weekly game state -- the dashboard's CURRENT WEEK / WEEKLY ARCHIVE /
+# CLOSE WEEK / START NEW WEEK control plane (see production/
+# knowledge.py KnowledgeStore.current_state()/start_new_week()/
+# close_week()/set_archived_week()). No route here writes JSON to
+# disk directly or asks a moderator to hand-edit anything -- every
+# write goes through the same KnowledgeStore methods /teach update
+# and the rest of this file already rely on.
+# ==========================================================
+
+
+@routes.get("/api/v1/week")
+async def week_status(request: web.Request) -> web.Response:
+    """Current reporting week, its start boundary, and which weeks
+    have an archived snapshot -- everything the dashboard needs to
+    render "Week 9 (current)" plus a "Week 5 / 6 / 7 / 8" archive
+    list, without the dashboard tracking any of this state itself."""
+
+    engine = _engine(request)
+    knowledge = engine.knowledge
+
+    return web.json_response(
+        {
+            "current_week": knowledge.current_week,
+            "started_at": (
+                knowledge.week_started_at.isoformat()
+                if knowledge.week_started_at
+                else None
+            ),
+            "archived_weeks": sorted(knowledge.week_archive.keys()),
+        }
+    )
+
+
+@routes.get("/api/v1/week/{week}")
+async def week_detail(request: web.Request) -> web.Response:
+    """One week's full snapshot -- the CURRENT week's live confirmed
+    state (current_state_items(), same values format_official_state()
+    renders for Julie) if `week` is the current one, otherwise its
+    frozen archived snapshot (see KnowledgeStore.archived_week()).
+    404 only when `week` is neither the current week nor archived --
+    there is genuinely nothing recorded for it."""
+
+    engine = _engine(request)
+    knowledge = engine.knowledge
+
+    try:
+        week = int(request.match_info["week"])
+    except ValueError:
+        return web.json_response({"error": "invalid week"}, status=400)
+
+    if week == knowledge.current_week:
+        snapshot = {
+            item.topic: item.content for item in knowledge.current_state_items()
+        }
+        return web.json_response(
+            {
+                "week": week,
+                "status": "current",
+                "started_at": (
+                    knowledge.week_started_at.isoformat()
+                    if knowledge.week_started_at
+                    else None
+                ),
+                "snapshot": snapshot,
+            }
+        )
+
+    record = knowledge.archived_week(week)
+    if record is None:
+        return web.json_response(
+            {"error": f"no data recorded for week {week}"}, status=404
+        )
+
+    return web.json_response({"week": week, "status": "archived", **record})
+
+
+@routes.post("/api/v1/week/start")
+async def week_start(request: web.Request) -> web.Response:
+    """Begins a new reporting week (the dashboard's START NEW WEEK
+    control) -- see KnowledgeStore.start_new_week(). Every
+    WEEK_SCOPED_TOPICS field (HOH, NOMINEES, VETO_WINNER, VETO_USED,
+    BB_BLOCKBUSTER, HAVE_NOTS) immediately reads as unconfirmed for
+    /hoh, /nominees, /veto, and Julie's chat context until explicitly
+    re-taught -- nothing from the previous week is carried forward.
+    Never touches a single KnowledgeItem; call POST /api/v1/week/close
+    first if the outgoing week's values should be preserved as a
+    queryable historical snapshot.
+    """
+
+    engine = _engine(request)
+    body = await _json_body(request)
+    if body is None or not isinstance(body.get("week"), int):
+        return web.json_response({"error": "'week' (integer) is required"}, status=400)
+
+    engine.knowledge.start_new_week(body["week"])
+
+    return web.json_response(
+        {
+            "current_week": engine.knowledge.current_week,
+            "started_at": engine.knowledge.week_started_at.isoformat(),
+        }
+    )
+
+
+@routes.post("/api/v1/week/close")
+async def week_close(request: web.Request) -> web.Response:
+    """Freezes the CURRENT week's full STATE snapshot into the
+    queryable weekly archive (the dashboard's CLOSE WEEK control) --
+    see KnowledgeStore.close_week(). Does not itself start a new week;
+    follow with POST /api/v1/week/start for that (see that route's own
+    docstring for why the two stay separate operations)."""
+
+    engine = _engine(request)
+    try:
+        record = engine.knowledge.close_week()
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    return web.json_response(record)
+
+
+@routes.post("/api/v1/week/{week}/archive")
+async def week_backfill(request: web.Request) -> web.Response:
+    """Manually records a historical week's final snapshot -- for a
+    week that predates week-tracking ever being turned on (e.g.
+    backfilling Week 7/8 the first time this ships), so a historical
+    question about it works immediately rather than only from the
+    first week tracked live. See KnowledgeStore.set_archived_week().
+    """
+
+    engine = _engine(request)
+
+    try:
+        week = int(request.match_info["week"])
+    except ValueError:
+        return web.json_response({"error": "invalid week"}, status=400)
+
+    body = await _json_body(request)
+    if body is None or not isinstance(body.get("snapshot"), dict):
+        return web.json_response({"error": "'snapshot' (object) is required"}, status=400)
+
+    record = engine.knowledge.set_archived_week(week, body["snapshot"])
+    return web.json_response(record)
 
 
 # ==========================================================
@@ -311,7 +457,7 @@ async def state_why(request: web.Request) -> web.Response:
     engine = _engine(request)
     topic = request.match_info["topic"].strip().upper()
 
-    current = engine.knowledge.active_state(topic)
+    current = engine.knowledge.current_state(topic)
     history = sorted(
         (item for item in engine.knowledge.all_items() if item.topic == topic),
         key=lambda item: item.created_at,

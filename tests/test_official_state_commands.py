@@ -7,6 +7,7 @@ commands/hoh.py and commands/veto.py module docstrings. /nominees and
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import discord
@@ -14,6 +15,8 @@ import discord.ext.commands as dc
 
 import commands.hoh as hoh_module
 import commands.veto as veto_module
+from database.storage import Storage
+from production.knowledge import KnowledgeStore, KnowledgeType
 
 
 class FakeInteraction:
@@ -112,3 +115,70 @@ def test_veto_reports_not_confirmed_when_untaught() -> None:
     asyncio.run(tree.get_command("veto").callback(interaction))
 
     assert "No Power of Veto winner" in interaction.sent[0]
+
+
+# ==========================================================
+# Weekly boundary: /hoh and /veto must not answer with a value taught
+# for a PREVIOUS reporting week (see production/knowledge.py
+# KnowledgeStore.current_state()) -- the actual production bug this
+# closes: a stale Week 7/8 value being served forever as "confirmed."
+# Exercised against a REAL KnowledgeStore (not the bare active_state()
+# fake above) since current_state() is what makes this distinction.
+# ==========================================================
+
+
+def _register_real(module, knowledge: KnowledgeStore):
+    ds = SimpleNamespace()
+    ds.bot = dc.Bot(command_prefix="!", intents=discord.Intents.default())
+    ds.command = lambda *a, **kw: ds.bot.tree.command(*a, **kw)
+    ds.scheduler = SimpleNamespace(engine=SimpleNamespace(knowledge=knowledge))
+    module.register(ds)
+    return ds.bot.tree
+
+
+def test_hoh_reports_not_confirmed_for_a_value_taught_last_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    knowledge = KnowledgeStore(storage=Storage())
+    knowledge.teach(KnowledgeType.STATE, "Dee", author_id=1, topic="HOH")
+    knowledge.start_new_week(9)
+
+    tree = _register_real(hoh_module, knowledge)
+    interaction = FakeInteraction()
+    asyncio.run(tree.get_command("hoh").callback(interaction))
+
+    assert "No Head of Household" in interaction.sent[0]
+    assert "Dee" not in interaction.sent[0]
+
+
+def test_hoh_reports_the_value_re_taught_this_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    knowledge = KnowledgeStore(storage=Storage())
+    knowledge.teach(KnowledgeType.STATE, "Dee", author_id=1, topic="HOH")
+    knowledge.start_new_week(9)
+    knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+
+    tree = _register_real(hoh_module, knowledge)
+    interaction = FakeInteraction()
+    asyncio.run(tree.get_command("hoh").callback(interaction))
+
+    assert "Barrett" in interaction.sent[0]
+
+
+def test_veto_reports_not_confirmed_for_a_value_taught_last_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    knowledge = KnowledgeStore(storage=Storage())
+    knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
+    knowledge.start_new_week(9)
+
+    tree = _register_real(veto_module, knowledge)
+    interaction = FakeInteraction()
+    asyncio.run(tree.get_command("veto").callback(interaction))
+
+    assert "No Power of Veto winner" in interaction.sent[0]
+    assert "Yash" not in interaction.sent[0]

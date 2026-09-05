@@ -25,6 +25,7 @@ startup, matching _load_pending_events()'s per-entry try/except.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -34,6 +35,31 @@ from database.storage import Storage
 from services.logger import ProductionLogger
 
 logger = ProductionLogger.get("Knowledge")
+
+
+def _canonicalize_topic(topic: str) -> str:
+    """Normalizes a STATE topic string to one canonical spelling.
+
+    Forensic production finding: KnowledgeStore's old normalization
+    (`.strip().upper()` alone) treats "VETO WINNER" and "VETO_WINNER"
+    as two genuinely different topics, since it never collapses a
+    space/underscore difference. A moderator typing a topic slightly
+    differently on two occasions (free-text entry via /teach update or
+    the dashboard -- see production/batch_teach.py) then produces two
+    independently-"active" STATE items for what a human considers the
+    same real-world fact, silently breaking the "at most one active
+    STATE item per topic" guarantee every reader (active_state(),
+    format_official_state(), /hoh, /nominees, /veto) relies on. Both
+    survive, and whichever one a caller happens to query by its exact
+    spelling is what's shown as "official" -- which can be the stale
+    one. Collapsing every run of whitespace to a single underscore
+    here, applied at both write time (teach()) and read time
+    (active_state()), makes every spelling variant resolve to the same
+    stored topic going forward. See KnowledgeStore.dedupe_topics() for
+    repairing spellings already persisted before this existed.
+    """
+
+    return re.sub(r"\s+", "_", topic.strip().upper())
 
 
 # ==========================================================
@@ -178,10 +204,25 @@ class KnowledgeStore:
     """
 
     STORAGE_KEY = "knowledge"
+    WEEK_META_KEY = "game_week"
+
+    # STATE topics representing "this competition cycle's" result --
+    # the fields a new reporting week must never blindly inherit from
+    # the previous one just because nobody got around to re-teaching
+    # them (see current_state() and start_new_week()/close_week()
+    # below). Every other STATE topic (e.g. REMAINING_HOUSEGUESTS,
+    # LAST_EVICTED, VOTE, EVICTED) is a running/one-time fact, not a
+    # per-week value, and is deliberately NOT in this set -- it keeps
+    # active_state()'s plain "most recent taught value" semantics
+    # forever, exactly as before this feature existed.
+    WEEK_SCOPED_TOPICS = frozenset(
+        {"HOH", "NOMINEES", "VETO_WINNER", "VETO_USED", "BB_BLOCKBUSTER", "HAVE_NOTS"}
+    )
 
     def __init__(self, storage: Optional[Storage] = None) -> None:
         self.storage = storage or Storage()
         self._items: list[KnowledgeItem] = self._load()
+        self._load_week_meta()
 
         logger.info(
             "Knowledge store initialized (%d item(s), %d active).",
@@ -208,6 +249,41 @@ class KnowledgeStore:
         self.storage.set(
             self.STORAGE_KEY,
             [item.to_dict() for item in self._items],
+        )
+
+    def _load_week_meta(self) -> None:
+        """Restores the current reporting week's boundary and the
+        historical weekly archive (see start_new_week()/close_week()
+        below). Absence of this key means week-tracking has never been
+        turned on for this deployment: current_week/week_started_at
+        stay None, and current_state() below behaves EXACTLY like
+        active_state() always has -- no filtering, fully backward
+        compatible until an admin explicitly starts week tracking via
+        start_new_week()."""
+
+        data = self.storage.get(self.WEEK_META_KEY, None) or {}
+
+        self.current_week: Optional[int] = data.get("current_week")
+
+        started_raw = data.get("started_at")
+        self.week_started_at: Optional[datetime] = (
+            datetime.fromisoformat(started_raw) if started_raw else None
+        )
+
+        self.week_archive: dict[int, dict] = {
+            int(week): record for week, record in (data.get("archive") or {}).items()
+        }
+
+    def _persist_week_meta(self) -> None:
+        self.storage.set(
+            self.WEEK_META_KEY,
+            {
+                "current_week": self.current_week,
+                "started_at": (
+                    self.week_started_at.isoformat() if self.week_started_at else None
+                ),
+                "archive": {str(week): record for week, record in self.week_archive.items()},
+            },
         )
 
     # ======================================================
@@ -258,7 +334,7 @@ class KnowledgeStore:
         """
 
         if knowledge_type == KnowledgeType.STATE:
-            normalized_topic = (topic or "").strip().upper()
+            normalized_topic = _canonicalize_topic(topic or "")
             if not normalized_topic:
                 raise ValueError(
                     "A STATE item requires a topic (e.g. HOH, NOMINEES)."
@@ -406,6 +482,19 @@ class KnowledgeStore:
         the only one there should ever be.
         """
 
+        # Deliberately NOT _canonicalize_topic() here -- this stays a
+        # plain, literal-string lookup (matching every already-
+        # persisted topic exactly as stored), so production/
+        # state_sync.py's alias-aware resolver can still query several
+        # distinct literal spellings of the same real-world topic (see
+        # its own docstring) and tell whether they genuinely agree.
+        # Canonicalizing the query here would collapse every spelling
+        # variant into the same string before this method ever sees
+        # them, making that distinction impossible to observe. New
+        # writes are already canonical at the source (see teach()),
+        # and dedupe_topics() migrates anything persisted before that
+        # existed -- this method needs no canonicalization of its own
+        # for either case to resolve correctly once that has run.
         normalized = topic.strip().upper()
         return next(
             (
@@ -417,3 +506,253 @@ class KnowledgeStore:
             ),
             None,
         )
+
+    def current_state(self, topic: str) -> Optional[KnowledgeItem]:
+        """Like active_state(), but additionally enforces the current
+        reporting week's boundary for WEEK_SCOPED_TOPICS: a value
+        taught before this week started is NOT "current" merely
+        because nobody has re-taught it since -- it returns None
+        (meaning "unconfirmed this week"), the same way active_state()
+        already returns None for a topic never taught at all.
+
+        This is the fix for the production bug where a genuinely stale
+        value (e.g. last week's HOH) kept being served indefinitely as
+        "OFFICIAL GAME FACTS... ground truth" -- see /hoh, /nominees,
+        /veto, and services/ai_service.py format_official_state(),
+        every one of which must call this instead of active_state()
+        for a WEEK_SCOPED_TOPICS field.
+
+        A topic outside WEEK_SCOPED_TOPICS (REMAINING_HOUSEGUESTS,
+        LAST_EVICTED, VOTE, EVICTED, or anything else an admin has
+        taught) is unaffected -- it keeps active_state()'s plain
+        "most recently taught value, however old" semantics, since
+        those are running/one-time facts, not per-week values.
+
+        When no week has ever been started (week_started_at is None,
+        the default for a deployment that hasn't turned on week
+        tracking yet -- see start_new_week()), this is identical to
+        active_state(): fully backward compatible, no behavior change
+        until an admin explicitly starts tracking weeks.
+        """
+
+        item = self.active_state(topic)
+        if item is None:
+            return None
+
+        normalized = _canonicalize_topic(topic)
+        if normalized in self.WEEK_SCOPED_TOPICS and self.week_started_at is not None:
+            if item.created_at < self.week_started_at:
+                return None
+
+        return item
+
+    def current_state_items(self) -> list[KnowledgeItem]:
+        """Every active STATE item that counts as confirmed for the
+        CURRENT reporting week -- the set services/ai_service.py
+        format_official_state() and the admin API's /api/v1/game-state
+        render. A WEEK_SCOPED_TOPICS item whose only active value
+        predates the current week's start (see current_state()) is
+        excluded; every other active STATE item (including any
+        WEEK_SCOPED_TOPICS item already re-taught this week) is
+        included unchanged.
+        """
+
+        result = []
+        for item in self.active_items():
+            if item.type != KnowledgeType.STATE or not item.topic:
+                continue
+            if item.topic in self.WEEK_SCOPED_TOPICS:
+                if self.current_state(item.topic) is None:
+                    continue
+            result.append(item)
+        return result
+
+    # ======================================================
+    # Weekly state boundary
+    # ======================================================
+    #
+    # Deliberately time-based, not a new field on every KnowledgeItem:
+    # "which week is this STATE value for" is derived from WHEN it was
+    # taught (created_at) relative to the recorded week-start boundary,
+    # rather than stamping every write with an explicit week number.
+    # This needed zero schema/migration changes to any already-
+    # persisted KnowledgeItem, and it means current_state() above is a
+    # pure read -- starting or closing a week never rewrites a single
+    # existing KnowledgeItem.
+
+    def start_new_week(
+        self, week: int, *, started_at: Optional[datetime] = None
+    ) -> None:
+        """Begins a new reporting week: current_state() for every
+        WEEK_SCOPED_TOPICS field immediately starts returning None
+        (UNCONFIRMED) until each is explicitly re-taught with a
+        created_at at or after `started_at` (defaults to now).
+
+        Deliberately does not touch a single KnowledgeItem -- no STATE
+        value is deleted, deactivated, or overwritten by this call.
+        The previous week's values are still fully readable via
+        active_state()/all_items(); they simply stop counting as
+        "current" (see current_state()). Call close_week() first if
+        the outgoing week's values should be preserved as a queryable
+        historical snapshot (see close_week() below) -- the two are
+        deliberately separate operations (matching the dashboard's own
+        CLOSE WEEK / START NEW WEEK controls) so closing a week never
+        silently starts a new one, and vice versa.
+        """
+
+        self.current_week = week
+        self.week_started_at = started_at or datetime.now(UTC)
+        self._persist_week_meta()
+
+        logger.info(
+            "Started week %d (boundary=%s).",
+            week,
+            self.week_started_at.isoformat(),
+        )
+
+    def close_week(self, *, closed_at: Optional[datetime] = None) -> dict:
+        """Freezes the CURRENT reporting week's full STATE snapshot
+        (every active STATE item, not just WEEK_SCOPED_TOPICS -- a
+        historical query about REMAINING_HOUSEGUESTS or LAST_EVICTED
+        for a past week should work too) into the queryable weekly
+        archive (see archived_week()), keyed by the current week
+        number. Raises ValueError if no week has been started yet --
+        there is nothing to close.
+
+        Does not itself start a new week or touch current_state()'s
+        behavior -- call start_new_week() afterward (see that method's
+        own docstring for why these stay separate operations).
+        """
+
+        if self.current_week is None:
+            raise ValueError(
+                "No current week is set -- call start_new_week() first."
+            )
+
+        snapshot = {
+            item.topic: item.content
+            for item in self.active_items()
+            if item.type == KnowledgeType.STATE and item.topic
+        }
+
+        return self.set_archived_week(
+            self.current_week,
+            snapshot,
+            started_at=self.week_started_at,
+            closed_at=closed_at,
+        )
+
+    def archived_week(self, week: int) -> Optional[dict]:
+        """Returns the frozen snapshot for `week` (see close_week()/
+        set_archived_week()), or None if nothing has been archived for
+        it. Never derived from the live current-week state -- if
+        `week` is the currently-open week, it hasn't been closed yet
+        and this correctly returns None; the caller should read
+        current_state()/current_state_items() for the live value
+        instead."""
+
+        return self.week_archive.get(week)
+
+    def set_archived_week(
+        self,
+        week: int,
+        snapshot: dict,
+        *,
+        started_at: Optional[datetime] = None,
+        closed_at: Optional[datetime] = None,
+    ) -> dict:
+        """Directly records (or overwrites) week `week`'s historical
+        snapshot -- the primitive close_week() itself uses, also
+        exposed directly so an administrator can backfill a week that
+        predates week-tracking ever being turned on (e.g. recording
+        what Week 7/8 actually ended with, once this feature first
+        ships, so historical questions about them work immediately
+        rather than only from the first week tracked live).
+
+        Never touches current_week/week_started_at or any
+        KnowledgeItem -- purely an archive write.
+        """
+
+        record = {
+            "week": week,
+            "started_at": started_at.isoformat() if started_at else None,
+            "closed_at": (closed_at or datetime.now(UTC)).isoformat(),
+            "snapshot": dict(snapshot),
+        }
+
+        self.week_archive[week] = record
+        self._persist_week_meta()
+
+        logger.info("Archived week %d snapshot: %s", week, snapshot)
+
+        return record
+
+    # ======================================================
+    # Topic-spelling repair
+    # ======================================================
+
+    def dedupe_topics(self) -> list[str]:
+        """Repairs STATE topic-spelling drift that predates
+        _canonicalize_topic() -- e.g. "VETO WINNER" and "VETO_WINNER"
+        independently taught as if they were different topics for the
+        same real-world fact (a free-text moderator entry point --
+        see production/batch_teach.py -- with no canonicalization
+        before this existed). That silently broke the "at most one
+        active STATE item per topic" guarantee active_state() and
+        every reader of it rely on: both stayed active, and whichever
+        exact spelling a caller queried decided what showed up as
+        "official" -- which could be the stale one.
+
+        Idempotent and safe to call on every startup (same posture as
+        ProductionEngine.reconcile_game_state_from_knowledge()):
+
+        1. Rewrites every STATE item's topic to its canonical spelling
+           (in place -- content, author, created_at, id all untouched).
+        2. For any canonical topic that now has more than one active
+           item (the actual conflict this closes), keeps the most
+           recently updated as active and deactivates the rest -- same
+           as any other automatic supersede, never a delete.
+
+        Returns the canonical topics that had a genuine conflict
+        repaired (step 2), for the caller to log. A pure spelling
+        rewrite with no resulting conflict (step 1 only) is not
+        reported here -- it changed no reader-visible fact, only the
+        stored spelling.
+        """
+
+        rewrote_any = False
+        for item in self._items:
+            if item.type != KnowledgeType.STATE or not item.topic:
+                continue
+            canonical = _canonicalize_topic(item.topic)
+            if item.topic != canonical:
+                item.topic = canonical
+                rewrote_any = True
+
+        by_topic: dict[str, list[KnowledgeItem]] = {}
+        for item in self._items:
+            if item.active and item.type == KnowledgeType.STATE and item.topic:
+                by_topic.setdefault(item.topic, []).append(item)
+
+        repaired: list[str] = []
+        now = datetime.now(UTC)
+        for topic, active_candidates in by_topic.items():
+            if len(active_candidates) <= 1:
+                continue
+            winner = max(active_candidates, key=lambda candidate: candidate.updated_at)
+            for candidate in active_candidates:
+                if candidate is not winner:
+                    candidate.active = False
+                    candidate.updated_at = now
+            repaired.append(topic)
+
+        if rewrote_any or repaired:
+            self._persist()
+            logger.info(
+                "Knowledge topic dedupe: canonicalized spellings=%s, "
+                "conflicts repaired for topics=%s.",
+                rewrote_any,
+                repaired,
+            )
+
+        return repaired

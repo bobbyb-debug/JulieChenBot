@@ -16,11 +16,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from datetime import UTC, datetime
+
 from database.storage import Storage
 from production.competition import CompetitionState, CompetitionType
 from production.engine import ProductionEngine
 from production.house_status import HouseStatus
-from production.knowledge import KnowledgeType
+from production.knowledge import KnowledgeItem, KnowledgeType
+
+
+def _teach_legacy_spelling(knowledge, content: str, *, author_id: int, topic: str) -> KnowledgeItem:
+    """Directly injects a STATE item under a literal, non-canonicalized
+    topic spelling -- see tests/test_state_sync.py's identical helper
+    for why: KnowledgeStore.teach() now canonicalizes topics (see
+    production/knowledge.py _canonicalize_topic()), so it can no
+    longer produce two independently-active spellings of the same
+    real-world topic on its own. This simulates data persisted before
+    that existed."""
+
+    next_id = max((item.id for item in knowledge.all_items()), default=0) + 1
+    now = datetime.now(UTC)
+    item = KnowledgeItem(
+        id=next_id, type=KnowledgeType.STATE, content=content, author_id=author_id,
+        created_at=now, updated_at=now, active=True, topic=topic.strip().upper(),
+    )
+    knowledge._items.append(item)  # noqa: SLF001 -- deliberate legacy-data simulation
+    knowledge._persist()
+    return item
 
 
 def _teach_the_repair_scenario(storage: Storage) -> None:
@@ -304,12 +326,45 @@ def test_startup_reconciliation_survives_a_topic_alias_conflict(
     assert engine.watcher.house_status.current.veto_holder == ""
 
 
+def test_startup_dedupes_pre_existing_conflicting_topic_spellings(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """The other half of the topic-spelling fix (see production/
+    knowledge.py KnowledgeStore.dedupe_topics()): a genuinely
+    conflicting legacy pair (persisted before canonicalization
+    existed -- teach() itself can no longer create one) is repaired
+    automatically at the very next startup, before reconciliation even
+    runs, rather than surviving as a standing conflict forever."""
+
+    import logging as _logging
+
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    storage = Storage()
+
+    from production.knowledge import KnowledgeStore
+
+    seed = KnowledgeStore(storage=storage)
+    older = _teach_legacy_spelling(seed, "LaLa", author_id=1, topic="VETO WINNER")
+    newer = seed.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
+
+    with caplog.at_level(_logging.WARNING, logger="Engine"):
+        engine = ProductionEngine(storage=Storage())
+
+    assert "repaired" in caplog.text.lower()
+    assert engine.knowledge.get(older.id).active is False
+    assert engine.knowledge.get(newer.id).active is True
+    assert engine.knowledge.active_state("VETO_WINNER").content == "Yash"
+    # Reconciliation ran against the now-clean state -- no leftover
+    # conflict, no guessing.
+    assert engine.watcher.house_status.current.veto_holder == "Yash"
+
+
 def test_reconcile_logs_a_warning_on_alias_conflict(tmp_path: Path, monkeypatch, caplog) -> None:
     import logging as _logging
 
     monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
     engine = ProductionEngine(storage=Storage())
-    engine.knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(engine.knowledge, "LaLa", author_id=1, topic="VETO WINNER")
     engine.knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
 
     with caplog.at_level(_logging.WARNING, logger="Engine"):

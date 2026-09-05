@@ -15,7 +15,10 @@ tests (ProductionEngine.reconcile_game_state_from_knowledge(), the
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from database.storage import Storage
+from production.knowledge import KnowledgeItem
 from production.house_status import HouseStatus
 from production.knowledge import KnowledgeStore, KnowledgeType
 from production.state_sync import (
@@ -28,6 +31,40 @@ from production.state_sync import (
 def _knowledge(tmp_path, monkeypatch) -> KnowledgeStore:
     monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
     return KnowledgeStore(storage=Storage())
+
+
+def _teach_legacy_spelling(
+    knowledge: KnowledgeStore, content: str, *, author_id: int, topic: str
+) -> KnowledgeItem:
+    """Directly injects a STATE item under a literal, non-canonicalized
+    topic spelling (e.g. "VETO WINNER" with a space), bypassing
+    KnowledgeStore.teach()'s normalization -- see production/
+    knowledge.py _canonicalize_topic()/dedupe_topics().
+
+    Simulates data persisted before canonicalization existed. teach()
+    itself can no longer produce two independently-active spellings of
+    the same real-world topic (a new write now canonicalizes and
+    auto-supersedes the previous spelling too), so this is the only
+    way left to construct the genuine alias-conflict scenario
+    state_sync.py's _resolve_active_state() defends against as a
+    backstop for pre-existing/legacy data.
+    """
+
+    next_id = max((item.id for item in knowledge.all_items()), default=0) + 1
+    now = datetime.now(UTC)
+    item = KnowledgeItem(
+        id=next_id,
+        type=KnowledgeType.STATE,
+        content=content,
+        author_id=author_id,
+        created_at=now,
+        updated_at=now,
+        active=True,
+        topic=topic.strip().upper(),
+    )
+    knowledge._items.append(item)  # noqa: SLF001 -- deliberate legacy-data simulation
+    knowledge._persist()
+    return item
 
 
 # ==========================================================
@@ -361,7 +398,7 @@ def test_conflicting_alias_variants_never_guess_a_value(tmp_path, monkeypatch):
     active at once. Must never silently pick either one."""
 
     knowledge = _knowledge(tmp_path, monkeypatch)
-    knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(knowledge, "LaLa", author_id=1, topic="VETO WINNER")
     knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
 
     result, conflicts = sync_house_status_from_knowledge(
@@ -376,7 +413,7 @@ def test_conflicting_alias_variants_never_guess_a_value(tmp_path, monkeypatch):
 
 def test_conflicting_alias_variants_do_not_affect_other_fields(tmp_path, monkeypatch):
     knowledge = _knowledge(tmp_path, monkeypatch)
-    knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(knowledge, "LaLa", author_id=1, topic="VETO WINNER")
     knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
     knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
 
@@ -388,9 +425,9 @@ def test_conflicting_alias_variants_do_not_affect_other_fields(tmp_path, monkeyp
 
 def test_multiple_topics_can_each_report_their_own_conflict(tmp_path, monkeypatch):
     knowledge = _knowledge(tmp_path, monkeypatch)
-    knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(knowledge, "LaLa", author_id=1, topic="VETO WINNER")
     knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
-    knowledge.teach(KnowledgeType.STATE, "YES", author_id=1, topic="VETO USED")
+    _teach_legacy_spelling(knowledge, "YES", author_id=1, topic="VETO USED")
     knowledge.teach(KnowledgeType.STATE, "NO", author_id=1, topic="VETO_USED")
 
     _result, conflicts = sync_house_status_from_knowledge(HouseStatus(), knowledge)
@@ -400,7 +437,7 @@ def test_multiple_topics_can_each_report_their_own_conflict(tmp_path, monkeypatc
 
 def test_alias_resolution_never_mutates_knowledge_store(tmp_path, monkeypatch):
     knowledge = _knowledge(tmp_path, monkeypatch)
-    knowledge.teach(KnowledgeType.STATE, "LaLa", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(knowledge, "LaLa", author_id=1, topic="VETO WINNER")
     knowledge.teach(KnowledgeType.STATE, "UNCONFIRMED", author_id=1, topic="VETO_WINNER")
     before = len(knowledge.active_items())
 
@@ -417,7 +454,7 @@ def test_freshest_alias_variant_wins_when_values_actually_agree_but_differ_in_ca
     rather than depending on dict/list ordering."""
 
     knowledge = _knowledge(tmp_path, monkeypatch)
-    knowledge.teach(KnowledgeType.STATE, "yash", author_id=1, topic="VETO WINNER")
+    _teach_legacy_spelling(knowledge, "yash", author_id=1, topic="VETO WINNER")
     knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
 
     result, conflicts = sync_house_status_from_knowledge(HouseStatus(), knowledge)

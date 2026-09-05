@@ -618,6 +618,85 @@ def test_official_state_outranks_taught_facts_and_live_feed_in_prompt_order(
 
 
 # ==========================================================
+# format_official_state() -- weekly boundary (real KnowledgeStore).
+#
+# See production/knowledge.py KnowledgeStore.current_state_items() --
+# this is the actual production bug ("Head of Household: Dee" served
+# as current when Dee's win was Week 7 and Barrett is Week 9's real
+# HOH) reproduced and closed at the prompt-formatting layer.
+# ==========================================================
+
+
+def test_format_official_state_excludes_a_value_taught_last_week(
+    tmp_path,
+) -> None:
+    from database.storage import Storage
+    from production.knowledge import KnowledgeStore
+
+    storage_path = tmp_path / "storage.json"
+    original_file = Storage.FILE
+    Storage.FILE = storage_path
+    try:
+        store = KnowledgeStore(storage=Storage())
+        store.teach(KnowledgeType.STATE, "Dee", author_id=1, topic="HOH")
+        store.teach(
+            KnowledgeType.STATE, "Drew, LaLa, Taylor", author_id=1, topic="NOMINEES"
+        )
+        store.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
+        store.teach(
+            KnowledgeType.STATE,
+            "LaLa, Taylor, Mallory",
+            author_id=1,
+            topic="HAVE_NOTS",
+        )
+
+        store.start_new_week(9)
+        store.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
+        store.teach(
+            KnowledgeType.STATE, "Angela, Dee, Devens", author_id=1, topic="NOMINEES"
+        )
+
+        text = ai_service.format_official_state(store)
+    finally:
+        Storage.FILE = original_file
+
+    assert "Hoh: Barrett" in text
+    assert "Nominees: Angela, Dee, Devens" in text
+    # The stale Week 7 values must not appear anywhere in the block --
+    # "Dee" alone isn't checked bare since she's also a CURRENT
+    # nominee this week; the old HOH line specifically must be gone.
+    assert "Hoh: Dee" not in text
+    assert "Drew" not in text
+    assert "Yash" not in text
+    assert "Mallory" not in text
+
+
+# ==========================================================
+# format_weekly_archive()
+# ==========================================================
+
+
+def test_format_weekly_archive_empty_for_no_record() -> None:
+    assert ai_service.format_weekly_archive(None, 8) == ""
+    assert ai_service.format_weekly_archive({"snapshot": {}}, 8) == ""
+
+
+def test_format_weekly_archive_labels_the_week_as_historical() -> None:
+    record = {
+        "week": 8,
+        "snapshot": {"VETO_WINNER": "Yash", "BB_BLOCKBUSTER": "Devens"},
+    }
+
+    text = ai_service.format_weekly_archive(record, 8)
+
+    assert "Week 8" in text
+    assert "Yash" in text
+    assert "Devens" in text
+    assert "HISTORICAL" in text
+    assert "not current" in text.lower() or "never" in text.lower()
+
+
+# ==========================================================
 # format_long_term_memory()
 # ==========================================================
 

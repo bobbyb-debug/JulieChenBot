@@ -15,12 +15,15 @@ nominees.py's module docstring.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import discord
 import discord.ext.commands as dc
 
 import commands.nominees as nominees_module
+from database.storage import Storage
+from production.knowledge import KnowledgeStore, KnowledgeType
 
 
 class FakeInteraction:
@@ -185,3 +188,62 @@ def test_nominees_and_noms_have_equivalent_permissions() -> None:
     assert nominees_cmd.default_permissions == noms_cmd.default_permissions
     # /nominees has always been open to everyone -- /noms must match.
     assert nominees_cmd.default_permissions is None
+
+
+# ==========================================================
+# Weekly boundary: nominees taught for a PREVIOUS reporting week must
+# not survive as "current" once a new week has started -- see
+# production/knowledge.py KnowledgeStore.current_state(). This is the
+# production bug this closes: stale Week 7 nominees (Drew, LaLa,
+# Taylor) being served forever as "confirmed."
+# ==========================================================
+
+
+def test_nominees_reports_none_confirmed_for_a_value_taught_last_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    knowledge = KnowledgeStore(storage=Storage())
+    knowledge.teach(
+        KnowledgeType.STATE, "Drew, LaLa, Taylor", author_id=1, topic="NOMINEES"
+    )
+    knowledge.start_new_week(9)
+
+    ds = SimpleNamespace()
+    ds.bot = dc.Bot(command_prefix="!", intents=discord.Intents.default())
+    ds.command = lambda *a, **kw: ds.bot.tree.command(*a, **kw)
+    ds.scheduler = SimpleNamespace(engine=SimpleNamespace(knowledge=knowledge))
+    nominees_module.register(ds)
+
+    interaction = FakeInteraction()
+    asyncio.run(ds.bot.tree.get_command("nominees").callback(interaction))
+
+    assert "No nominees" in interaction.sent[0]
+    assert "Drew" not in interaction.sent[0]
+
+
+def test_nominees_reports_the_value_re_taught_this_week(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Storage, "FILE", tmp_path / "storage.json")
+    knowledge = KnowledgeStore(storage=Storage())
+    knowledge.teach(
+        KnowledgeType.STATE, "Drew, LaLa, Taylor", author_id=1, topic="NOMINEES"
+    )
+    knowledge.start_new_week(9)
+    knowledge.teach(
+        KnowledgeType.STATE, "Angela, Dee, Devens", author_id=1, topic="NOMINEES"
+    )
+
+    ds = SimpleNamespace()
+    ds.bot = dc.Bot(command_prefix="!", intents=discord.Intents.default())
+    ds.command = lambda *a, **kw: ds.bot.tree.command(*a, **kw)
+    ds.scheduler = SimpleNamespace(engine=SimpleNamespace(knowledge=knowledge))
+    nominees_module.register(ds)
+
+    interaction = FakeInteraction()
+    asyncio.run(ds.bot.tree.get_command("nominees").callback(interaction))
+
+    assert "Angela" in interaction.sent[0]
+    assert "Devens" in interaction.sent[0]
+    assert "Drew" not in interaction.sent[0]

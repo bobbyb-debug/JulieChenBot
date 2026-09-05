@@ -39,7 +39,15 @@ async def _show_nominees(
     told apart in logs without any behavioral difference for the user.
     """
 
-    official = discord_service.scheduler.engine.knowledge.active_state("NOMINEES")
+    knowledge = discord_service.scheduler.engine.knowledge
+    # current_state() additionally enforces the current reporting
+    # week's boundary (see production/knowledge.py KnowledgeStore.
+    # current_state()) so nominees taught for a previous week and
+    # never re-confirmed this week correctly read as "not confirmed
+    # yet." Falls back to active_state() for a test double that
+    # doesn't define current_state().
+    current_state = getattr(knowledge, "current_state", knowledge.active_state)
+    official = current_state("NOMINEES")
 
     if official is None or not official.content.strip():
         message = "🎯 No nominees have been confirmed yet this cycle."
