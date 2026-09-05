@@ -95,7 +95,7 @@ def _setup(tmp_path: Path, monkeypatch, reply_text: str = "Yash won the Week 8 v
     historical_events = HistoricalEventStore(db_path=tmp_path / "historical_events.db")
     engine = _FakeEngine(knowledge, memory, historical_events)
     host = _FakeDiscordServiceHost(engine)
-    return host, knowledge
+    return host, knowledge, historical_events
 
 
 def _ask(host, channel_id, text, user_id=1):
@@ -118,7 +118,7 @@ def _prompt(host):
 
 
 def test_question_about_a_closed_past_week_retrieves_its_archive(tmp_path, monkeypatch):
-    host, knowledge = _setup(tmp_path, monkeypatch)
+    host, knowledge, historical_events = _setup(tmp_path, monkeypatch)
     knowledge.start_new_week(8)
     knowledge.teach(KnowledgeType.STATE, "Yash", author_id=1, topic="VETO_WINNER")
     knowledge.teach(KnowledgeType.STATE, "Devens", author_id=1, topic="BB_BLOCKBUSTER")
@@ -138,7 +138,7 @@ def test_question_about_a_closed_past_week_retrieves_its_archive(tmp_path, monke
 def test_question_about_the_current_week_does_not_add_an_archive_block(
     tmp_path, monkeypatch
 ):
-    host, knowledge = _setup(tmp_path, monkeypatch)
+    host, knowledge, historical_events = _setup(tmp_path, monkeypatch)
     knowledge.start_new_week(9)
     knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
 
@@ -148,7 +148,7 @@ def test_question_about_the_current_week_does_not_add_an_archive_block(
 
 
 def test_question_about_a_week_never_archived_adds_no_block(tmp_path, monkeypatch):
-    host, knowledge = _setup(tmp_path, monkeypatch)
+    host, knowledge, historical_events = _setup(tmp_path, monkeypatch)
     knowledge.start_new_week(9)
 
     _ask(host, channel_id=3, text="What happened in Week 3?")
@@ -159,7 +159,7 @@ def test_question_about_a_week_never_archived_adds_no_block(tmp_path, monkeypatc
 def test_ordinary_question_with_no_week_number_adds_no_archive_block(
     tmp_path, monkeypatch
 ):
-    host, knowledge = _setup(tmp_path, monkeypatch)
+    host, knowledge, historical_events = _setup(tmp_path, monkeypatch)
     knowledge.start_new_week(9)
     knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
 
@@ -171,11 +171,18 @@ def test_ordinary_question_with_no_week_number_adds_no_archive_block(
 def test_current_state_still_outranks_a_stale_week_scoped_value_end_to_end(
     tmp_path, monkeypatch
 ):
-    """The full production bug, end to end: Week 7's HOH/nominees/
-    veto/Have-Nots must not appear as OFFICIAL GAME FACTS once Week 9
-    has started, even with no week number named in the question."""
+    """The full production bug, end to end, exactly as specified for
+    validation: CURRENT WEEK 9 (Barrett / Angela,Dee,Devens / veto+
+    Have-Nots unconfirmed) coexists with HISTORICAL WEEK 7 (Dee /
+    Drew,LaLa,Taylor / Yash / LaLa,Taylor,Mallory) in BOTH the
+    KnowledgeStore weekly archive AND the separate, administrator-
+    verified HistoricalEventStore (Phase 1, HOH-only). Asking for the
+    CURRENT game state must reference Week 9's real values and must
+    NOT let Week 7 override them; asking for the Week 7 HOH must still
+    correctly answer Dee -- proving this fix does not destroy
+    historical retrieval to achieve current-state correctness."""
 
-    host, knowledge = _setup(tmp_path, monkeypatch)
+    host, knowledge, historical_events = _setup(tmp_path, monkeypatch)
     knowledge.teach(KnowledgeType.STATE, "Dee", author_id=1, topic="HOH")
     knowledge.teach(
         KnowledgeType.STATE, "Drew, LaLa, Taylor", author_id=1, topic="NOMINEES"
@@ -184,6 +191,15 @@ def test_current_state_still_outranks_a_stale_week_scoped_value_end_to_end(
     knowledge.teach(
         KnowledgeType.STATE, "LaLa, Taylor, Mallory", author_id=1, topic="HAVE_NOTS"
     )
+    # Administrator-verified structured historical record for Week 7's
+    # HOH -- the SEPARATE Phase 1 system (database/historical_events.py)
+    # that "who was HOH in Week N?" actually answers from. This proves
+    # the fix doesn't merely rely on the weekly archive for history.
+    claim = historical_events.record_hoh_claim(
+        season=28, cycle_sequence_number=7, week_number=7, winner="Dee",
+        source_type="manual_admin_note", source_ref="validation-test",
+    )
+    historical_events.verify_hoh(claim.id, author_id=1)
 
     knowledge.start_new_week(9)
     knowledge.teach(KnowledgeType.STATE, "Barrett", author_id=1, topic="HOH")
@@ -210,3 +226,17 @@ def test_current_state_still_outranks_a_stale_week_scoped_value_end_to_end(
     assert "Drew" not in official_block
     assert "Yash" not in official_block
     assert "Mallory" not in official_block
+
+    # Historical retrieval must still work: asking specifically about
+    # Week 7 must still correctly answer Dee, via the SAME
+    # HistoricalEventStore this fix left untouched.
+    from production.historical_retrieval import retrieve_hoh
+
+    week7_result = retrieve_hoh("What was the Week 7 HOH?", historical_events)
+    assert len(week7_result.events) == 1
+    winners = [
+        p.houseguest
+        for p in week7_result.events[0].participants
+        if p.role == "WINNER"
+    ]
+    assert winners == ["DEE"]
