@@ -28,6 +28,8 @@ everything else on this router requires a valid bearer token.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from aiohttp import web
 
 from admin_api.conflicts import detect_conflicts, house_status_value
@@ -265,6 +267,19 @@ async def week_start(request: web.Request) -> web.Response:
     Never touches a single KnowledgeItem; call POST /api/v1/week/close
     first if the outgoing week's values should be preserved as a
     queryable historical snapshot.
+
+    Optional body field `started_at` (ISO 8601, e.g.
+    "2026-09-01T00:00:00+00:00") backdates the boundary instead of
+    using now -- required when turning week-tracking on for the first
+    time in a deployment that already has this week's values taught:
+    without it, current_state()'s "taught at or after the boundary"
+    check would wrongly exclude everything already taught for the
+    current week before this call ever ran. Pick a moment after the
+    PREVIOUS week's last relevant teach (so its leftover values
+    correctly read as unconfirmed) and at or before the CURRENT week's
+    first relevant teach (so those remain current) -- see
+    GET /api/v1/knowledge?type=state to find the right instant from
+    each item's created_at.
     """
 
     engine = _engine(request)
@@ -272,7 +287,17 @@ async def week_start(request: web.Request) -> web.Response:
     if body is None or not isinstance(body.get("week"), int):
         return web.json_response({"error": "'week' (integer) is required"}, status=400)
 
-    engine.knowledge.start_new_week(body["week"])
+    started_at = None
+    raw_started_at = body.get("started_at")
+    if raw_started_at is not None:
+        try:
+            started_at = datetime.fromisoformat(raw_started_at)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "'started_at' must be an ISO 8601 timestamp"}, status=400
+            )
+
+    engine.knowledge.start_new_week(body["week"], started_at=started_at)
 
     return web.json_response(
         {

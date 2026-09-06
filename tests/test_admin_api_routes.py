@@ -548,6 +548,58 @@ def test_week_start_moves_the_current_week_boundary(
     assert engine.knowledge.active_state("HOH").content == "Dee"  # history preserved
 
 
+def test_week_start_can_backdate_the_boundary_to_preserve_already_taught_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Turning week-tracking on for the first time in a deployment
+    that already has this week's values taught must not blank them
+    out -- see production/knowledge.py KnowledgeStore.start_new_week()
+    started_at, and this route's own docstring for why."""
+
+    from datetime import UTC, datetime, timedelta
+
+    engine, app = _build(monkeypatch, tmp_path)
+    engine.knowledge.teach(KnowledgeType.STATE, "Dee", 1, topic="HOH")  # Week 7 leftover
+    engine.knowledge.teach(KnowledgeType.STATE, "Barrett", 1, topic="HOH")  # already Week 9
+
+    backdated = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/week/start",
+                json={"week": 9, "started_at": backdated},
+                headers=AUTH,
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["current_week"] == 9
+            assert body["started_at"] == backdated
+
+    _run(scenario())
+
+    # Barrett (already taught before this call) must still read as
+    # current -- backdating is what makes that possible.
+    assert engine.knowledge.current_state("HOH").content == "Barrett"
+
+
+def test_week_start_rejects_a_malformed_started_at(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, app = _build(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/v1/week/start",
+                json={"week": 9, "started_at": "not-a-timestamp"},
+                headers=AUTH,
+            )
+            assert resp.status == 400
+
+    _run(scenario())
+
+
 def test_week_start_requires_an_integer_week(tmp_path: Path, monkeypatch) -> None:
     _, app = _build(monkeypatch, tmp_path)
 
